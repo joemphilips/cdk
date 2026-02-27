@@ -28,6 +28,7 @@ sqlcipher = ["sqlite", "cdk-sqlite/sqlcipher"]
 swagger = ["cdk-axum/swagger", "dep:utoipa", "dep:utoipa-swagger-ui"]
 redis = ["cdk-axum/redis"]
 prometheus = ["cdk/prometheus", "dep:cdk-prometheus", "cdk-sqlite?/prometheus", "cdk-axum/prometheus"]
+conditional-tokens = ["cdk-axum/conditional-tokens", "cdk/conditional-tokens"]
 
 [dependencies]
 anyhow.workspace = true
