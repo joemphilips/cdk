@@ -371,6 +371,12 @@ impl From<cdk::nuts::Witness> for Witness {
                 preimage: htlc.preimage,
                 signatures: htlc.signatures,
             },
+            cdk::nuts::Witness::OracleWitness(_) => {
+                // OracleWitness is not exposed via FFI yet
+                Self::P2PK {
+                    signatures: vec![],
+                }
+            }
         }
     }
 }
