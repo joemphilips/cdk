@@ -3,14 +3,11 @@
 //! Uses the `dlc-messages` crate for announcement TLV parsing
 //! and verification of oracle attestation signatures.
 
-use bitcoin::hashes::sha256::Hash as Sha256Hash;
-use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
 use dlc_messages::oracle_msgs::{
     EnumEventDescriptor, EventDescriptor, OracleAnnouncement, OracleEvent,
 };
 use dlc_messages::ser_impls::read_as_tlv;
-use lightning::util::ser::Writeable;
 
 use super::Error;
 
@@ -221,31 +218,15 @@ pub fn verify_oracle_attestation(
 
 /// Verify that an oracle announcement's signature is valid.
 ///
-/// The announcement contains a Schnorr signature over the **raw** serialized
-/// oracle event (via `Writeable::write`, without TLV type/length prefix).
-/// This matches `dlc-messages`' own `OracleAnnouncement::validate()`.
+/// Delegates to `dlc-messages`' own `OracleAnnouncement::validate()`, which
+/// signs/verifies over raw `Writeable::write()` bytes (no TLV wrapper).
 pub fn verify_announcement_signature(
     announcement: &OracleAnnouncement,
 ) -> Result<(), Error> {
     let secp = Secp256k1::verification_only();
-
-    // Serialize the oracle event using raw Writeable::write() — NOT write_as_tlv().
-    // The DLC spec signs over raw event bytes; the TLV wrapper is only for wire encoding.
-    let event_bytes = announcement.oracle_event.encode();
-
-    // Hash the serialized event
-    let event_hash = Sha256Hash::hash(&event_bytes).to_byte_array();
-    let message = Message::from_digest(event_hash);
-
-    // Verify the announcement signature
-    secp.verify_schnorr(
-        &announcement.announcement_signature,
-        &message,
-        &announcement.oracle_public_key,
-    )
-    .map_err(|_| {
-        Error::OracleAnnouncementVerificationFailed("Signature verification failed".into())
-    })
+    announcement
+        .validate(&secp)
+        .map_err(|e| Error::OracleAnnouncementVerificationFailed(e.to_string()))
 }
 
 #[cfg(test)]
@@ -598,5 +579,19 @@ mod tests {
         // Also verify roundtrip via TLV parsing
         let parsed = parse_oracle_announcement(&hex_tlv).expect("parse should succeed");
         assert_eq!(parsed.oracle_public_key, ann.oracle_public_key);
+    }
+
+    /// Verify that our `verify_announcement_signature` uses the same serialization
+    /// as `dlc-messages`' own `OracleAnnouncement::validate()` — both must sign/verify
+    /// over raw `Writeable::encode()` bytes, not TLV-wrapped bytes.
+    #[test]
+    fn test_verify_matches_dlc_messages_validate() {
+        let oracle = create_test_oracle();
+        let (ann, _) = create_test_announcement(&oracle, &["YES", "NO"], "compat-test");
+
+        // Our verification must agree with dlc-messages' own validate()
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        ann.validate(&secp).expect("dlc-messages validate() should pass");
+        verify_announcement_signature(&ann).expect("our verify should also pass");
     }
 }

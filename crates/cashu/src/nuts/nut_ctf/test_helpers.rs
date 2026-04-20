@@ -11,9 +11,30 @@ use dlc_messages::oracle_msgs::{
     EnumEventDescriptor, EventDescriptor, OracleAnnouncement, OracleEvent,
 };
 use dlc_messages::ser_impls::write_as_tlv;
-use lightning::util::ser::Writeable;
 
 use super::{tagged_hash, to_hex, OracleSig, OracleWitness};
+
+/// Extract the raw event payload from a TLV-serialized oracle event.
+///
+/// `write_as_tlv()` produces BigSize(type_id) + BigSize(payload_len) + payload.
+/// We strip the two BigSize prefixes to get the raw bytes, matching what
+/// `dlc-messages`' `OracleAnnouncement::validate()` uses for signature verification.
+///
+/// This workaround avoids importing `lightning 0.0.125`'s `Writeable` trait, which
+/// conflicts with `lightning 0.2.0`'s `Writeable` in the `cashu` crate.
+fn strip_tlv_prefix(tlv_bytes: &[u8]) -> &[u8] {
+    fn big_size_len(first_byte: u8) -> usize {
+        match first_byte {
+            0..=252 => 1,
+            253 => 3,
+            254 => 5,
+            255 => 9,
+        }
+    }
+    let type_prefix_len = big_size_len(tlv_bytes[0]);
+    let len_prefix_len = big_size_len(tlv_bytes[type_prefix_len]);
+    &tlv_bytes[type_prefix_len + len_prefix_len..]
+}
 
 /// Test oracle with keypair and nonce
 #[derive(Debug)]
@@ -80,12 +101,15 @@ pub fn create_test_announcement(
         event_id: event_id.to_string(),
     };
 
-    // Serialize the oracle event for signing using raw Writeable::encode() — NOT
-    // write_as_tlv(). The DLC spec signs over raw event bytes; TLV is only for wire encoding.
-    let event_bytes = oracle_event.encode();
+    // Serialize the oracle event for signing. The DLC spec signs over raw event
+    // bytes (Writeable::write), NOT TLV-wrapped bytes. We get raw bytes by writing
+    // as TLV and stripping the type+length prefix.
+    let mut event_tlv = Vec::new();
+    write_as_tlv(&oracle_event, &mut event_tlv).expect("serialize oracle event");
+    let event_bytes = strip_tlv_prefix(&event_tlv);
 
     // Sign the event hash (announcement signature)
-    let event_hash = Sha256Hash::hash(&event_bytes).to_byte_array();
+    let event_hash = Sha256Hash::hash(event_bytes).to_byte_array();
     let message = Message::from_digest(event_hash);
     let keypair = Keypair::from_secret_key(&secp, &oracle.secret_key);
     let announcement_sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
@@ -96,7 +120,6 @@ pub fn create_test_announcement(
         oracle_event,
     };
 
-    // Serialize announcement to TLV hex
     // Serialize announcement to TLV hex
     let mut ann_bytes = Vec::new();
     write_as_tlv(&announcement, &mut ann_bytes).expect("serialize announcement");
@@ -246,10 +269,12 @@ pub fn create_digit_decomposition_announcement(
         event_id: event_id.to_string(),
     };
 
-    // Sign over raw event bytes, matching dlc-messages spec
-    let event_bytes = oracle_event.encode();
+    // Sign over raw event bytes, matching dlc-messages' own validate()
+    let mut event_tlv = Vec::new();
+    write_as_tlv(&oracle_event, &mut event_tlv).expect("serialize oracle event");
+    let event_bytes = strip_tlv_prefix(&event_tlv);
 
-    let event_hash = Sha256Hash::hash(&event_bytes).to_byte_array();
+    let event_hash = Sha256Hash::hash(event_bytes).to_byte_array();
     let message = Message::from_digest(event_hash);
     let keypair = Keypair::from_secret_key(&secp, &oracle.secret_key);
     let announcement_sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
