@@ -181,11 +181,11 @@ where
             INSERT INTO conditions (
                 condition_id, threshold, description, announcements_json,
                 attestation_status, winning_outcome, attested_at, created_at,
-                condition_type, lo_bound, hi_bound, precision
+                condition_type, lo_bound, hi_bound, "precision"
             ) VALUES (
                 :condition_id, :threshold, :description, :announcements_json,
                 :attestation_status, :winning_outcome, :attested_at, :created_at,
-                :condition_type, :lo_bound, :hi_bound, :precision
+                :condition_type, :lo_bound, :hi_bound, :precisionval
             )
             "#,
         )?
@@ -200,7 +200,7 @@ where
         .bind("condition_type", condition.condition_type)
         .bind("lo_bound", condition.lo_bound)
         .bind("hi_bound", condition.hi_bound)
-        .bind("precision", condition.precision.map(|p| p as i64))
+        .bind("precisionval", condition.precision.map(|p| p as i64))
         .execute(&*conn)
         .await?;
 
@@ -214,7 +214,7 @@ where
             r#"
             SELECT condition_id, threshold, description, announcements_json,
                    attestation_status, winning_outcome, attested_at, created_at,
-                   condition_type, lo_bound, hi_bound, precision
+                   condition_type, lo_bound, hi_bound, "precision"
             FROM conditions
             WHERE condition_id = :condition_id
             "#,
@@ -241,7 +241,7 @@ where
         let mut sql = String::from(
             "SELECT condition_id, threshold, description, announcements_json, \
              attestation_status, winning_outcome, attested_at, created_at, \
-             condition_type, lo_bound, hi_bound, precision FROM conditions WHERE 1=1",
+             condition_type, lo_bound, hi_bound, \"precision\" FROM conditions WHERE 1=1",
         );
 
         if since.is_some() {
