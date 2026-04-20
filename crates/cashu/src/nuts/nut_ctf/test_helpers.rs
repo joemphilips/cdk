@@ -120,7 +120,6 @@ pub fn create_test_announcement(
         oracle_event,
     };
 
-    // Serialize announcement to TLV hex
     let mut ann_bytes = Vec::new();
     write_as_tlv(&announcement, &mut ann_bytes).expect("serialize announcement");
     let hex_tlv = to_hex(&ann_bytes);
