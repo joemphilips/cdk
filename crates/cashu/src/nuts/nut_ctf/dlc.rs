@@ -10,6 +10,7 @@ use dlc_messages::oracle_msgs::{
     EnumEventDescriptor, EventDescriptor, OracleAnnouncement, OracleEvent,
 };
 use dlc_messages::ser_impls::read_as_tlv;
+use lightning::util::ser::Writeable;
 
 use super::Error;
 
@@ -218,23 +219,19 @@ pub fn verify_oracle_attestation(
         .map_err(|_| Error::InvalidOracleSignature)
 }
 
-/// Verify that an oracle announcement's TLV signature is valid.
+/// Verify that an oracle announcement's signature is valid.
 ///
-/// The announcement contains a Schnorr signature over the serialized oracle event.
+/// The announcement contains a Schnorr signature over the **raw** serialized
+/// oracle event (via `Writeable::write`, without TLV type/length prefix).
+/// This matches `dlc-messages`' own `OracleAnnouncement::validate()`.
 pub fn verify_announcement_signature(
     announcement: &OracleAnnouncement,
 ) -> Result<(), Error> {
     let secp = Secp256k1::verification_only();
 
-    // Serialize the oracle event for signature verification
-    let mut event_bytes = Vec::new();
-    dlc_messages::ser_impls::write_as_tlv(
-        &announcement.oracle_event,
-        &mut event_bytes,
-    )
-    .map_err(|e| {
-        Error::OracleAnnouncementVerificationFailed(format!("Event serialization: {}", e))
-    })?;
+    // Serialize the oracle event using raw Writeable::write() — NOT write_as_tlv().
+    // The DLC spec signs over raw event bytes; the TLV wrapper is only for wire encoding.
+    let event_bytes = announcement.oracle_event.encode();
 
     // Hash the serialized event
     let event_hash = Sha256Hash::hash(&event_bytes).to_byte_array();

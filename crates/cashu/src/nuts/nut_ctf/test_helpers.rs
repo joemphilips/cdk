@@ -11,6 +11,7 @@ use dlc_messages::oracle_msgs::{
     EnumEventDescriptor, EventDescriptor, OracleAnnouncement, OracleEvent,
 };
 use dlc_messages::ser_impls::write_as_tlv;
+use lightning::util::ser::Writeable;
 
 use super::{tagged_hash, to_hex, OracleSig, OracleWitness};
 
@@ -79,9 +80,9 @@ pub fn create_test_announcement(
         event_id: event_id.to_string(),
     };
 
-    // Serialize the oracle event for signing
-    let mut event_bytes = Vec::new();
-    write_as_tlv(&oracle_event, &mut event_bytes).expect("serialize oracle event");
+    // Serialize the oracle event for signing using raw Writeable::encode() — NOT
+    // write_as_tlv(). The DLC spec signs over raw event bytes; TLV is only for wire encoding.
+    let event_bytes = oracle_event.encode();
 
     // Sign the event hash (announcement signature)
     let event_hash = Sha256Hash::hash(&event_bytes).to_byte_array();
@@ -245,8 +246,8 @@ pub fn create_digit_decomposition_announcement(
         event_id: event_id.to_string(),
     };
 
-    let mut event_bytes = Vec::new();
-    write_as_tlv(&oracle_event, &mut event_bytes).expect("serialize oracle event");
+    // Sign over raw event bytes, matching dlc-messages spec
+    let event_bytes = oracle_event.encode();
 
     let event_hash = Sha256Hash::hash(&event_bytes).to_byte_array();
     let message = Message::from_digest(event_hash);
@@ -259,6 +260,7 @@ pub fn create_digit_decomposition_announcement(
         oracle_event,
     };
 
+    // Serialize announcement to TLV hex for wire transmission
     let mut ann_bytes = Vec::new();
     write_as_tlv(&announcement, &mut ann_bytes).expect("serialize announcement");
     let hex_tlv = to_hex(&ann_bytes);
