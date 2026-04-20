@@ -346,7 +346,7 @@ pub(crate) async fn get_conditions(
         .get_conditions(params.since, params.limit, &params.status)
         .await
         .map_err(|err| {
-            tracing::error!("Could not get conditions: {} (debug: {:?})", err, err);
+            tracing::error!("Could not get conditions: {}", err);
             into_response(err)
         })?;
     Ok(Json(response))
@@ -377,7 +377,7 @@ pub(crate) async fn post_conditions(
         .register_condition(payload)
         .await
         .map_err(|err| {
-            tracing::error!("Could not register condition: {} (debug: {:?})", err, err);
+            tracing::error!("Could not register condition: {}", err);
             into_response(err)
         })?;
     Ok(Json(response))
