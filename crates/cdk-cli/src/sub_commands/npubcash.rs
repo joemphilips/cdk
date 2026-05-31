@@ -40,9 +40,15 @@ async fn get_wallet_for_mint(
 
 #[derive(Subcommand)]
 pub enum NpubCashSubCommand {
-    /// Sync quotes from NpubCash
+    #[command(
+        about = "Sync quotes from NpubCash",
+        long_about = "Fetch quotes from the NpubCash server and mint any paid quotes into the selected wallet."
+    )]
     Sync,
-    /// List all quotes
+    #[command(
+        about = "List NpubCash quotes",
+        long_about = "List quotes known by the NpubCash server, optionally filtered by timestamp and formatted as a table or JSON."
+    )]
     List {
         /// Only show quotes since this Unix timestamp
         #[arg(long)]
@@ -51,14 +57,23 @@ pub enum NpubCashSubCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
-    /// Subscribe to quote updates and auto-mint paid quotes
+    #[command(
+        about = "Subscribe to quote updates",
+        long_about = "Subscribe to NpubCash quote updates and automatically mint paid quotes as they arrive."
+    )]
     Subscribe,
-    /// Set mint URL for NpubCash
+    #[command(
+        about = "Set the NpubCash mint",
+        long_about = "Set the mint URL that NpubCash should use when creating quotes for this wallet."
+    )]
     SetMint {
         /// The mint URL to use
         url: String,
     },
-    /// Show Nostr keys used for NpubCash authentication
+    #[command(
+        about = "Show NpubCash keys",
+        long_about = "Show the Nostr keys derived from the wallet seed and used for NpubCash authentication."
+    )]
     ShowKeys,
 }
 

@@ -74,48 +74,111 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Decode a token
+    #[command(
+        about = "Decode a Cashu token",
+        long_about = "Decode a Cashu token and print its contents without receiving it into the wallet."
+    )]
     DecodeToken(sub_commands::decode_token::DecodeTokenSubCommand),
-    /// Balance
+    #[command(
+        about = "Show wallet balances",
+        long_about = "Show available balances across all configured mints and currency units."
+    )]
     Balance,
-    /// Pay bolt11 invoice
+    #[command(
+        about = "Pay a Lightning invoice",
+        long_about = "Pay a BOLT11 invoice, BOLT12 offer, or BIP353 address by melting ecash from the wallet."
+    )]
     Melt(sub_commands::melt::MeltSubCommand),
-    /// Claim pending mint quotes that have been paid
+    #[command(
+        about = "Claim paid mint quotes",
+        long_about = "Check pending mint quotes and claim ecash for quotes that have been paid."
+    )]
     MintPending,
-    /// Receive token
+    #[command(
+        about = "Receive a Cashu token",
+        long_about = "Receive a Cashu token into the wallet, including tokens locked with supported spending conditions."
+    )]
     Receive(sub_commands::receive::ReceiveSubCommand),
-    /// Send
+    #[command(
+        about = "Send ecash",
+        long_about = "Create a Cashu token from wallet funds, optionally with memo, mint selection, transfer, or lock options."
+    )]
     Send(sub_commands::send::SendSubCommand),
-    /// Transfer tokens between mints
+    #[command(
+        about = "Move ecash between mints",
+        long_about = "Transfer wallet funds from one mint to another by sending from the source mint and receiving at the target mint."
+    )]
     Transfer(sub_commands::transfer::TransferSubCommand),
-    /// Reclaim pending proofs that are no longer pending
+    #[command(
+        about = "Recover pending proofs",
+        long_about = "Check pending proofs with their mints and return proofs that are no longer pending to the spendable balance."
+    )]
     CheckPending,
-    /// View mint info
+    #[command(
+        about = "Show mint information",
+        long_about = "Fetch and display information advertised by a Cashu mint, such as supported features and settings."
+    )]
     MintInfo(sub_commands::mint_info::MintInfoSubcommand),
-    /// Mint proofs via bolt11
+    #[command(
+        about = "Mint ecash",
+        long_about = "Create a mint quote, pay the Lightning invoice, and mint ecash into the wallet."
+    )]
     Mint(sub_commands::mint::MintSubCommand),
-    /// Burn Spent tokens
+    #[command(
+        about = "Burn spent tokens",
+        long_about = "Check spent or pending tokens and remove tokens that can no longer be recovered into the wallet."
+    )]
     Burn(sub_commands::burn::BurnSubCommand),
-    /// Restore proofs from seed
+    #[command(
+        about = "Restore ecash from seed",
+        long_about = "Scan a mint for recoverable proofs derived from the wallet seed and add them back to the wallet."
+    )]
     Restore(sub_commands::restore::RestoreSubCommand),
-    /// Update Mint Url
+    #[command(
+        about = "Update a mint URL",
+        long_about = "Replace an existing mint URL in the wallet with a new URL for the selected currency unit."
+    )]
     UpdateMintUrl(sub_commands::update_mint_url::UpdateMintUrlSubCommand),
-    /// Get proofs from mint.
+    #[command(
+        about = "List wallet proofs",
+        long_about = "List proofs currently stored in the wallet, grouped by mint and proof state."
+    )]
     ListMintProofs,
-    /// Decode a payment request
+    #[command(
+        about = "Decode a payment request",
+        long_about = "Decode a Cashu payment request and print the requested amount, unit, mints, and conditions."
+    )]
     DecodeRequest(sub_commands::decode_request::DecodePaymentRequestSubCommand),
-    /// Pay a payment request
+    #[command(
+        about = "Pay a payment request",
+        long_about = "Pay a Cashu payment request from a matching wallet mint and currency unit."
+    )]
     PayRequest(sub_commands::pay_request::PayRequestSubCommand),
-    /// Create Payment request
+    #[command(
+        about = "Create a payment request",
+        long_about = "Create a Cashu payment request that another wallet can pay, including optional amount and memo."
+    )]
     CreateRequest(sub_commands::create_request::CreateRequestSubCommand),
-    /// Mint blind auth proofs
+    #[command(
+        about = "Mint blind auth proofs",
+        long_about = "Authenticate with a protected mint and mint blind authentication proofs for future requests."
+    )]
     MintBlindAuth(sub_commands::mint_blind_auth::MintBlindAuthSubCommand),
-    /// Cat login with username/password
+    #[command(
+        about = "Log in with clear auth credentials",
+        long_about = "Authenticate to a protected mint with username and password clear auth flow and store the resulting token."
+    )]
     CatLogin(sub_commands::cat_login::CatLoginSubCommand),
-    /// Cat login with device code flow
+    #[command(
+        about = "Log in with device code auth",
+        long_about = "Authenticate to a protected mint with the OAuth device code flow and store the resulting clear auth token."
+    )]
     CatDeviceLogin(sub_commands::cat_device_login::CatDeviceLoginSubCommand),
-    /// NpubCash integration commands
     #[cfg(feature = "npubcash")]
+    #[command(
+        about = "Manage NpubCash integration",
+        long_about = "Sync, subscribe to, and manage NpubCash quotes using Nostr keys derived from the wallet seed."
+    )]
     NpubCash {
         /// Mint URL to use for npubcash operations
         #[arg(short, long)]
