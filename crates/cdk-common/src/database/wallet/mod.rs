@@ -16,6 +16,14 @@ use crate::wallet::{
     self, MintQuote as WalletMintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
 };
 
+#[cfg(feature = "conditional-tokens")]
+mod conditional_restore;
+#[cfg(feature = "conditional-tokens")]
+pub use conditional_restore::{
+    join_conditional_restore_proof_state, ConditionalRestoreAdmission,
+    ConditionalRestoreAdmissionMode, ConditionalRestoreAdmissionResult,
+};
+
 #[cfg(feature = "test")]
 pub mod test;
 
@@ -26,6 +34,38 @@ pub trait Database<Err>: Debug
 where
     Err: Into<Error> + From<Error>,
 {
+    /// Atomically advance and return the conditional-restore high-water time.
+    #[cfg(feature = "conditional-tokens")]
+    async fn advance_conditional_restore_high_water(
+        &self,
+        _mint_url: MintUrl,
+        _unit: CurrencyUnit,
+        _observed_wall_time: u64,
+    ) -> Result<u64, Err> {
+        Err(Error::ConditionalRestoreUnsupported.into())
+    }
+
+    /// Atomically admit one recovered conditional keyset and its proofs.
+    #[cfg(feature = "conditional-tokens")]
+    async fn commit_conditional_restore(
+        &self,
+        _admission: ConditionalRestoreAdmission,
+    ) -> Result<ConditionalRestoreAdmissionResult, Err> {
+        Err(Error::ConditionalRestoreUnsupported.into())
+    }
+
+    /// Query ordinary proofs while atomically excluding durable conditional keysets.
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_ordinary_proofs(
+        &self,
+        _mint_url: MintUrl,
+        _unit: CurrencyUnit,
+        _state: Option<Vec<State>>,
+        _spending_conditions: Option<Vec<SpendingConditions>>,
+    ) -> Result<Vec<ProofInfo>, Err> {
+        Err(Error::ConditionalRestoreUnsupported.into())
+    }
+
     /// Get mint from storage
     async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, Err>;
 

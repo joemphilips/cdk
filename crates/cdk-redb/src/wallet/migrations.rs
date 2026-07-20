@@ -13,7 +13,8 @@ use redb::{
 
 use super::Error;
 use crate::wallet::{
-    KEYSETS_TABLE, KEYSET_COUNTER, KEYSET_U32_MAPPING, MINT_KEYS_TABLE, P2PK_SIGNING_KEYS_TABLE,
+    CONDITIONAL_RESTORE_HIGH_WATER_TABLE, CONDITIONAL_RESTORE_KEYSETS_TABLE, KEYSETS_TABLE,
+    KEYSET_COUNTER, KEYSET_U32_MAPPING, MINT_KEYS_TABLE, P2PK_SIGNING_KEYS_TABLE,
 };
 
 // <Mint_url, Info>
@@ -219,4 +220,23 @@ pub(crate) fn migrate_04_to_05(db: Arc<Database>) -> Result<u32, Error> {
     tracing::info!("Finished migration from version 4 to 5: P2PK_SIGNING_KEYS_TABLE initialized");
 
     Ok(5)
+}
+
+pub(crate) fn migrate_05_to_06(db: Arc<Database>) -> Result<u32, Error> {
+    tracing::info!("Starting migration from version 5 to 6: conditional restore tables");
+    let write_txn = db.begin_write().map_err(Error::from)?;
+
+    {
+        let _ = write_txn
+            .open_table(CONDITIONAL_RESTORE_HIGH_WATER_TABLE)
+            .map_err(Error::from)?;
+        let _ = write_txn
+            .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+            .map_err(Error::from)?;
+    }
+
+    write_txn.commit()?;
+    tracing::info!("Finished migration from version 5 to 6: conditional restore tables");
+
+    Ok(6)
 }

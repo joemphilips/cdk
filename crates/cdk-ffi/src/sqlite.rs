@@ -15,6 +15,12 @@ pub struct WalletSqliteDatabase {
     inner: Arc<FfiWalletDatabaseWrapper<CdkWalletSqliteDatabase, CdkDatabaseError>>,
 }
 
+impl WalletSqliteDatabase {
+    pub(crate) fn native_database(&self) -> CdkWalletSqliteDatabase {
+        self.inner.clone_inner()
+    }
+}
+
 #[uniffi::export]
 impl WalletSqliteDatabase {
     /// Create a new WalletSqliteDatabase with the given work directory

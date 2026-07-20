@@ -47,8 +47,7 @@ impl Wallet {
         store: crate::database::WalletStore,
         config: WalletConfig,
     ) -> Result<Self, FfiError> {
-        let db = crate::database::resolve_wallet_store(store)?;
-        let localstore = crate::database::create_cdk_database_from_ffi(db);
+        let localstore = crate::database::resolve_cdk_wallet_store(store)?;
 
         let m = Mnemonic::parse(&mnemonic)
             .map_err(|e| FfiError::internal(format!("Invalid mnemonic: {}", e)))?;

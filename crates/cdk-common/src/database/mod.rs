@@ -2,6 +2,9 @@
 
 mod kvstore;
 
+#[cfg(feature = "conditional-tokens")]
+pub mod conditional;
+
 #[cfg(feature = "mint")]
 pub mod mint;
 #[cfg(feature = "wallet")]
@@ -220,6 +223,21 @@ pub enum Error {
     /// Concurrent update detected
     #[error("Concurrent update detected")]
     ConcurrentUpdate,
+
+    /// Backend does not support atomic conditional-token restore storage.
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Atomic conditional restore storage is unsupported by this backend")]
+    ConditionalRestoreUnsupported,
+
+    /// Conditional restore admission was internally inconsistent.
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Invalid conditional restore admission: {0}")]
+    InvalidConditionalRestore(String),
+
+    /// Existing immutable conditional keyset metadata conflicts with the admission.
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Conditional restore metadata conflicts with persisted state")]
+    ConditionalRestoreMetadataConflict,
 }
 
 #[cfg(feature = "mint")]

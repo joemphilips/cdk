@@ -13,6 +13,10 @@ use bitcoin::secp256k1::rand::rngs::OsRng;
 use cdk_common::auth::oidc::OidcClient;
 use cdk_common::common::ProofInfo;
 use cdk_common::database::wallet::Database;
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::database::wallet::{
+    ConditionalRestoreAdmission, ConditionalRestoreAdmissionResult,
+};
 use cdk_common::database::{Error as DatabaseError, KVStoreDatabase};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::{
@@ -204,7 +208,7 @@ impl SupabaseWalletDatabase {
     /// This must match the latest `schema_version` value set in the migration files.
     /// When adding new migrations, update this constant and set the same value
     /// in the new migration's `INSERT INTO schema_info` statement.
-    pub const REQUIRED_SCHEMA_VERSION: u32 = 5;
+    pub const REQUIRED_SCHEMA_VERSION: u32 = 6;
 
     /// Get the full database schema SQL
     ///
@@ -739,6 +743,44 @@ impl SupabaseWalletDatabase {
             Ok(Some(items))
         }
     }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn conditional_restore_proof_json(
+        &self,
+        proof: ProofInfo,
+    ) -> Result<serde_json::Value, DatabaseError> {
+        let mut canonical = proof.clone();
+        canonical.state = State::Unspent;
+        canonical.used_by_operation = None;
+        canonical.created_by_operation = None;
+        let fingerprint = sha256::Hash::hash(&serde_json::to_vec(&canonical)?).to_string();
+        let mut table: ProofTable = proof.try_into()?;
+        table.secret = hex::encode(self.encrypt(table.secret.as_bytes()).await?);
+        if let Ok(c) = hex::decode(&table.c) {
+            table.c = hex::encode(self.encrypt(&c).await?);
+        }
+        let mut value = serde_json::to_value(table)?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| DatabaseError::Internal("invalid conditional proof JSON".into()))?
+            .insert(
+                "restore_fingerprint".to_string(),
+                serde_json::Value::String(fingerprint),
+            );
+        Ok(value)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    fn conditional_rpc_error(error: Error) -> DatabaseError {
+        let message = error.to_string();
+        if message.contains("conditional_restore_metadata_conflict") {
+            DatabaseError::ConditionalRestoreMetadataConflict
+        } else if message.contains("keyset_counter_overflow") {
+            DatabaseError::AmountOverflow
+        } else {
+            error.into()
+        }
+    }
 }
 
 #[async_trait]
@@ -812,6 +854,142 @@ impl KVStoreDatabase for SupabaseWalletDatabase {
 }
 #[async_trait]
 impl Database<DatabaseError> for SupabaseWalletDatabase {
+    #[cfg(feature = "conditional-tokens")]
+    async fn advance_conditional_restore_high_water(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        observed_wall_time: u64,
+    ) -> Result<u64, DatabaseError> {
+        let response = self
+            .call_rpc(
+                "advance_conditional_restore_high_water",
+                &serde_json::json!({
+                    "p_mint_url": mint_url.to_string(),
+                    "p_unit": unit.to_string(),
+                    "p_observed_high_water": format!("{observed_wall_time:016x}")
+                })
+                .to_string(),
+            )
+            .await
+            .map_err(Self::conditional_rpc_error)?;
+        let high_water: String = serde_json::from_str(&response)?;
+        u64::from_str_radix(&high_water, 16).map_err(|_| DatabaseError::InvalidDbResponse)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn commit_conditional_restore(
+        &self,
+        admission: ConditionalRestoreAdmission,
+    ) -> Result<ConditionalRestoreAdmissionResult, DatabaseError> {
+        admission.validate()?;
+        if admission.keyset.input_fee_ppk > i64::MAX as u64
+            || admission
+                .keyset
+                .final_expiry
+                .is_some_and(|value| value > i64::MAX as u64)
+            || admission.conditional_keyset.registered_at > i64::MAX as u64
+            || admission
+                .proofs
+                .iter()
+                .chain(&admission.spent_proofs)
+                .any(|proof| proof.proof.amount.to_u64() > i64::MAX as u64)
+        {
+            return Err(DatabaseError::InvalidConditionalRestore(
+                "Supabase conditional payload exceeds the SQL integer domain".into(),
+            ));
+        }
+        let keyset = KeySetTable::from_info(admission.mint_url.clone(), admission.keyset.clone())?;
+        let keys = KeyTable::from_keyset(&admission.keys)?;
+        let mut proofs = Vec::with_capacity(admission.proofs.len());
+        for proof in admission.proofs.clone() {
+            proofs.push(self.conditional_restore_proof_json(proof).await?);
+        }
+        let mut spent_proofs = Vec::with_capacity(admission.spent_proofs.len());
+        for proof in admission.spent_proofs.clone() {
+            spent_proofs.push(self.conditional_restore_proof_json(proof).await?);
+        }
+        let mode = match admission.mode {
+            cdk_common::database::wallet::ConditionalRestoreAdmissionMode::HeldProofs => {
+                "held_proofs"
+            }
+            cdk_common::database::wallet::ConditionalRestoreAdmissionMode::ProgressOnly => {
+                "progress_only"
+            }
+        };
+        let response = self
+            .call_rpc(
+                "commit_conditional_restore",
+                &serde_json::json!({
+                    "p_mint_url": admission.mint_url.to_string(),
+                    "p_unit": admission.unit.to_string(),
+                    "p_observed_high_water": format!("{:016x}", admission.observed_wall_time),
+                    "p_mode": mode,
+                    "p_conditional_keyset": admission.conditional_keyset,
+                    "p_keyset": keyset,
+                    "p_keys": keys,
+                    "p_proofs": proofs,
+                    "p_spent_proofs": spent_proofs,
+                    "p_counter_floor": admission.counter_floor,
+                })
+                .to_string(),
+            )
+            .await
+            .map_err(Self::conditional_rpc_error)?;
+        let result: serde_json::Value = serde_json::from_str(&response)?;
+        let effective_hex = result
+            .get("effective_time")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(DatabaseError::InvalidDbResponse)?;
+        let effective_time =
+            u64::from_str_radix(effective_hex, 16).map_err(|_| DatabaseError::InvalidDbResponse)?;
+        match result.get("result").and_then(serde_json::Value::as_str) {
+            Some("held_proofs") => {
+                Ok(ConditionalRestoreAdmissionResult::HeldProofs { effective_time })
+            }
+            Some("progress_only") => {
+                Ok(ConditionalRestoreAdmissionResult::ProgressOnly { effective_time })
+            }
+            Some("expired") => Ok(ConditionalRestoreAdmissionResult::Expired { effective_time }),
+            _ => Err(DatabaseError::InvalidDbResponse),
+        }
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_ordinary_proofs(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        state: Option<Vec<State>>,
+        spending_conditions: Option<Vec<SpendingConditions>>,
+    ) -> Result<Vec<ProofInfo>, DatabaseError> {
+        let response = self
+            .call_rpc(
+                "get_ordinary_proofs",
+                &serde_json::json!({
+                    "p_mint_url": mint_url.to_string(),
+                    "p_unit": unit.to_string()
+                })
+                .to_string(),
+            )
+            .await
+            .map_err(Self::conditional_rpc_error)?;
+        let mut result = Vec::new();
+        for mut proof in serde_json::from_str::<Vec<ProofTable>>(&response)? {
+            self.decrypt_proof_table(&mut proof).await;
+            let proof: ProofInfo = proof.try_into()?;
+            if proof.matches_conditions(
+                &Some(mint_url.clone()),
+                &Some(unit.clone()),
+                &state,
+                &spending_conditions,
+            ) {
+                result.push(proof);
+            }
+        }
+        Ok(result)
+    }
+
     async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, DatabaseError> {
         let path = format!(
             "rest/v1/mint?mint_url=eq.{}",
@@ -1325,60 +1503,78 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         old_mint_url: MintUrl,
         new_mint_url: MintUrl,
     ) -> Result<(), DatabaseError> {
-        let old_encoded = url_encode(&old_mint_url.to_string());
-        let update_body = serde_json::json!({ "mint_url": new_mint_url.to_string() });
-
-        // Update mint table first (parent table)
-        let path = format!("rest/v1/mint?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (mint) failed: HTTP {} - {}",
-                status, response_text
-            )));
+        #[cfg(feature = "conditional-tokens")]
+        {
+            self.call_rpc(
+                "update_mint_url_atomic",
+                &serde_json::json!({
+                    "p_old_mint_url": old_mint_url.to_string(),
+                    "p_new_mint_url": new_mint_url.to_string()
+                })
+                .to_string(),
+            )
+            .await
+            .map_err(Self::conditional_rpc_error)?;
+            return Ok(());
         }
 
-        // Update keyset table
-        let path = format!("rest/v1/keyset?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (keyset) failed: HTTP {} - {}",
-                status, response_text
-            )));
-        }
+        #[cfg(not(feature = "conditional-tokens"))]
+        {
+            let old_encoded = url_encode(&old_mint_url.to_string());
+            let update_body = serde_json::json!({ "mint_url": new_mint_url.to_string() });
 
-        // Update mint_quote table
-        let path = format!("rest/v1/mint_quote?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (mint_quote) failed: HTTP {} - {}",
-                status, response_text
-            )));
-        }
+            // Update mint table first (parent table)
+            let path = format!("rest/v1/mint?mint_url=eq.{}", old_encoded);
+            let (status, response_text) = self.patch_request(&path, &update_body).await?;
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "update_mint_url (mint) failed: HTTP {} - {}",
+                    status, response_text
+                )));
+            }
 
-        // Update proof table
-        let path = format!("rest/v1/proof?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (proof) failed: HTTP {} - {}",
-                status, response_text
-            )));
-        }
+            // Update keyset table
+            let path = format!("rest/v1/keyset?mint_url=eq.{}", old_encoded);
+            let (status, response_text) = self.patch_request(&path, &update_body).await?;
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "update_mint_url (keyset) failed: HTTP {} - {}",
+                    status, response_text
+                )));
+            }
 
-        // Update transactions table
-        let path = format!("rest/v1/transactions?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (transactions) failed: HTTP {} - {}",
-                status, response_text
-            )));
-        }
+            // Update mint_quote table
+            let path = format!("rest/v1/mint_quote?mint_url=eq.{}", old_encoded);
+            let (status, response_text) = self.patch_request(&path, &update_body).await?;
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "update_mint_url (mint_quote) failed: HTTP {} - {}",
+                    status, response_text
+                )));
+            }
 
-        Ok(())
+            // Update proof table
+            let path = format!("rest/v1/proof?mint_url=eq.{}", old_encoded);
+            let (status, response_text) = self.patch_request(&path, &update_body).await?;
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "update_mint_url (proof) failed: HTTP {} - {}",
+                    status, response_text
+                )));
+            }
+
+            // Update transactions table
+            let path = format!("rest/v1/transactions?mint_url=eq.{}", old_encoded);
+            let (status, response_text) = self.patch_request(&path, &update_body).await?;
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "update_mint_url (transactions) failed: HTTP {} - {}",
+                    status, response_text
+                )));
+            }
+
+            Ok(())
+        }
     }
 
     async fn increment_keyset_counter(
@@ -1390,7 +1586,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         // This calls the increment_keyset_counter PostgreSQL function
         let rpc_body = serde_json::json!({
             "p_keyset_id": keyset_id.to_string(),
-            "p_increment": count as i32
+            "p_increment": u64::from(count)
         });
 
         let url = self.join_url("rest/v1/rpc/increment_keyset_counter")?;
@@ -1417,16 +1613,20 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
 
         if status.is_success() {
             // RPC returns the new counter value directly
-            let new_counter: i32 = serde_json::from_str(&text).map_err(|e| {
+            let new_counter: u64 = serde_json::from_str(&text).map_err(|e| {
                 DatabaseError::Internal(format!("Failed to parse counter response: {}", e))
             })?;
-            return Ok(new_counter as u32);
+            return u32::try_from(new_counter).map_err(|_| DatabaseError::AmountOverflow);
         }
 
-        Err(DatabaseError::Internal(format!(
-            "increment_keyset_counter RPC failed: HTTP {}. Ensure migrations have been run.",
-            status
-        )))
+        if text.contains("keyset_counter_overflow") {
+            Err(DatabaseError::AmountOverflow)
+        } else {
+            Err(DatabaseError::Internal(format!(
+                "increment_keyset_counter RPC failed: HTTP {}. Ensure migrations have been run.",
+                status
+            )))
+        }
     }
 
     async fn add_mint(
@@ -1491,6 +1691,10 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
             .await?;
 
         if !status.is_success() {
+            #[cfg(feature = "conditional-tokens")]
+            if response_text.contains("conditional_restore_metadata_conflict") {
+                return Err(DatabaseError::ConditionalRestoreMetadataConflict);
+            }
             return Err(DatabaseError::Internal(format!(
                 "add_mint_keysets failed: HTTP {} - {}",
                 status, response_text
@@ -1628,6 +1832,10 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
             .await?;
 
         if !status.is_success() {
+            #[cfg(feature = "conditional-tokens")]
+            if response_text.contains("conditional_restore_metadata_conflict") {
+                return Err(DatabaseError::ConditionalRestoreMetadataConflict);
+            }
             return Err(DatabaseError::Internal(format!(
                 "add_keys failed: HTTP {} - {}",
                 status, response_text
@@ -1641,6 +1849,10 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         let (status, response_text) = self.delete_request(&path).await?;
 
         if !status.is_success() {
+            #[cfg(feature = "conditional-tokens")]
+            if response_text.contains("conditional_restore_metadata_conflict") {
+                return Err(DatabaseError::ConditionalRestoreMetadataConflict);
+            }
             return Err(DatabaseError::Internal(format!(
                 "remove_keys failed: HTTP {} - {}",
                 status, response_text
@@ -2631,6 +2843,8 @@ impl TryInto<ProofInfo> for ProofTable {
 impl TryFrom<ProofInfo> for ProofTable {
     type Error = DatabaseError;
     fn try_from(p: ProofInfo) -> Result<Self, Self::Error> {
+        let amount =
+            i64::try_from(p.proof.amount.to_u64()).map_err(|_| DatabaseError::AmountOverflow)?;
         Ok(Self {
             y: hex::encode(p.y.to_bytes()),
             mint_url: p.mint_url.to_string(),
@@ -2640,7 +2854,7 @@ impl TryFrom<ProofInfo> for ProofTable {
                 .map(|s| serde_json::to_string(&s))
                 .transpose()?,
             unit: p.unit.to_string(),
-            amount: p.proof.amount.to_u64() as i64,
+            amount,
             keyset_id: p.proof.keyset_id.to_string(),
             secret: p.proof.secret.to_string(),
             c: hex::encode(p.proof.c.to_bytes()),
@@ -2891,6 +3105,66 @@ impl SupabaseAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn conditional_restore_schema_embeds_atomic_contract() {
+        let schema = SupabaseWalletDatabase::get_schema_sql();
+        for required in [
+            "CREATE TABLE IF NOT EXISTS conditional_restore_high_water",
+            "CREATE TABLE IF NOT EXISTS conditional_restore_keyset",
+            "CREATE OR REPLACE FUNCTION public.advance_conditional_restore_high_water",
+            "CREATE OR REPLACE FUNCTION public.commit_conditional_restore",
+            "WHERE y = v_proof->>'y' AND wallet_id = v_wallet\n                      AND state = 'UNSPENT';",
+            "CREATE OR REPLACE FUNCTION public.get_ordinary_proofs",
+            "CREATE OR REPLACE FUNCTION public.update_mint_url_atomic",
+            "DROP FUNCTION IF EXISTS public.increment_keyset_counter(TEXT, INTEGER);",
+            "CREATE OR REPLACE FUNCTION public.increment_keyset_counter(\n    p_keyset_id TEXT,\n    p_increment BIGINT",
+            "GRANT EXECUTE ON FUNCTION public.increment_keyset_counter(TEXT, BIGINT) TO authenticated;",
+            "VALUES ('schema_version', '6')",
+        ] {
+            assert!(
+                schema.contains(required),
+                "missing schema contract: {required}"
+            );
+        }
+
+        let drop_legacy = schema
+            .rfind("DROP FUNCTION IF EXISTS public.increment_keyset_counter(TEXT, INTEGER);")
+            .expect("legacy overload removal should be embedded");
+        let create_bigint = schema
+            .rfind("CREATE OR REPLACE FUNCTION public.increment_keyset_counter(")
+            .expect("BIGINT counter function should be embedded");
+        assert!(
+            drop_legacy < create_bigint,
+            "legacy overload must be removed before the BIGINT function is created"
+        );
+    }
+
+    #[test]
+    fn proof_table_rejects_amount_outside_sql_domain() {
+        let proof = cdk_common::Proof {
+            amount: cdk_common::Amount::from(i64::MAX as u64 + 1),
+            keyset_id: Id::from_str("009a1f293253e41e").expect("keyset id should parse"),
+            secret: Secret::generate(),
+            c: cdk_common::nuts::SecretKey::generate().public_key(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let proof = ProofInfo::new(
+            proof,
+            MintUrl::from_str("https://example.com").expect("mint URL should parse"),
+            State::Unspent,
+            CurrencyUnit::Sat,
+        )
+        .expect("proof should be valid");
+
+        assert!(matches!(
+            ProofTable::try_from(proof),
+            Err(DatabaseError::AmountOverflow)
+        ));
+    }
 
     #[test]
     fn test_set_encryption_password_key_derivation() {

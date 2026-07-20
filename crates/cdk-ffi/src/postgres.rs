@@ -32,6 +32,12 @@ fn pg_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+impl WalletPostgresDatabase {
+    pub(crate) fn native_database(&self) -> WalletPgDatabase {
+        self.inner.clone_inner()
+    }
+}
+
 #[uniffi::export]
 impl WalletPostgresDatabase {
     /// Create a new Postgres-backed wallet database

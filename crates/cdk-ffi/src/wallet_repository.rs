@@ -27,15 +27,12 @@ impl WalletRepository {
     /// - `Custom { db }` — foreign-language implementation of `WalletDatabase`
     #[uniffi::constructor]
     pub fn new(mnemonic: String, store: crate::database::WalletStore) -> Result<Self, FfiError> {
-        let db = crate::database::resolve_wallet_store(store)?;
+        let localstore = crate::database::resolve_cdk_wallet_store(store)?;
 
         // Parse mnemonic and generate seed without passphrase
         let m = Mnemonic::parse(&mnemonic)
             .map_err(|e| FfiError::internal(format!("Invalid mnemonic: {}", e)))?;
         let seed = m.to_seed_normalized("");
-
-        // Convert the FFI database trait to a CDK database implementation
-        let localstore = crate::database::create_cdk_database_from_ffi(db);
 
         let wallet = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
@@ -73,15 +70,12 @@ impl WalletRepository {
         store: crate::database::WalletStore,
         proxy_url: String,
     ) -> Result<Self, FfiError> {
-        let db = crate::database::resolve_wallet_store(store)?;
+        let localstore = crate::database::resolve_cdk_wallet_store(store)?;
 
         // Parse mnemonic and generate seed without passphrase
         let m = Mnemonic::parse(&mnemonic)
             .map_err(|e| FfiError::internal(format!("Invalid mnemonic: {}", e)))?;
         let seed = m.to_seed_normalized("");
-
-        // Convert the FFI database trait to a CDK database implementation
-        let localstore = crate::database::create_cdk_database_from_ffi(db);
 
         // Parse proxy URL
         let proxy_url = url::Url::parse(&proxy_url)

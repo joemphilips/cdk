@@ -1163,6 +1163,14 @@ where
         })
     }
 
+    /// Clone the native database without routing it back through the foreign callback ABI.
+    pub(crate) fn clone_inner(&self) -> T
+    where
+        T: Clone,
+    {
+        self.inner.clone()
+    }
+
     /// Returns a reference to the inner database
     ///
     /// This is useful for accessing database-specific methods that are not part
@@ -2191,6 +2199,29 @@ pub fn resolve_wallet_store(store: WalletStore) -> Result<Arc<dyn WalletDatabase
     }
 }
 
+/// Resolve a wallet store directly to CDK's native database trait.
+///
+/// Built-in Rust backends must use this path so backend-specific extensions,
+/// including atomic conditional restore, are not erased by the UniFFI callback
+/// interface. Custom foreign stores remain bridged and therefore fail closed
+/// for extensions that are not part of that stable callback ABI.
+pub fn resolve_cdk_wallet_store(
+    store: WalletStore,
+) -> Result<Arc<dyn CdkWalletDatabase<cdk::cdk_database::Error> + Send + Sync>, FfiError> {
+    match store {
+        WalletStore::Sqlite { path } => {
+            let sqlite = WalletSqliteDatabase::new(path)?;
+            Ok(Arc::new(sqlite.native_database()))
+        }
+        #[cfg(feature = "postgres")]
+        WalletStore::Postgres { url } => {
+            let postgres = WalletPostgresDatabase::new(url)?;
+            Ok(Arc::new(postgres.native_database()))
+        }
+        WalletStore::Custom { db } => Ok(create_cdk_database_from_ffi(db)),
+    }
+}
+
 /// Factory helpers returning a CDK wallet database behind the FFI trait
 #[uniffi::export]
 pub fn create_wallet_db(backend: WalletDbBackend) -> Result<Arc<dyn WalletDatabase>, FfiError> {
@@ -2212,4 +2243,34 @@ pub fn create_cdk_database_from_ffi(
     ffi_db: Arc<dyn WalletDatabase>,
 ) -> Arc<dyn CdkWalletDatabase<cdk::cdk_database::Error> + Send + Sync> {
     Arc::new(WalletDatabaseBridge::new(ffi_db))
+}
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod conditional_restore_tests {
+    use std::str::FromStr;
+
+    use cdk_common::mint_url::MintUrl as CdkMintUrl;
+    use cdk_common::CurrencyUnit as CdkCurrencyUnit;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn builtin_sqlite_store_preserves_native_conditional_restore_extensions() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "cdk-ffi-conditional-{}.sqlite",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let database = resolve_cdk_wallet_store(WalletStore::Sqlite { path }).unwrap();
+        let mint_url = CdkMintUrl::from_str("https://ffi-restore.example.com").unwrap();
+        assert_eq!(
+            database
+                .advance_conditional_restore_high_water(mint_url, CdkCurrencyUnit::Sat, 7)
+                .await
+                .unwrap(),
+            7
+        );
+    }
 }

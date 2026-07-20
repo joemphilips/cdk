@@ -8,6 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cdk_common::bitcoin::bip32::DerivationPath;
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::database::wallet::{
+    join_conditional_restore_proof_state, ConditionalRestoreAdmission,
+    ConditionalRestoreAdmissionMode, ConditionalRestoreAdmissionResult,
+};
 use cdk_common::database::{validate_kvstore_params, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nut00::KnownMethod;
@@ -19,13 +24,16 @@ use cdk_common::{
     database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PaymentMethod,
     PublicKey, SpendingConditions, State,
 };
-use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
+    TableDefinition,
+};
 use tracing::instrument;
 
 use crate::error::Error;
 use crate::migrations::migrate_00_to_01;
 use crate::wallet::migrations::{
-    migrate_01_to_02, migrate_02_to_03, migrate_03_to_04, migrate_04_to_05,
+    migrate_01_to_02, migrate_02_to_03, migrate_03_to_04, migrate_04_to_05, migrate_05_to_06,
 };
 
 mod migrations;
@@ -51,6 +59,13 @@ const TRANSACTIONS_TABLE: TableDefinition<&[u8], &str> = TableDefinition::new("t
 // <Saga_id, WalletSaga>
 const SAGAS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("wallet_sagas");
 
+// <(Mint_url, unit), monotonic wall-clock high-water>
+const CONDITIONAL_RESTORE_HIGH_WATER_TABLE: TableDefinition<(&str, &str), u64> =
+    TableDefinition::new("conditional_restore_high_water");
+// <Keyset_id, immutable conditional keyset ownership and metadata>
+const CONDITIONAL_RESTORE_KEYSETS_TABLE: TableDefinition<&[u8], &str> =
+    TableDefinition::new("conditional_restore_keysets");
+
 // <Pubkey, P2PKSigningKey>
 const P2PK_SIGNING_KEYS_TABLE: TableDefinition<&[u8], &str> =
     TableDefinition::new("p2pk_signing_keys");
@@ -59,7 +74,14 @@ const KEYSET_U32_MAPPING: TableDefinition<u32, &str> = TableDefinition::new("key
 // <(primary_namespace, secondary_namespace, key), value>
 const KV_STORE_TABLE: TableDefinition<(&str, &str, &str), &[u8]> = TableDefinition::new("kv_store");
 
-const DATABASE_VERSION: u32 = 5;
+const DATABASE_VERSION: u32 = 6;
+
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ConditionalRestoreKeysetRecord {
+    mint_url: MintUrl,
+    info: cdk_common::nuts::nut_ctf::ConditionalKeySetInfo,
+}
 
 /// Wallet Redb Database
 #[derive(Debug, Clone)]
@@ -127,6 +149,10 @@ impl WalletRedbDatabase {
                                 current_file_version = migrate_04_to_05(Arc::clone(&db))?;
                             }
 
+                            if current_file_version == 5 {
+                                current_file_version = migrate_05_to_06(Arc::clone(&db))?;
+                            }
+
                             if current_file_version != DATABASE_VERSION {
                                 tracing::warn!(
                                     "Database upgrade did not complete at {} current is {}",
@@ -176,6 +202,8 @@ impl WalletRedbDatabase {
                         let _ = write_txn.open_table(KEYSET_U32_MAPPING)?;
                         let _ = write_txn.open_table(KV_STORE_TABLE)?;
                         let _ = write_txn.open_table(P2PK_SIGNING_KEYS_TABLE)?;
+                        let _ = write_txn.open_table(CONDITIONAL_RESTORE_HIGH_WATER_TABLE)?;
+                        let _ = write_txn.open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)?;
                         table.insert("db_version", DATABASE_VERSION.to_string().as_str())?;
                     }
 
@@ -203,6 +231,374 @@ impl WalletRedbDatabase {
 
 #[async_trait]
 impl WalletDatabase<database::Error> for WalletRedbDatabase {
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self))]
+    async fn advance_conditional_restore_high_water(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        observed_wall_time: u64,
+    ) -> Result<u64, database::Error> {
+        let write_txn = self.db.begin_write().map_err(Error::from)?;
+        let effective_time = {
+            let mut table = write_txn
+                .open_table(CONDITIONAL_RESTORE_HIGH_WATER_TABLE)
+                .map_err(Error::from)?;
+            let mint_url = mint_url.to_string();
+            let unit = unit.to_string();
+            let current = table
+                .get((mint_url.as_str(), unit.as_str()))
+                .map_err(Error::from)?
+                .map(|value| value.value())
+                .unwrap_or_default();
+            let effective_time = current.max(observed_wall_time);
+            table
+                .insert((mint_url.as_str(), unit.as_str()), effective_time)
+                .map_err(Error::from)?;
+            effective_time
+        };
+        write_txn.commit().map_err(Error::from)?;
+        Ok(effective_time)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self, admission))]
+    async fn commit_conditional_restore(
+        &self,
+        admission: ConditionalRestoreAdmission,
+    ) -> Result<ConditionalRestoreAdmissionResult, database::Error> {
+        admission.validate()?;
+        let final_expiry = admission.final_expiry()?;
+        let keyset_id = admission.keyset.id.to_bytes();
+        let keyset_id_text = admission.keyset.id.to_string();
+        let mint_url_text = admission.mint_url.to_string();
+        let unit_text = admission.unit.to_string();
+        let write_txn = self.db.begin_write().map_err(Error::from)?;
+
+        let effective_time = {
+            let mut table = write_txn
+                .open_table(CONDITIONAL_RESTORE_HIGH_WATER_TABLE)
+                .map_err(Error::from)?;
+            let current = table
+                .get((mint_url_text.as_str(), unit_text.as_str()))
+                .map_err(Error::from)?
+                .map(|value| value.value())
+                .unwrap_or_default();
+            let effective_time = current.max(admission.observed_wall_time);
+            table
+                .insert((mint_url_text.as_str(), unit_text.as_str()), effective_time)
+                .map_err(Error::from)?;
+            effective_time
+        };
+
+        if final_expiry.is_some_and(|expiry| expiry <= effective_time) {
+            write_txn.commit().map_err(Error::from)?;
+            return Ok(ConditionalRestoreAdmissionResult::Expired { effective_time });
+        }
+
+        let existing_classification = {
+            let table = write_txn
+                .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+                .map_err(Error::from)?;
+            let record = table
+                .get(keyset_id.as_slice())
+                .map_err(Error::from)?
+                .map(|record| record.value().to_owned());
+            record
+        };
+        let classified = existing_classification.is_some();
+        match existing_classification {
+            Some(record) => {
+                let record: ConditionalRestoreKeysetRecord =
+                    serde_json::from_str(&record).map_err(Error::from)?;
+                if record.mint_url != admission.mint_url
+                    || record.info != admission.conditional_keyset
+                {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+            }
+            None => {
+                let ordinary_keyset_exists = write_txn
+                    .open_table(KEYSETS_TABLE)
+                    .map_err(Error::from)?
+                    .get(keyset_id.as_slice())
+                    .map_err(Error::from)?
+                    .is_some();
+                let ordinary_keys_exist = write_txn
+                    .open_table(MINT_KEYS_TABLE)
+                    .map_err(Error::from)?
+                    .get(keyset_id_text.as_str())
+                    .map_err(Error::from)?
+                    .is_some();
+                if ordinary_keyset_exists || ordinary_keys_exist {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+
+                if admission.mode == ConditionalRestoreAdmissionMode::HeldProofs {
+                    let record = ConditionalRestoreKeysetRecord {
+                        mint_url: admission.mint_url.clone(),
+                        info: admission.conditional_keyset.clone(),
+                    };
+                    let record = serde_json::to_string(&record).map_err(Error::from)?;
+                    write_txn
+                        .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+                        .map_err(Error::from)?
+                        .insert(keyset_id.as_slice(), record.as_str())
+                        .map_err(Error::from)?;
+                }
+            }
+        }
+
+        if admission.mode == ConditionalRestoreAdmissionMode::ProgressOnly && !classified {
+            let proofs = write_txn.open_table(PROOFS_TABLE).map_err(Error::from)?;
+            for evidence in &admission.spent_proofs {
+                if proofs
+                    .get(evidence.y.to_bytes().as_slice())
+                    .map_err(Error::from)?
+                    .is_some()
+                {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+            }
+            drop(proofs);
+            let mut counters = write_txn.open_table(KEYSET_COUNTER).map_err(Error::from)?;
+            let current = counters
+                .get(keyset_id_text.as_str())
+                .map_err(Error::from)?
+                .map(|counter| counter.value())
+                .unwrap_or_default();
+            counters
+                .insert(
+                    keyset_id_text.as_str(),
+                    current.max(admission.counter_floor),
+                )
+                .map_err(Error::from)?;
+            drop(counters);
+            write_txn.commit().map_err(Error::from)?;
+            return Ok(ConditionalRestoreAdmissionResult::ProgressOnly { effective_time });
+        }
+
+        {
+            let mut mapping = write_txn
+                .open_table(KEYSET_U32_MAPPING)
+                .map_err(Error::from)?;
+            let compact_id = u32::from(admission.keyset.id);
+            let existing = mapping
+                .get(compact_id)
+                .map_err(Error::from)?
+                .map(|id| id.value().to_owned());
+            if existing
+                .as_deref()
+                .is_some_and(|id| id != keyset_id_text.as_str())
+            {
+                return Err(database::Error::ConditionalRestoreMetadataConflict);
+            }
+            if classified {
+                if existing.as_deref() != Some(keyset_id_text.as_str()) {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+            } else {
+                mapping
+                    .insert(compact_id, keyset_id_text.as_str())
+                    .map_err(Error::from)?;
+            }
+        }
+
+        let existing_keyset = {
+            let table = write_txn.open_table(KEYSETS_TABLE).map_err(Error::from)?;
+            let keyset = table
+                .get(keyset_id.as_slice())
+                .map_err(Error::from)?
+                .map(|keyset| keyset.value().to_owned());
+            keyset
+        };
+        match existing_keyset {
+            Some(keyset) => {
+                let keyset: KeySetInfo = serde_json::from_str(&keyset).map_err(Error::from)?;
+                if keyset != admission.keyset {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+                let mint_keysets = write_txn
+                    .open_multimap_table(MINT_KEYSETS_TABLE)
+                    .map_err(Error::from)?;
+                let owned = mint_keysets
+                    .get(mint_url_text.as_str())
+                    .map_err(Error::from)?
+                    .flatten()
+                    .any(|id| id.value() == keyset_id.as_slice());
+                if !owned {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+            }
+            None if !classified => {
+                let keyset = serde_json::to_string(&admission.keyset).map_err(Error::from)?;
+                write_txn
+                    .open_table(KEYSETS_TABLE)
+                    .map_err(Error::from)?
+                    .insert(keyset_id.as_slice(), keyset.as_str())
+                    .map_err(Error::from)?;
+                write_txn
+                    .open_multimap_table(MINT_KEYSETS_TABLE)
+                    .map_err(Error::from)?
+                    .insert(mint_url_text.as_str(), keyset_id.as_slice())
+                    .map_err(Error::from)?;
+            }
+            None => return Err(database::Error::ConditionalRestoreMetadataConflict),
+        }
+
+        let existing_keys = {
+            let table = write_txn.open_table(MINT_KEYS_TABLE).map_err(Error::from)?;
+            let keys = table
+                .get(keyset_id_text.as_str())
+                .map_err(Error::from)?
+                .map(|keys| keys.value().to_owned());
+            keys
+        };
+        match existing_keys {
+            Some(keys) => {
+                let keys: Keys = serde_json::from_str(&keys).map_err(Error::from)?;
+                if keys != admission.keys.keys {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+            }
+            None if !classified => {
+                let keys = serde_json::to_string(&admission.keys.keys).map_err(Error::from)?;
+                write_txn
+                    .open_table(MINT_KEYS_TABLE)
+                    .map_err(Error::from)?
+                    .insert(keyset_id_text.as_str(), keys.as_str())
+                    .map_err(Error::from)?;
+            }
+            None => return Err(database::Error::ConditionalRestoreMetadataConflict),
+        }
+
+        {
+            let mut proofs = write_txn.open_table(PROOFS_TABLE).map_err(Error::from)?;
+            for proof in &admission.proofs {
+                let y = proof.y.to_bytes();
+                let existing = proofs
+                    .get(y.as_slice())
+                    .map_err(Error::from)?
+                    .map(|stored| stored.value().to_owned());
+                match existing {
+                    Some(stored) => {
+                        let mut existing: ProofInfo =
+                            serde_json::from_str(&stored).map_err(Error::from)?;
+                        let mut expected = proof.clone();
+                        expected.state = existing.state;
+                        expected.used_by_operation = existing.used_by_operation;
+                        expected.created_by_operation = existing.created_by_operation;
+                        if expected != existing {
+                            return Err(database::Error::ConditionalRestoreMetadataConflict);
+                        }
+                        let joined =
+                            join_conditional_restore_proof_state(existing.state, proof.state);
+                        if joined != existing.state {
+                            existing.state = joined;
+                            let existing = serde_json::to_string(&existing).map_err(Error::from)?;
+                            proofs
+                                .insert(y.as_slice(), existing.as_str())
+                                .map_err(Error::from)?;
+                        }
+                    }
+                    None => {
+                        let proof = serde_json::to_string(proof).map_err(Error::from)?;
+                        proofs
+                            .insert(y.as_slice(), proof.as_str())
+                            .map_err(Error::from)?;
+                    }
+                }
+            }
+            for evidence in &admission.spent_proofs {
+                let y = evidence.y.to_bytes();
+                let Some(stored) = proofs
+                    .get(y.as_slice())
+                    .map_err(Error::from)?
+                    .map(|stored| stored.value().to_owned())
+                else {
+                    continue;
+                };
+                let mut existing: ProofInfo = serde_json::from_str(&stored).map_err(Error::from)?;
+                let mut expected = evidence.clone();
+                expected.state = existing.state;
+                expected.used_by_operation = existing.used_by_operation;
+                expected.created_by_operation = existing.created_by_operation;
+                if expected != existing {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+                if existing.state != State::Spent {
+                    existing.state = State::Spent;
+                    let existing = serde_json::to_string(&existing).map_err(Error::from)?;
+                    proofs
+                        .insert(y.as_slice(), existing.as_str())
+                        .map_err(Error::from)?;
+                }
+            }
+        }
+
+        {
+            let mut counters = write_txn.open_table(KEYSET_COUNTER).map_err(Error::from)?;
+            let current = counters
+                .get(keyset_id_text.as_str())
+                .map_err(Error::from)?
+                .map(|counter| counter.value())
+                .unwrap_or_default();
+            counters
+                .insert(
+                    keyset_id_text.as_str(),
+                    current.max(admission.counter_floor),
+                )
+                .map_err(Error::from)?;
+        }
+
+        write_txn.commit().map_err(Error::from)?;
+        Ok(match admission.mode {
+            ConditionalRestoreAdmissionMode::HeldProofs => {
+                ConditionalRestoreAdmissionResult::HeldProofs { effective_time }
+            }
+            ConditionalRestoreAdmissionMode::ProgressOnly => {
+                ConditionalRestoreAdmissionResult::ProgressOnly { effective_time }
+            }
+        })
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self, state, spending_conditions))]
+    async fn get_ordinary_proofs(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        state: Option<Vec<State>>,
+        spending_conditions: Option<Vec<SpendingConditions>>,
+    ) -> Result<Vec<ProofInfo>, database::Error> {
+        let read_txn = self.db.begin_read().map_err(Error::from)?;
+        let proofs = read_txn.open_table(PROOFS_TABLE).map_err(Error::from)?;
+        let conditional = read_txn
+            .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+            .map_err(Error::from)?;
+        let mint_filter = Some(mint_url);
+        let unit_filter = Some(unit);
+        let mut ordinary = Vec::new();
+        for row in proofs.iter().map_err(Error::from)? {
+            let (_, proof) = row.map_err(Error::from)?;
+            let proof: ProofInfo = serde_json::from_str(proof.value()).map_err(Error::from)?;
+            if conditional
+                .get(proof.proof.keyset_id.to_bytes().as_slice())
+                .map_err(Error::from)?
+                .is_none()
+                && proof.matches_conditions(
+                    &mint_filter,
+                    &unit_filter,
+                    &state,
+                    &spending_conditions,
+                )
+            {
+                ordinary.push(proof);
+            }
+        }
+        Ok(ordinary)
+    }
+
     #[instrument(skip(self))]
     async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, database::Error> {
         let read_txn = self.db.begin_read().map_err(Into::<Error>::into)?;
@@ -602,7 +998,110 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         old_mint_url: MintUrl,
         new_mint_url: MintUrl,
     ) -> Result<(), database::Error> {
+        if old_mint_url == new_mint_url {
+            return Ok(());
+        }
+
         let write_txn = self.db.begin_write().map_err(Error::from)?;
+
+        #[cfg(feature = "conditional-tokens")]
+        {
+            let old_mint_url_text = old_mint_url.to_string();
+            let new_mint_url_text = new_mint_url.to_string();
+            let high_water_rows = {
+                let table = write_txn
+                    .open_table(CONDITIONAL_RESTORE_HIGH_WATER_TABLE)
+                    .map_err(Error::from)?;
+                let mut rows = Vec::new();
+                for row in table.iter().map_err(Error::from)? {
+                    let (key, high_water) = row.map_err(Error::from)?;
+                    let (mint_url, unit) = key.value();
+                    if mint_url == old_mint_url_text {
+                        rows.push((unit.to_owned(), high_water.value()));
+                    }
+                }
+                rows
+            };
+            if !high_water_rows.is_empty() {
+                let mut table = write_txn
+                    .open_table(CONDITIONAL_RESTORE_HIGH_WATER_TABLE)
+                    .map_err(Error::from)?;
+                for (unit, old_high_water) in high_water_rows {
+                    let new_high_water = table
+                        .get((new_mint_url_text.as_str(), unit.as_str()))
+                        .map_err(Error::from)?
+                        .map(|value| value.value())
+                        .unwrap_or_default()
+                        .max(old_high_water);
+                    table
+                        .insert((new_mint_url_text.as_str(), unit.as_str()), new_high_water)
+                        .map_err(Error::from)?;
+                    table
+                        .remove((old_mint_url_text.as_str(), unit.as_str()))
+                        .map_err(Error::from)?;
+                }
+            }
+
+            let classifications = {
+                let table = write_txn
+                    .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+                    .map_err(Error::from)?;
+                let mut rows = Vec::new();
+                for row in table.iter().map_err(Error::from)? {
+                    let (id, record) = row.map_err(Error::from)?;
+                    let record =
+                        serde_json::from_str::<ConditionalRestoreKeysetRecord>(record.value())
+                            .map_err(Error::from)?;
+                    if record.mint_url == old_mint_url {
+                        rows.push((id.value().to_vec(), record));
+                    }
+                }
+                rows
+            };
+            if !classifications.is_empty() {
+                let mut table = write_txn
+                    .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+                    .map_err(Error::from)?;
+                for (id, mut record) in classifications {
+                    record.mint_url = new_mint_url.clone();
+                    let record = serde_json::to_string(&record).map_err(Error::from)?;
+                    table
+                        .insert(id.as_slice(), record.as_str())
+                        .map_err(Error::from)?;
+                }
+            }
+        }
+
+        // Move keyset ownership to the canonical mint URL.
+        {
+            let old_mint_url_text = old_mint_url.to_string();
+            let new_mint_url_text = new_mint_url.to_string();
+            let keyset_ids = {
+                let table = write_txn
+                    .open_multimap_table(MINT_KEYSETS_TABLE)
+                    .map_err(Error::from)?;
+                let ids = table
+                    .get(old_mint_url_text.as_str())
+                    .map_err(Error::from)?
+                    .flatten()
+                    .map(|id| id.value().to_vec())
+                    .collect::<Vec<_>>();
+                ids
+            };
+            if !keyset_ids.is_empty() {
+                let mut table = write_txn
+                    .open_multimap_table(MINT_KEYSETS_TABLE)
+                    .map_err(Error::from)?;
+                table
+                    .remove_all(old_mint_url_text.as_str())
+                    .map_err(Error::from)?;
+                for id in keyset_ids {
+                    table
+                        .insert(new_mint_url_text.as_str(), id.as_slice())
+                        .map_err(Error::from)?;
+                }
+            }
+        }
 
         // Update proofs table
         {
@@ -690,7 +1189,9 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
                 .map(|x| x.value())
                 .unwrap_or_default();
 
-            let new_counter = current_counter + count;
+            let new_counter = current_counter
+                .checked_add(count)
+                .ok_or(database::Error::AmountOverflow)?;
 
             table
                 .insert(keyset_id.to_string().as_str(), new_counter)
@@ -744,6 +1245,23 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         keysets: Vec<KeySetInfo>,
     ) -> Result<(), database::Error> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
+
+        #[cfg(feature = "conditional-tokens")]
+        {
+            let table = write_txn
+                .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+                .map_err(Error::from)?;
+            for keyset in &keysets {
+                if table
+                    .get(keyset.id.to_bytes().as_slice())
+                    .map_err(Error::from)?
+                    .is_some()
+                {
+                    return Err(database::Error::ConditionalRestoreMetadataConflict);
+                }
+            }
+        }
+
         {
             let mut table = write_txn
                 .open_multimap_table(MINT_KEYSETS_TABLE)
@@ -931,6 +1449,17 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     async fn add_keys(&self, keyset: KeySet) -> Result<(), database::Error> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
 
+        #[cfg(feature = "conditional-tokens")]
+        if write_txn
+            .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+            .map_err(Error::from)?
+            .get(keyset.id.to_bytes().as_slice())
+            .map_err(Error::from)?
+            .is_some()
+        {
+            return Err(database::Error::ConditionalRestoreMetadataConflict);
+        }
+
         keyset.verify_id()?;
 
         {
@@ -974,6 +1503,16 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     #[instrument(skip(self), fields(keyset_id = %keyset_id))]
     async fn remove_keys(&self, keyset_id: &Id) -> Result<(), database::Error> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
+        #[cfg(feature = "conditional-tokens")]
+        if write_txn
+            .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+            .map_err(Error::from)?
+            .get(keyset_id.to_bytes().as_slice())
+            .map_err(Error::from)?
+            .is_some()
+        {
+            return Err(database::Error::ConditionalRestoreMetadataConflict);
+        }
         {
             let mut table = write_txn.open_table(MINT_KEYS_TABLE).map_err(Error::from)?;
 
@@ -1577,9 +2116,21 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
 mod test {
     use std::path::PathBuf;
 
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::database::WalletDatabase;
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::mint_url::MintUrl;
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::wallet_conditional_restore_db_test;
     use cdk_common::wallet_db_test;
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::CurrencyUnit;
+    #[cfg(feature = "conditional-tokens")]
+    use redb::{Database, ReadableDatabase};
 
     use super::WalletRedbDatabase;
+    #[cfg(feature = "conditional-tokens")]
+    use super::{CONFIG_TABLE, DATABASE_VERSION};
 
     async fn provide_db(test_id: String) -> WalletRedbDatabase {
         let path = PathBuf::from(format!("/tmp/cdk-test-{}.redb", test_id));
@@ -1587,4 +2138,50 @@ mod test {
     }
 
     wallet_db_test!(provide_db);
+    #[cfg(feature = "conditional-tokens")]
+    wallet_conditional_restore_db_test!(provide_db);
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn wallet_conditional_restore_migrates_v5_schema() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("wallet.redb");
+        let db = Database::create(&path).expect("legacy database");
+        let write_txn = db.begin_write().expect("legacy write transaction");
+        {
+            let mut config = write_txn
+                .open_table(CONFIG_TABLE)
+                .expect("legacy config table");
+            config.insert("db_version", "5").expect("legacy version");
+        }
+        write_txn.commit().expect("legacy database commit");
+        drop(db);
+
+        let wallet = WalletRedbDatabase::new(&path).expect("database migration");
+        assert_eq!(
+            wallet
+                .advance_conditional_restore_high_water(
+                    "https://example.com"
+                        .parse::<MintUrl>()
+                        .expect("test mint URL"),
+                    CurrencyUnit::Sat,
+                    u64::MAX,
+                )
+                .await
+                .expect("migrated high-water table"),
+            u64::MAX
+        );
+        let read_txn = wallet.db.begin_read().expect("version read transaction");
+        let config = read_txn
+            .open_table(CONFIG_TABLE)
+            .expect("migrated config table");
+        assert_eq!(
+            config
+                .get("db_version")
+                .expect("version lookup")
+                .expect("version row")
+                .value(),
+            DATABASE_VERSION.to_string()
+        );
+    }
 }

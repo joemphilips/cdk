@@ -28,6 +28,12 @@ pub mod test;
 
 pub use auth::{DynMintAuthDatabase, MintAuthDatabase, MintAuthTransaction};
 
+#[cfg(feature = "conditional-tokens")]
+pub use super::conditional::{
+    is_canonical_conditional_keyset_hash, validate_conditional_keyset_catalogue_fields,
+    MAX_CONDITIONAL_KEYSET_OUTCOME_COLLECTION_LENGTH, MAX_CONDITIONAL_KEYSET_UNIT_LENGTH,
+};
+
 // Re-export KVStore types from shared module for backward compatibility
 pub use super::kvstore::{
     validate_kvstore_params, validate_kvstore_string, KVStore, KVStoreDatabase, KVStoreTransaction,
@@ -671,18 +677,6 @@ pub const MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE: u64 = 100;
 #[cfg(feature = "conditional-tokens")]
 pub const MAX_CONDITIONAL_KEYSET_CATALOGUE_CURSOR_LENGTH: usize = 2_048;
 
-/// Maximum byte length of a wire-visible currency unit.
-#[cfg(feature = "conditional-tokens")]
-pub const MAX_CONDITIONAL_KEYSET_UNIT_LENGTH: usize = 64;
-
-/// Maximum byte length of one canonical outcome-collection expression.
-///
-/// A page can contain 100 expressions and JSON escaping can expand every
-/// source byte to six bytes (`\\u00xx`). Keeping the field at 16 KiB leaves
-/// ample room below the shared hard response cap for all fixed metadata.
-#[cfg(feature = "conditional-tokens")]
-pub const MAX_CONDITIONAL_KEYSET_OUTCOME_COLLECTION_LENGTH: usize = 16 * 1_024;
-
 #[cfg(feature = "conditional-tokens")]
 const MAX_JSON_ESCAPED_BYTES_PER_INPUT_BYTE: usize = 6;
 #[cfg(feature = "conditional-tokens")]
@@ -715,40 +709,6 @@ const _: () = assert!(
     MAX_CONDITIONAL_KEYSET_CATALOGUE_DERIVED_RESPONSE_BYTES
         <= MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES
 );
-
-/// Whether a value is the canonical lowercase encoding of a 32-byte hash.
-#[cfg(feature = "conditional-tokens")]
-pub fn is_canonical_conditional_keyset_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// Validate the bounded wire/persistence fields shared by registrations,
-/// database rows, server responses, and wallet connectors.
-#[cfg(feature = "conditional-tokens")]
-pub fn validate_conditional_keyset_catalogue_fields(
-    unit: &str,
-    condition_id: &str,
-    outcome_collection: &str,
-    outcome_collection_id: &str,
-) -> Result<(), &'static str> {
-    if unit.is_empty() || unit.len() > MAX_CONDITIONAL_KEYSET_UNIT_LENGTH {
-        return Err("catalogue keyset unit is invalid");
-    }
-    if !is_canonical_conditional_keyset_hash(condition_id)
-        || !is_canonical_conditional_keyset_hash(outcome_collection_id)
-    {
-        return Err("catalogue keyset identifiers are not canonical lowercase 32-byte hex values");
-    }
-    if outcome_collection.is_empty()
-        || outcome_collection.len() > MAX_CONDITIONAL_KEYSET_OUTCOME_COLLECTION_LENGTH
-    {
-        return Err("catalogue outcome collection exceeds its field bound");
-    }
-    Ok(())
-}
 
 /// A conditional keyset paired with its immutable catalogue sequence.
 #[cfg(feature = "conditional-tokens")]

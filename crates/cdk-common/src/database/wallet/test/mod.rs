@@ -23,6 +23,11 @@ use crate::wallet::{
     TransactionDirection, WalletSaga, WalletSagaState,
 };
 
+#[cfg(feature = "conditional-tokens")]
+mod conditional_restore;
+#[cfg(feature = "conditional-tokens")]
+pub use conditional_restore::*;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a unique test ID
@@ -1599,5 +1604,39 @@ macro_rules! wallet_db_test {
                 }
             )+
         }
+    };
+}
+
+/// Conditional-restore tests expected of every native wallet database backend.
+#[cfg(feature = "conditional-tokens")]
+#[macro_export]
+macro_rules! wallet_conditional_restore_db_test {
+    ($make_db_fn:ident) => {
+        $crate::wallet_db_test!(
+            $make_db_fn,
+            conditional_restore_high_water_is_monotonic,
+            conditional_restore_commit_is_atomic,
+            conditional_restore_accepts_non_expiring_optional_fee_metadata,
+            conditional_restore_expiry_only_advances_high_water,
+            conditional_restore_progress_only_advances_counter_without_hydration,
+            conditional_restore_progress_only_rejects_namespace_conflicts,
+            conditional_restore_spent_evidence_is_exact_and_non_hydrating,
+            conditional_restore_rejects_duplicate_spent_evidence,
+            conditional_restore_progress_only_retries_preserve_maxima,
+            conditional_restore_expired_progress_only_does_not_advance_counter,
+            conditional_restore_rejects_immutable_metadata_conflict,
+            conditional_restore_late_proof_conflict_rolls_back,
+            conditional_restore_rejects_invalid_proof_admission,
+            conditional_restore_rejects_mutated_semantic_binding,
+            conditional_restore_rejects_ordinary_id_collision,
+            ordinary_keyset_refresh_rejects_conditional_id,
+            conditional_restore_retry_joins_proof_lifecycle,
+            conditional_restore_counter_uses_absolute_floor,
+            conditional_restore_counter_overflow_is_non_mutating,
+            ordinary_key_operations_cannot_mutate_conditional_keys,
+            conditional_restore_update_mint_url_preserves_fence,
+            conditional_restore_update_mint_url_same_url_is_noop,
+            ordinary_proofs_exclude_conditional_but_listing_and_balance_include_it
+        );
     };
 }

@@ -48,7 +48,13 @@ bip353 = ["cdk/bip353"]
 postgres = ["cdk-postgres"]
 # Enable Supabase-backed wallet database support in FFI
 supabase = ["cdk-supabase"]
-conditional-tokens = ["cdk/conditional-tokens", "cdk-common/conditional-tokens"]
+conditional-tokens = [
+    "cdk/conditional-tokens",
+    "cdk-common/conditional-tokens",
+    "cdk-sqlite/conditional-tokens",
+    "cdk-postgres?/conditional-tokens",
+    "cdk-supabase?/conditional-tokens",
+]
 # Enable NpubCash client bindings
 npubcash = ["cdk-npubcash", "nostr-sdk"]
 

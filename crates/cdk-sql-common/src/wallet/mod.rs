@@ -7,8 +7,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bitcoin::bip32::DerivationPath;
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::database::wallet::{
+    join_conditional_restore_proof_state, ConditionalRestoreAdmission,
+    ConditionalRestoreAdmissionMode, ConditionalRestoreAdmissionResult,
+};
 use cdk_common::database::{ConversionError, Error, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::nuts::nut_ctf::ConditionalKeySetInfo;
 use cdk_common::nuts::{MeltQuoteState, MintQuoteState};
 use cdk_common::secret::Secret;
 use cdk_common::util::unix_time;
@@ -143,11 +150,522 @@ where
     }
 }
 
+#[cfg(feature = "conditional-tokens")]
+fn encode_restore_high_water(value: u64) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn decode_restore_high_water(value: Column) -> Result<u64, Error> {
+    let bytes = column_as_binary!(value);
+    let bytes = <[u8; 8]>::try_from(bytes.as_slice()).map_err(|_| Error::InvalidDbResponse)?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn advance_restore_high_water<T>(
+    conn: &T,
+    mint_url: &MintUrl,
+    unit: &CurrencyUnit,
+    observed_wall_time: u64,
+) -> Result<u64, Error>
+where
+    T: DatabaseExecutor,
+{
+    let high_water = encode_restore_high_water(observed_wall_time);
+    let stored = query(
+        r#"
+        INSERT INTO conditional_restore_high_water (mint_url, unit, high_water)
+        VALUES (:mint_url, :unit, :high_water)
+        ON CONFLICT(mint_url, unit) DO UPDATE SET
+            high_water = CASE
+                WHEN conditional_restore_high_water.high_water < excluded.high_water
+                    THEN excluded.high_water
+                ELSE conditional_restore_high_water.high_water
+            END
+        RETURNING high_water
+        "#,
+    )?
+    .bind("mint_url", mint_url.to_string())
+    .bind("unit", unit.to_string())
+    .bind("high_water", high_water)
+    .pluck(conn)
+    .await?
+    .ok_or(Error::InvalidDbResponse)?;
+    decode_restore_high_water(stored)
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn lock_restore_mint_namespace<T>(
+    conn: &T,
+    postgres: bool,
+    mint_url: &MintUrl,
+) -> Result<(), Error>
+where
+    T: DatabaseExecutor,
+{
+    if postgres {
+        query("SELECT pg_advisory_xact_lock(hashtext(:mint_url))")?
+            .bind("mint_url", mint_url.to_string())
+            // The PostgreSQL function returns `void`. Execute the statement
+            // without deserializing its result while retaining the
+            // transaction-scoped lock on this connection.
+            .execute(conn)
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn checked_sql_u64(value: u64, field: &str) -> Result<i64, Error> {
+    i64::try_from(value).map_err(|_| {
+        Error::InvalidConditionalRestore(format!("{field} exceeds the SQL integer domain"))
+    })
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn load_conditional_restore_keyset<T>(
+    conn: &T,
+    id: &Id,
+) -> Result<Option<(MintUrl, ConditionalKeySetInfo)>, Error>
+where
+    T: DatabaseExecutor,
+{
+    query(
+        r#"
+        SELECT id, mint_url, unit, active, input_fee_ppk, final_expiry,
+               condition_id, outcome_collection, outcome_collection_id, registered_at
+        FROM conditional_restore_keyset
+        WHERE id = :id
+        "#,
+    )?
+    .bind("id", id.to_string())
+    .fetch_one(conn)
+    .await?
+    .map(sql_row_to_conditional_restore_keyset)
+    .transpose()
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn apply_conditional_restore_spent_evidence<T>(
+    conn: &T,
+    spent_proofs: &[ProofInfo],
+) -> Result<(), Error>
+where
+    T: DatabaseExecutor,
+{
+    for evidence in spent_proofs {
+        let Some(existing) = load_proof_by_y(conn, &evidence.y).await? else {
+            continue;
+        };
+        let mut expected = evidence.clone();
+        expected.state = existing.state;
+        expected.used_by_operation = existing.used_by_operation;
+        expected.created_by_operation = existing.created_by_operation;
+        if expected != existing {
+            return Err(Error::ConditionalRestoreMetadataConflict);
+        }
+        if existing.state != State::Spent {
+            query("UPDATE proof SET state = :state WHERE y = :y")?
+                .bind("state", State::Spent.to_string())
+                .bind("y", evidence.y.to_bytes().to_vec())
+                .execute(conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl<RM> WalletDatabase<database::Error> for SQLWalletDatabase<RM>
 where
     RM: DatabasePool + 'static,
 {
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self))]
+    async fn advance_conditional_restore_high_water(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        observed_wall_time: u64,
+    ) -> Result<u64, database::Error> {
+        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let tx = ConnectionWithTransaction::new(conn).await?;
+        lock_restore_mint_namespace(&tx, RM::Connection::name() == "postgres", &mint_url).await?;
+        let effective =
+            advance_restore_high_water(&tx, &mint_url, &unit, observed_wall_time).await?;
+        tx.commit().await?;
+        Ok(effective)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self, admission))]
+    async fn commit_conditional_restore(
+        &self,
+        admission: ConditionalRestoreAdmission,
+    ) -> Result<ConditionalRestoreAdmissionResult, database::Error> {
+        admission.validate()?;
+        let final_expiry = admission.final_expiry()?;
+        let input_fee_ppk = checked_sql_u64(admission.keyset.input_fee_ppk, "input_fee_ppk")?;
+        let classification_input_fee_ppk = admission
+            .conditional_keyset
+            .input_fee_ppk
+            .map(|fee| checked_sql_u64(fee, "input_fee_ppk"))
+            .transpose()?;
+        let final_expiry_sql = final_expiry
+            .map(|expiry| checked_sql_u64(expiry, "final_expiry"))
+            .transpose()?;
+        let registered_at =
+            checked_sql_u64(admission.conditional_keyset.registered_at, "registered_at")?;
+        let keys_json = serde_json::to_string(&admission.keys.keys)?;
+        for proof in admission.proofs.iter().chain(&admission.spent_proofs) {
+            checked_sql_u64(u64::from(proof.proof.amount), "proof amount")?;
+        }
+
+        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let tx = ConnectionWithTransaction::new(conn).await?;
+        let operation = async {
+            lock_restore_mint_namespace(
+                &tx,
+                RM::Connection::name() == "postgres",
+                &admission.mint_url,
+            )
+            .await?;
+            let effective_time = advance_restore_high_water(
+                &tx,
+                &admission.mint_url,
+                &admission.unit,
+                admission.observed_wall_time,
+            )
+            .await?;
+            if final_expiry.is_some_and(|expiry| expiry <= effective_time) {
+                return Ok(ConditionalRestoreAdmissionResult::Expired { effective_time });
+            }
+
+            if admission.mode == ConditionalRestoreAdmissionMode::ProgressOnly {
+                let classification =
+                    load_conditional_restore_keyset(&tx, &admission.keyset.id).await?;
+                let stored_keyset = query(
+                    r#"
+                    SELECT mint_url, id, unit, active, input_fee_ppk, final_expiry, restore_kind
+                    FROM keyset WHERE id = :id
+                    "#,
+                )?
+                .bind("id", admission.keyset.id.to_string())
+                .fetch_one(&tx)
+                .await?;
+                let stored_keys = query("SELECT keys, restore_kind FROM key WHERE id = :id")?
+                    .bind("id", admission.keyset.id.to_string())
+                    .fetch_one(&tx)
+                    .await?;
+
+                match classification {
+                    Some((mint_url, info)) => {
+                        if mint_url != admission.mint_url || info != admission.conditional_keyset {
+                            return Err(Error::ConditionalRestoreMetadataConflict);
+                        }
+                        let (mint_url, keyset, restore_kind) = stored_keyset
+                            .ok_or(Error::ConditionalRestoreMetadataConflict)
+                            .and_then(sql_row_to_owned_keyset)?;
+                        if mint_url != admission.mint_url
+                            || keyset != admission.keyset
+                            || restore_kind != "conditional"
+                        {
+                            return Err(Error::ConditionalRestoreMetadataConflict);
+                        }
+                        let stored_keys =
+                            stored_keys.ok_or(Error::ConditionalRestoreMetadataConflict)?;
+                        unpack_into!(let (keys, restore_kind) = stored_keys);
+                        if column_as_string!(keys) != keys_json
+                            || column_as_string!(restore_kind) != "conditional"
+                        {
+                            return Err(Error::ConditionalRestoreMetadataConflict);
+                        }
+                        apply_conditional_restore_spent_evidence(&tx, &admission.spent_proofs)
+                            .await?;
+                    }
+                    None => {
+                        if stored_keyset.is_some() || stored_keys.is_some() {
+                            return Err(Error::ConditionalRestoreMetadataConflict);
+                        }
+                        for evidence in &admission.spent_proofs {
+                            if load_proof_by_y(&tx, &evidence.y).await?.is_some() {
+                                return Err(Error::ConditionalRestoreMetadataConflict);
+                            }
+                        }
+                    }
+                }
+                query(
+                    r#"
+                    INSERT INTO keyset_counter (keyset_id, counter)
+                    VALUES (:keyset_id, :counter_floor)
+                    ON CONFLICT(keyset_id) DO UPDATE SET
+                        counter = CASE
+                            WHEN keyset_counter.counter < excluded.counter THEN excluded.counter
+                            ELSE keyset_counter.counter
+                        END
+                    "#,
+                )?
+                .bind("keyset_id", admission.keyset.id.to_string())
+                .bind("counter_floor", admission.counter_floor)
+                .execute(&tx)
+                .await?;
+                return Ok(ConditionalRestoreAdmissionResult::ProgressOnly { effective_time });
+            }
+
+            let mut existing_classification =
+                load_conditional_restore_keyset(&tx, &admission.keyset.id).await?;
+            if let Some((mint_url, info)) = &existing_classification {
+                if *mint_url != admission.mint_url || *info != admission.conditional_keyset {
+                    return Err(Error::ConditionalRestoreMetadataConflict);
+                }
+            }
+
+            let mut new_namespace_claim = false;
+            if existing_classification.is_none() {
+                if query("SELECT id FROM key WHERE id = :id")?
+                    .bind("id", admission.keyset.id.to_string())
+                    .pluck(&tx)
+                    .await?
+                    .is_some()
+                {
+                    return Err(Error::ConditionalRestoreMetadataConflict);
+                }
+                let inserted = query(
+                    r#"
+                    INSERT INTO keyset
+                        (mint_url, id, unit, active, input_fee_ppk, final_expiry,
+                         keyset_u32, restore_kind)
+                    VALUES
+                        (:mint_url, :id, :unit, :active, :input_fee_ppk, :final_expiry,
+                         :keyset_u32, 'conditional')
+                    ON CONFLICT(id) DO NOTHING
+                    "#,
+                )?
+                .bind("mint_url", admission.mint_url.to_string())
+                .bind("id", admission.keyset.id.to_string())
+                .bind("unit", admission.unit.to_string())
+                .bind("active", false)
+                .bind("input_fee_ppk", input_fee_ppk)
+                .bind("final_expiry", final_expiry_sql)
+                .bind("keyset_u32", u32::from(admission.keyset.id))
+                .execute(&tx)
+                .await?;
+                if inserted == 1 {
+                    new_namespace_claim = true;
+                } else {
+                    existing_classification =
+                        load_conditional_restore_keyset(&tx, &admission.keyset.id).await?;
+                    match &existing_classification {
+                        Some((mint_url, info))
+                            if *mint_url == admission.mint_url
+                                && *info == admission.conditional_keyset => {}
+                        Some(_) | None => {
+                            return Err(Error::ConditionalRestoreMetadataConflict);
+                        }
+                    }
+                }
+            }
+
+            let stored_keyset = query(
+                r#"
+                SELECT mint_url, id, unit, active, input_fee_ppk, final_expiry, restore_kind
+                FROM keyset WHERE id = :id
+                "#,
+            )?
+            .bind("id", admission.keyset.id.to_string())
+            .fetch_one(&tx)
+            .await?
+            .ok_or(Error::ConditionalRestoreMetadataConflict)?;
+            let (mint_url, keyset, restore_kind) = sql_row_to_owned_keyset(stored_keyset)?;
+            if mint_url != admission.mint_url
+                || keyset != admission.keyset
+                || restore_kind != "conditional"
+            {
+                return Err(Error::ConditionalRestoreMetadataConflict);
+            }
+
+            let stored_keys = query("SELECT keys, restore_kind FROM key WHERE id = :id")?
+                .bind("id", admission.keyset.id.to_string())
+                .fetch_one(&tx)
+                .await?;
+            match stored_keys {
+                Some(row) => {
+                    unpack_into!(let (value, restore_kind) = row);
+                    if column_as_string!(value) != keys_json
+                        || column_as_string!(restore_kind) != "conditional"
+                    {
+                        return Err(Error::ConditionalRestoreMetadataConflict);
+                    }
+                }
+                None if new_namespace_claim => {
+                    let inserted = query(
+                        r#"
+                        INSERT INTO key (id, keys, keyset_u32, restore_kind)
+                        VALUES (:id, :keys, :keyset_u32, 'conditional')
+                        ON CONFLICT(id) DO NOTHING
+                        "#,
+                    )?
+                    .bind("id", admission.keyset.id.to_string())
+                    .bind("keys", keys_json.clone())
+                    .bind("keyset_u32", u32::from(admission.keyset.id))
+                    .execute(&tx)
+                    .await?;
+                    if inserted != 1 {
+                        return Err(Error::ConditionalRestoreMetadataConflict);
+                    }
+                }
+                None => return Err(Error::ConditionalRestoreMetadataConflict),
+            }
+
+            if new_namespace_claim {
+                query(
+                    r#"
+                    INSERT INTO conditional_restore_keyset
+                        (id, mint_url, unit, active, input_fee_ppk, final_expiry,
+                         condition_id, outcome_collection, outcome_collection_id, registered_at)
+                    VALUES
+                        (:id, :mint_url, :unit, :active, :input_fee_ppk, :final_expiry,
+                         :condition_id, :outcome_collection, :outcome_collection_id, :registered_at)
+                    "#,
+                )?
+                .bind("id", admission.keyset.id.to_string())
+                .bind("mint_url", admission.mint_url.to_string())
+                .bind("unit", admission.unit.to_string())
+                .bind("active", admission.conditional_keyset.active)
+                .bind("input_fee_ppk", classification_input_fee_ppk)
+                .bind("final_expiry", final_expiry_sql)
+                .bind(
+                    "condition_id",
+                    admission.conditional_keyset.condition_id.clone(),
+                )
+                .bind(
+                    "outcome_collection",
+                    admission.conditional_keyset.outcome_collection.clone(),
+                )
+                .bind(
+                    "outcome_collection_id",
+                    admission.conditional_keyset.outcome_collection_id.clone(),
+                )
+                .bind("registered_at", registered_at)
+                .execute(&tx)
+                .await?;
+            }
+
+            for proof in &admission.proofs {
+                let existing = load_proof_by_y(&tx, &proof.y).await?;
+                match existing {
+                    Some(existing) => {
+                        let mut expected = proof.clone();
+                        expected.state = existing.state;
+                        expected.used_by_operation = existing.used_by_operation;
+                        expected.created_by_operation = existing.created_by_operation;
+                        if expected != existing {
+                            return Err(Error::ConditionalRestoreMetadataConflict);
+                        }
+                        let joined =
+                            join_conditional_restore_proof_state(existing.state, proof.state);
+                        if joined != existing.state {
+                            query(
+                                "UPDATE proof SET state = :state \
+                                 WHERE y = :y AND state = 'UNSPENT'",
+                            )?
+                            .bind("state", joined.to_string())
+                            .bind("y", proof.y.to_bytes().to_vec())
+                            .execute(&tx)
+                            .await?;
+                        }
+                    }
+                    None => insert_restore_proof(&tx, proof).await?,
+                }
+            }
+            apply_conditional_restore_spent_evidence(&tx, &admission.spent_proofs).await?;
+
+            query(
+                r#"
+                INSERT INTO keyset_counter (keyset_id, counter)
+                VALUES (:keyset_id, :counter_floor)
+                ON CONFLICT(keyset_id) DO UPDATE SET
+                    counter = CASE
+                        WHEN keyset_counter.counter < excluded.counter THEN excluded.counter
+                        ELSE keyset_counter.counter
+                    END
+                "#,
+            )?
+            .bind("keyset_id", admission.keyset.id.to_string())
+            .bind("counter_floor", admission.counter_floor)
+            .execute(&tx)
+            .await?;
+
+            Ok(ConditionalRestoreAdmissionResult::HeldProofs { effective_time })
+        }
+        .await;
+
+        match operation {
+            Ok(result) => {
+                tx.commit().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self, state, spending_conditions))]
+    async fn get_ordinary_proofs(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        state: Option<Vec<State>>,
+        spending_conditions: Option<Vec<SpendingConditions>>,
+    ) -> Result<Vec<ProofInfo>, database::Error> {
+        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let mint_filter = Some(mint_url);
+        let unit_filter = Some(unit);
+        Ok(query(
+            r#"
+            SELECT
+                p.amount, p.unit, p.keyset_id, p.secret, p.c, p.witness,
+                p.dleq_e, p.dleq_s, p.dleq_r, p.y, p.mint_url, p.state,
+                p.spending_condition, p.used_by_operation, p.created_by_operation, p.p2pk_e
+            FROM proof p
+            WHERE p.mint_url = :mint_url
+              AND p.unit = :unit
+              AND NOT EXISTS (
+                  SELECT 1 FROM conditional_restore_keyset c
+                  WHERE c.id = p.keyset_id
+              )
+            "#,
+        )?
+        .bind(
+            "mint_url",
+            mint_filter
+                .as_ref()
+                .expect("mint filter is set")
+                .to_string(),
+        )
+        .bind(
+            "unit",
+            unit_filter
+                .as_ref()
+                .expect("unit filter is set")
+                .to_string(),
+        )
+        .fetch_all(&*conn)
+        .await?
+        .into_iter()
+        .map(sql_row_to_proof_info)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|proof| {
+            proof.matches_conditions(&mint_filter, &unit_filter, &state, &spending_conditions)
+        })
+        .collect())
+    }
+
     #[instrument(skip(self))]
     async fn get_melt_quotes(&self) -> Result<Vec<wallet::MeltQuote>, database::Error> {
         let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
@@ -868,7 +1386,76 @@ where
     ) -> Result<(), database::Error> {
         let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
         let tx = ConnectionWithTransaction::new(conn).await?;
-        let tables = ["mint_quote", "proof"];
+        #[cfg(feature = "conditional-tokens")]
+        if old_mint_url != new_mint_url {
+            let mut lock_urls = [&old_mint_url, &new_mint_url];
+            lock_urls.sort_by_key(|url| url.to_string());
+            for mint_url in lock_urls {
+                lock_restore_mint_namespace(&tx, RM::Connection::name() == "postgres", mint_url)
+                    .await?;
+            }
+            if RM::Connection::name() == "postgres" {
+                query("SELECT set_config('cdk.conditional_restore_url_migration', 'on', true)")?
+                    .pluck(&tx)
+                    .await?;
+                query(
+                    r#"
+                    SELECT high_water
+                    FROM conditional_restore_high_water
+                    WHERE mint_url = :old_mint_url
+                    FOR UPDATE
+                    "#,
+                )?
+                .bind("old_mint_url", old_mint_url.to_string())
+                .fetch_all(&tx)
+                .await?;
+            } else {
+                query(
+                    r#"
+                    INSERT INTO conditional_restore_high_water_move_authority
+                        (old_mint_url, new_mint_url)
+                    VALUES (:old_mint_url, :new_mint_url)
+                    ON CONFLICT(old_mint_url) DO UPDATE SET
+                        new_mint_url = excluded.new_mint_url
+                    "#,
+                )?
+                .bind("old_mint_url", old_mint_url.to_string())
+                .bind("new_mint_url", new_mint_url.to_string())
+                .execute(&tx)
+                .await?;
+            }
+            query(
+                r#"
+                INSERT INTO conditional_restore_high_water (mint_url, unit, high_water)
+                SELECT :new_mint_url, unit, high_water
+                FROM conditional_restore_high_water
+                WHERE mint_url = :old_mint_url
+                ON CONFLICT(mint_url, unit) DO UPDATE SET
+                    high_water = CASE
+                        WHEN conditional_restore_high_water.high_water < excluded.high_water
+                            THEN excluded.high_water
+                        ELSE conditional_restore_high_water.high_water
+                    END
+                "#,
+            )?
+            .bind("new_mint_url", new_mint_url.to_string())
+            .bind("old_mint_url", old_mint_url.to_string())
+            .execute(&tx)
+            .await?;
+            query("DELETE FROM conditional_restore_high_water WHERE mint_url = :old_mint_url")?
+                .bind("old_mint_url", old_mint_url.to_string())
+                .execute(&tx)
+                .await?;
+            if RM::Connection::name() != "postgres" {
+                query(
+                    "DELETE FROM conditional_restore_high_water_move_authority WHERE old_mint_url = :old_mint_url",
+                )?
+                .bind("old_mint_url", old_mint_url.to_string())
+                .execute(&tx)
+                .await?;
+            }
+        }
+        let tables = ["mint_quote", "proof", "keyset"];
 
         for table in &tables {
             query(&format!(
@@ -878,6 +1465,21 @@ where
                 WHERE mint_url = :old_mint_url
             "#
             ))?
+            .bind("new_mint_url", new_mint_url.to_string())
+            .bind("old_mint_url", old_mint_url.to_string())
+            .execute(&tx)
+            .await?;
+        }
+
+        #[cfg(feature = "conditional-tokens")]
+        if old_mint_url != new_mint_url {
+            query(
+                r#"
+                UPDATE conditional_restore_keyset
+                SET mint_url = :new_mint_url
+                WHERE mint_url = :old_mint_url
+                "#,
+            )?
             .bind("new_mint_url", new_mint_url.to_string())
             .bind("old_mint_url", old_mint_url.to_string())
             .execute(&tx)
@@ -903,16 +1505,18 @@ where
             VALUES (:keyset_id, :count)
             ON CONFLICT(keyset_id) DO UPDATE SET
                 counter = keyset_counter.counter + :count
+            WHERE keyset_counter.counter <= :max_before_increment
             RETURNING counter
             "#,
         )?
         .bind("keyset_id", keyset_id.to_string())
         .bind("count", count)
+        .bind("max_before_increment", u32::MAX - count)
         .pluck(&*conn)
         .await?
         .map(|n| Ok::<_, Error>(column_as_number!(n)))
         .transpose()?
-        .ok_or_else(|| Error::Internal("Counter update returned no value".to_owned()))?;
+        .ok_or(Error::AmountOverflow)?;
 
         Ok(new_counter)
     }
@@ -1043,16 +1647,31 @@ where
         let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
         let tx = ConnectionWithTransaction::new(conn).await?;
 
+        #[cfg(feature = "conditional-tokens")]
+        for keyset in &keysets {
+            if query("SELECT id FROM conditional_restore_keyset WHERE id = :id")?
+                .bind("id", keyset.id.to_string())
+                .pluck(&tx)
+                .await?
+                .is_some()
+            {
+                tx.rollback().await?;
+                return Err(Error::ConditionalRestoreMetadataConflict);
+            }
+        }
+
         for keyset in keysets {
-            query(
+            #[cfg(feature = "conditional-tokens")]
+            let affected = query(
                 r#"
         INSERT INTO keyset
-        (mint_url, id, unit, active, input_fee_ppk, final_expiry, keyset_u32)
+        (mint_url, id, unit, active, input_fee_ppk, final_expiry, keyset_u32, restore_kind)
         VALUES
-        (:mint_url, :id, :unit, :active, :input_fee_ppk, :final_expiry, :keyset_u32)
+        (:mint_url, :id, :unit, :active, :input_fee_ppk, :final_expiry, :keyset_u32, 'ordinary')
         ON CONFLICT(id) DO UPDATE SET
             active = excluded.active,
             input_fee_ppk = excluded.input_fee_ppk
+        WHERE keyset.restore_kind = 'ordinary'
         "#,
             )?
             .bind("mint_url", mint_url.to_string())
@@ -1064,6 +1683,32 @@ where
             .bind("keyset_u32", u32::from(keyset.id))
             .execute(&tx)
             .await?;
+            #[cfg(not(feature = "conditional-tokens"))]
+            query(
+                r#"
+                INSERT INTO keyset
+                    (mint_url, id, unit, active, input_fee_ppk, final_expiry, keyset_u32)
+                VALUES
+                    (:mint_url, :id, :unit, :active, :input_fee_ppk, :final_expiry, :keyset_u32)
+                ON CONFLICT(id) DO UPDATE SET
+                    active = excluded.active,
+                    input_fee_ppk = excluded.input_fee_ppk
+                "#,
+            )?
+            .bind("mint_url", mint_url.to_string())
+            .bind("id", keyset.id.to_string())
+            .bind("unit", keyset.unit.to_string())
+            .bind("active", keyset.active)
+            .bind("input_fee_ppk", keyset.input_fee_ppk as i64)
+            .bind("final_expiry", keyset.final_expiry.map(|v| v as i64))
+            .bind("keyset_u32", u32::from(keyset.id))
+            .execute(&tx)
+            .await?;
+            #[cfg(feature = "conditional-tokens")]
+            if affected != 1 {
+                tx.rollback().await?;
+                return Err(Error::ConditionalRestoreMetadataConflict);
+            }
         }
 
         tx.commit().await?;
@@ -1203,15 +1848,26 @@ where
     #[instrument(skip_all)]
     async fn add_keys(&self, keyset: KeySet) -> Result<(), database::Error> {
         let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
-
+        #[cfg(feature = "conditional-tokens")]
+        if query("SELECT id FROM key WHERE id = :id AND restore_kind = 'conditional'")?
+            .bind("id", keyset.id.to_string())
+            .pluck(&*conn)
+            .await?
+            .is_some()
+        {
+            return Err(Error::ConditionalRestoreMetadataConflict);
+        }
         keyset.verify_id()?;
+        let tx = ConnectionWithTransaction::new(conn).await?;
 
-        query(
+        #[cfg(feature = "conditional-tokens")]
+        let affected = query(
             r#"
                 INSERT INTO key
-                (id, keys, keyset_u32)
+                (id, keys, keyset_u32, restore_kind)
                 VALUES
-                (:id, :keys, :keyset_u32)
+                (:id, :keys, :keyset_u32, 'ordinary')
+                ON CONFLICT(id) DO NOTHING
             "#,
         )?
         .bind("id", keyset.id.to_string())
@@ -1220,8 +1876,31 @@ where
             serde_json::to_string(&keyset.keys).map_err(Error::from)?,
         )
         .bind("keyset_u32", u32::from(keyset.id))
-        .execute(&*conn)
+        .execute(&tx)
         .await?;
+        #[cfg(feature = "conditional-tokens")]
+        if affected != 1 {
+            tx.rollback().await?;
+            return Err(Error::ConditionalRestoreMetadataConflict);
+        }
+
+        #[cfg(not(feature = "conditional-tokens"))]
+        query(
+            r#"
+                INSERT INTO key (id, keys, keyset_u32)
+                VALUES (:id, :keys, :keyset_u32)
+            "#,
+        )?
+        .bind("id", keyset.id.to_string())
+        .bind(
+            "keys",
+            serde_json::to_string(&keyset.keys).map_err(Error::from)?,
+        )
+        .bind("keyset_u32", u32::from(keyset.id))
+        .execute(&tx)
+        .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1229,11 +1908,32 @@ where
     #[instrument(skip(self))]
     async fn remove_keys(&self, id: &Id) -> Result<(), database::Error> {
         let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let tx = ConnectionWithTransaction::new(conn).await?;
 
+        #[cfg(feature = "conditional-tokens")]
+        let affected = query(r#"DELETE FROM key WHERE id = :id AND restore_kind = 'ordinary'"#)?
+            .bind("id", id.to_string())
+            .execute(&tx)
+            .await?;
+        #[cfg(feature = "conditional-tokens")]
+        if affected == 0
+            && query("SELECT id FROM key WHERE id = :id")?
+                .bind("id", id.to_string())
+                .pluck(&tx)
+                .await?
+                .is_some()
+        {
+            tx.rollback().await?;
+            return Err(Error::ConditionalRestoreMetadataConflict);
+        }
+
+        #[cfg(not(feature = "conditional-tokens"))]
         query(r#"DELETE FROM key WHERE id = :id"#)?
             .bind("id", id.to_string())
-            .execute(&*conn)
+            .execute(&tx)
             .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1867,6 +2567,162 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<wallet::MeltQuote, Error> {
         used_by_operation: column_as_nullable_string!(used_by_operation),
         version: version_val,
     })
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn sql_row_to_owned_keyset(row: Vec<Column>) -> Result<(MintUrl, KeySetInfo, String), Error> {
+    unpack_into!(let (mint_url, id, unit, active, input_fee_ppk, final_expiry, restore_kind) = row);
+    let active: u8 = column_as_number!(active);
+    Ok((
+        column_as_string!(mint_url, MintUrl::from_str),
+        KeySetInfo {
+            id: column_as_string!(id, Id::from_str),
+            unit: column_as_string!(unit, CurrencyUnit::from_str),
+            active: active != 0,
+            input_fee_ppk: column_as_number!(input_fee_ppk),
+            final_expiry: column_as_nullable_number!(final_expiry),
+        },
+        column_as_string!(restore_kind),
+    ))
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn sql_row_to_conditional_restore_keyset(
+    row: Vec<Column>,
+) -> Result<(MintUrl, ConditionalKeySetInfo), Error> {
+    unpack_into!(
+        let (
+            id,
+            mint_url,
+            unit,
+            active,
+            input_fee_ppk,
+            final_expiry,
+            condition_id,
+            outcome_collection,
+            outcome_collection_id,
+            registered_at
+        ) = row
+    );
+    let active: u8 = column_as_number!(active);
+    Ok((
+        column_as_string!(mint_url, MintUrl::from_str),
+        ConditionalKeySetInfo {
+            id: column_as_string!(id, Id::from_str),
+            unit: column_as_string!(unit),
+            active: active != 0,
+            input_fee_ppk: column_as_nullable_number!(input_fee_ppk),
+            final_expiry: column_as_nullable_number!(final_expiry),
+            condition_id: column_as_string!(condition_id),
+            outcome_collection: column_as_string!(outcome_collection),
+            outcome_collection_id: column_as_string!(outcome_collection_id),
+            registered_at: column_as_number!(registered_at),
+        },
+    ))
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn load_proof_by_y<T>(conn: &T, y: &PublicKey) -> Result<Option<ProofInfo>, Error>
+where
+    T: DatabaseExecutor,
+{
+    query(
+        r#"
+        SELECT amount, unit, keyset_id, secret, c, witness, dleq_e, dleq_s, dleq_r,
+               y, mint_url, state, spending_condition, used_by_operation,
+               created_by_operation, p2pk_e
+        FROM proof WHERE y = :y
+        "#,
+    )?
+    .bind("y", y.to_bytes().to_vec())
+    .fetch_one(conn)
+    .await?
+    .map(sql_row_to_proof_info)
+    .transpose()
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn insert_restore_proof<T>(conn: &T, proof: &ProofInfo) -> Result<(), Error>
+where
+    T: DatabaseExecutor,
+{
+    let amount = checked_sql_u64(u64::from(proof.proof.amount), "proof amount")?;
+    let spending_condition = proof
+        .spending_condition
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let witness = proof
+        .proof
+        .witness
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    query(
+        r#"
+        INSERT INTO proof
+            (y, mint_url, state, spending_condition, unit, amount, keyset_id, secret,
+             c, witness, dleq_e, dleq_s, dleq_r, used_by_operation,
+             created_by_operation, p2pk_e)
+        VALUES
+            (:y, :mint_url, :state, :spending_condition, :unit, :amount, :keyset_id,
+             :secret, :c, :witness, :dleq_e, :dleq_s, :dleq_r,
+             :used_by_operation, :created_by_operation, :p2pk_e)
+        "#,
+    )?
+    .bind("y", proof.y.to_bytes().to_vec())
+    .bind("mint_url", proof.mint_url.to_string())
+    .bind("state", proof.state.to_string())
+    .bind("spending_condition", spending_condition)
+    .bind("unit", proof.unit.to_string())
+    .bind("amount", amount)
+    .bind("keyset_id", proof.proof.keyset_id.to_string())
+    .bind("secret", proof.proof.secret.to_string())
+    .bind("c", proof.proof.c.to_bytes().to_vec())
+    .bind("witness", witness)
+    .bind(
+        "dleq_e",
+        proof
+            .proof
+            .dleq
+            .as_ref()
+            .map(|dleq| dleq.e.to_secret_bytes().to_vec()),
+    )
+    .bind(
+        "dleq_s",
+        proof
+            .proof
+            .dleq
+            .as_ref()
+            .map(|dleq| dleq.s.to_secret_bytes().to_vec()),
+    )
+    .bind(
+        "dleq_r",
+        proof
+            .proof
+            .dleq
+            .as_ref()
+            .map(|dleq| dleq.r.to_secret_bytes().to_vec()),
+    )
+    .bind(
+        "used_by_operation",
+        proof.used_by_operation.map(|id| id.to_string()),
+    )
+    .bind(
+        "created_by_operation",
+        proof.created_by_operation.map(|id| id.to_string()),
+    )
+    .bind(
+        "p2pk_e",
+        proof
+            .proof
+            .p2pk_e
+            .as_ref()
+            .map(|key| key.to_bytes().to_vec()),
+    )
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 fn sql_row_to_proof_info(row: Vec<Column>) -> Result<ProofInfo, Error> {

@@ -270,7 +270,7 @@ impl Id {
     ///
     /// Panics if the SHA-256 hash prefix cannot be decoded as hex or does not
     /// fit the fixed short-id byte length.
-    #[cfg(feature = "mint")]
+    #[cfg(any(feature = "mint", feature = "conditional-tokens"))]
     pub fn v2_from_data_conditional(
         map: &Keys,
         unit: &CurrencyUnit,

@@ -24,7 +24,7 @@ mod db;
 mod rate_quote;
 mod value;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 /// Postgres connection pool
 pub struct PgConnectionPool;
 
@@ -433,11 +433,15 @@ pub async fn new_wallet_pg_database(conn_str: &str) -> Result<WalletPgDatabase, 
 mod test {
     #[cfg(feature = "conditional-tokens")]
     use std::collections::HashSet;
+    #[cfg(feature = "conditional-tokens")]
+    use std::time::Duration;
 
     #[cfg(feature = "conditional-tokens")]
     use cdk_common::database::mint::ConditionsDatabase;
     #[cfg(feature = "conditional-tokens")]
     use cdk_common::mint_db_conditional_test;
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::wallet_conditional_restore_db_test;
     use cdk_common::{mint_db_test, wallet_db_test};
 
     use super::*;
@@ -467,7 +471,7 @@ mod test {
     cdk_common::mint_db_conditional_test!(provide_mint_db);
 
     #[cfg(feature = "conditional-tokens")]
-    async fn raw_client(schema: &str) -> Client {
+    async fn base_client() -> Client {
         let (_, db_url) = PgConfig::strip_schema(&test_database_url());
         let (client, connection) = connect(&db_url, NoTls)
             .await
@@ -475,6 +479,12 @@ mod test {
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        client
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn raw_client(schema: &str) -> Client {
+        let client = base_client().await;
         client
             .batch_execute(&format!(r#"SET search_path TO "{schema}""#))
             .await
@@ -943,4 +953,493 @@ mod test {
     }
 
     wallet_db_test!(provide_wallet_db);
+    #[cfg(feature = "conditional-tokens")]
+    wallet_conditional_restore_db_test!(provide_wallet_db);
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn wallet_conditional_restore_kind_rejects_direct_sql_mutation() {
+        let test_id = format!("wallet_kind_{}", uuid::Uuid::new_v4().simple());
+        let _database = provide_wallet_db(test_id.clone()).await;
+        let client = raw_client(&test_id).await;
+        client
+            .execute(
+                "INSERT INTO mint (mint_url) VALUES ($1)",
+                &[&"https://example.com"],
+            )
+            .await
+            .expect("mint fixture");
+        let keyset_id = format!("01{}", "11".repeat(32));
+        client
+            .execute(
+                r#"
+                INSERT INTO keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry, restore_kind)
+                VALUES ($1, $2, 'sat', FALSE, 0, NULL, 'conditional')
+                "#,
+                &[&keyset_id, &"https://example.com"],
+            )
+            .await
+            .expect("conditional namespace fixture");
+        client
+            .execute(
+                "INSERT INTO key (id, keys, restore_kind) VALUES ($1, '{}', 'conditional')",
+                &[&keyset_id],
+            )
+            .await
+            .expect("conditional key fixture");
+        client
+            .execute(
+                r#"
+                INSERT INTO conditional_restore_keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry,
+                     condition_id, outcome_collection, outcome_collection_id, registered_at)
+                VALUES ($1, $2, 'usd', TRUE, NULL, NULL, $3, 'YES', $4, 1)
+                "#,
+                &[
+                    &keyset_id,
+                    &"https://example.com",
+                    &"11".repeat(32),
+                    &"22".repeat(32),
+                ],
+            )
+            .await
+            .expect_err("classification must match the conditional keyset owner and unit");
+        let error = client
+            .execute(
+                "UPDATE keyset SET restore_kind = 'ordinary' WHERE id = $1",
+                &[&keyset_id],
+            )
+            .await
+            .expect_err("namespace discriminator mutation must fail");
+        assert_eq!(
+            error.as_db_error().map(|error| error.code()),
+            Some(&tokio_postgres::error::SqlState::RAISE_EXCEPTION),
+            "the database trigger must reject discriminator mutation"
+        );
+        client
+            .execute(
+                "UPDATE key SET restore_kind = 'ordinary' WHERE id = $1",
+                &[&keyset_id],
+            )
+            .await
+            .expect_err("conditional key discriminator mutation must fail");
+        client
+            .execute(
+                "INSERT INTO conditional_restore_high_water (mint_url, unit, high_water) VALUES ($1, 'sat', $2)",
+                &[&"https://example.com", &100_u64.to_be_bytes().to_vec()],
+            )
+            .await
+            .expect("high-water fixture");
+        client
+            .execute(
+                "DELETE FROM conditional_restore_high_water WHERE mint_url = $1",
+                &[&"https://example.com"],
+            )
+            .await
+            .expect_err("high-water deletion outside URL migration must fail");
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn wallet_conditional_restore_schema_uses_utf8_byte_boundaries() {
+        let test_id = format!("wallet_utf8_{}", uuid::Uuid::new_v4().simple());
+        let _database = provide_wallet_db(test_id.clone()).await;
+        let client = raw_client(&test_id).await;
+        client
+            .execute(
+                "INSERT INTO mint (mint_url) VALUES ($1)",
+                &[&"https://example.com"],
+            )
+            .await
+            .expect("mint fixture");
+
+        async fn insert(
+            client: &Client,
+            id: &str,
+            unit: &str,
+            outcome: &str,
+        ) -> Result<(), PgError> {
+            client
+                .execute(
+                    r#"
+                    INSERT INTO keyset
+                        (id, mint_url, unit, active, input_fee_ppk, final_expiry, restore_kind)
+                    VALUES ($1, 'https://example.com', $2, FALSE, 0, NULL, 'conditional')
+                    "#,
+                    &[&id, &unit],
+                )
+                .await?;
+            client
+                .execute(
+                    "INSERT INTO key (id, keys, restore_kind) VALUES ($1, '{}', 'conditional')",
+                    &[&id],
+                )
+                .await?;
+            client
+                .execute(
+                    r#"
+                    INSERT INTO conditional_restore_keyset
+                        (id, mint_url, unit, active, input_fee_ppk, final_expiry,
+                         condition_id, outcome_collection, outcome_collection_id, registered_at)
+                    VALUES ($1, 'https://example.com', $2, TRUE, NULL, NULL,
+                            $3, $4, $5, 1)
+                    "#,
+                    &[&id, &unit, &"11".repeat(32), &outcome, &"22".repeat(32)],
+                )
+                .await?;
+            Ok(())
+        }
+
+        let unit_64 = "é".repeat(32);
+        let outcome_16384 = format!("{}a", "界".repeat(5461));
+        assert_eq!(unit_64.len(), 64);
+        assert_eq!(outcome_16384.len(), 16_384);
+        insert(&client, "utf8-boundary", &unit_64, &outcome_16384)
+            .await
+            .expect("exact UTF-8 byte limits should be accepted");
+        insert(&client, "unit-too-wide", &format!("{unit_64}a"), "YES")
+            .await
+            .expect_err("65-byte unit must be rejected");
+        insert(
+            &client,
+            "outcome-too-wide",
+            "sat",
+            &format!("{outcome_16384}a"),
+        )
+        .await
+        .expect_err("16385-byte outcome collection must be rejected");
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn wallet_conditional_restore_migrates_existing_postgres_schema() {
+        let test_id = format!("wallet_upgrade_{}", uuid::Uuid::new_v4().simple());
+        let client = base_client().await;
+        client
+            .batch_execute(&format!(
+                r#"
+                CREATE SCHEMA "{test_id}";
+                SET search_path TO "{test_id}";
+                CREATE TABLE migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMP);
+                CREATE TABLE keyset (
+                    id TEXT PRIMARY KEY, mint_url TEXT NOT NULL, unit TEXT NOT NULL,
+                    active BOOLEAN NOT NULL, input_fee_ppk BIGINT NOT NULL,
+                    final_expiry BIGINT, keyset_u32 BIGINT
+                );
+                CREATE TABLE key (
+                    id TEXT PRIMARY KEY, keys TEXT NOT NULL, keyset_u32 BIGINT
+                );
+                CREATE TABLE keyset_counter (
+                    keyset_id TEXT PRIMARY KEY, counter INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE proof (
+                    mint_url TEXT, unit TEXT, state TEXT, keyset_id TEXT
+                );
+                INSERT INTO keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry, keyset_u32)
+                VALUES ('legacy', 'https://example.com', 'sat', TRUE, 0, NULL, NULL);
+                INSERT INTO key (id, keys, keyset_u32) VALUES ('legacy', '{{}}', NULL);
+                "#,
+            ))
+            .await
+            .expect("legacy PostgreSQL wallet schema fixture");
+
+        fn migration_names(path: &std::path::Path, names: &mut Vec<String>) {
+            for entry in std::fs::read_dir(path).expect("wallet migrations directory") {
+                let entry = entry.expect("migration entry");
+                if entry.path().is_dir() {
+                    migration_names(&entry.path(), names);
+                } else {
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cdk-sql-common/src/wallet/migrations");
+        let mut names = Vec::new();
+        migration_names(&migrations_dir, &mut names);
+        for name in names {
+            if name != "20260720000000_add_conditional_restore.sql" {
+                client
+                    .execute(
+                        "INSERT INTO migrations (name) VALUES ($1) ON CONFLICT DO NOTHING",
+                        &[&name],
+                    )
+                    .await
+                    .expect("legacy migration marker");
+            }
+        }
+        drop(client);
+
+        let db_url = format!("{} schema={test_id}", test_database_url());
+        let _database = WalletPgDatabase::new(db_url.as_str())
+            .await
+            .expect("conditional restore migration should upgrade existing PostgreSQL wallet");
+        let client = raw_client(&test_id).await;
+        let row = client
+            .query_one(
+                r#"
+                SELECT s.restore_kind, k.restore_kind
+                FROM keyset s JOIN key k ON k.id = s.id
+                WHERE s.id = 'legacy'
+                "#,
+                &[],
+            )
+            .await
+            .expect("upgraded legacy discriminators");
+        assert_eq!(row.get::<_, String>(0), "ordinary");
+        assert_eq!(row.get::<_, String>(1), "ordinary");
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn wallet_ordinary_refresh_cannot_race_conditional_namespace_claim() {
+        use std::str::FromStr;
+
+        use cdk_common::database::WalletDatabase;
+        use cdk_common::mint_url::MintUrl;
+        use cdk_common::{CurrencyUnit, Id, KeySetInfo};
+
+        let test_id = format!("wallet_kind_race_{}", uuid::Uuid::new_v4().simple());
+        let database = provide_wallet_db(test_id.clone()).await;
+        let mint_url = MintUrl::from_str("https://example.com").expect("test mint URL");
+        database
+            .add_mint(mint_url.clone(), None)
+            .await
+            .expect("mint fixture");
+
+        let mut writer = raw_client(&test_id).await;
+        let transaction = writer
+            .transaction()
+            .await
+            .expect("conditional namespace transaction");
+        let keyset_id = format!("01{}", "22".repeat(32));
+        transaction
+            .execute(
+                r#"
+                INSERT INTO keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry, restore_kind)
+                VALUES ($1, $2, 'sat', FALSE, 0, NULL, 'conditional')
+                "#,
+                &[&keyset_id, &mint_url.to_string()],
+            )
+            .await
+            .expect("uncommitted conditional namespace claim");
+
+        let id = Id::from_str(&keyset_id).expect("test keyset id");
+        let ordinary = KeySetInfo {
+            id,
+            unit: CurrencyUnit::Sat,
+            active: true,
+            input_fee_ppk: 0,
+            final_expiry: None,
+        };
+        let refresh_database = database.clone();
+        let refresh_mint_url = mint_url.clone();
+        let mut refresh = tokio::spawn(async move {
+            refresh_database
+                .add_mint_keysets(refresh_mint_url, vec![ordinary])
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut refresh)
+                .await
+                .is_err()
+        );
+        transaction
+            .commit()
+            .await
+            .expect("conditional namespace claim should commit");
+        assert!(matches!(
+            refresh.await.expect("ordinary refresh task should join"),
+            Err(cdk_common::database::Error::ConditionalRestoreMetadataConflict)
+        ));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wallet_conditional_commit_cannot_race_ordinary_namespace_claim() {
+        use cdk_common::database::wallet::test::conditional_restore_test_admission;
+        use cdk_common::database::WalletDatabase;
+
+        let test_id = format!("wallet_reverse_kind_race_{}", uuid::Uuid::new_v4().simple());
+        let database = provide_wallet_db(test_id.clone()).await;
+        let admission = conditional_restore_test_admission(100, 300);
+        database
+            .add_mint(admission.mint_url.clone(), None)
+            .await
+            .expect("mint fixture");
+
+        let mut writer = raw_client(&test_id).await;
+        let transaction = writer.transaction().await.expect("ordinary transaction");
+        transaction
+            .execute(
+                r#"
+                INSERT INTO keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry, restore_kind)
+                VALUES ($1, $2, $3, FALSE, $4, $5, 'ordinary')
+                "#,
+                &[
+                    &admission.keyset.id.to_string(),
+                    &admission.mint_url.to_string(),
+                    &admission.unit.to_string(),
+                    &i32::try_from(admission.keyset.input_fee_ppk)
+                        .expect("fixture input fee should fit the keyset INTEGER column"),
+                    &admission.keyset.final_expiry.map(|value| {
+                        i32::try_from(value)
+                            .expect("fixture expiry should fit the keyset INTEGER column")
+                    }),
+                ],
+            )
+            .await
+            .expect("uncommitted ordinary namespace claim");
+
+        let commit_database = database.clone();
+        let mut commit =
+            tokio::spawn(
+                async move { commit_database.commit_conditional_restore(admission).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut commit)
+                .await
+                .is_err()
+        );
+        transaction
+            .commit()
+            .await
+            .expect("ordinary claim should commit");
+        assert!(matches!(
+            commit.await.expect("conditional commit task should join"),
+            Err(cdk_common::database::Error::ConditionalRestoreMetadataConflict)
+        ));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wallet_conditional_retry_cannot_overwrite_concurrent_proof_advance() {
+        use cdk_common::database::wallet::test::conditional_restore_test_admission;
+        use cdk_common::database::WalletDatabase;
+        use cdk_common::State;
+
+        let test_id = format!("wallet_proof_race_{}", uuid::Uuid::new_v4().simple());
+        let database = provide_wallet_db(test_id.clone()).await;
+        let initial = conditional_restore_test_admission(100, 300);
+        database
+            .add_mint(initial.mint_url.clone(), None)
+            .await
+            .expect("mint fixture");
+        database
+            .commit_conditional_restore(initial.clone())
+            .await
+            .expect("initial conditional proof should commit");
+
+        let mut writer = raw_client(&test_id).await;
+        let transaction = writer
+            .transaction()
+            .await
+            .expect("local proof advance transaction");
+        transaction
+            .execute(
+                "UPDATE proof SET state = 'RESERVED' WHERE y = $1",
+                &[&initial.proofs[0].y.to_bytes().to_vec()],
+            )
+            .await
+            .expect("uncommitted local proof advance");
+
+        let mut retry = initial.clone();
+        retry.observed_wall_time = 110;
+        retry.proofs[0].state = State::Pending;
+        let retry_database = database.clone();
+        let mut retry_task =
+            tokio::spawn(async move { retry_database.commit_conditional_restore(retry).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut retry_task)
+                .await
+                .is_err(),
+            "restore retry should wait for the concurrent proof writer"
+        );
+        transaction
+            .commit()
+            .await
+            .expect("local proof advance should commit");
+        retry_task
+            .await
+            .expect("restore retry task should join")
+            .expect("restore retry should preserve the concurrent lifecycle advance");
+
+        let stored = database
+            .get_proofs_by_ys(vec![initial.proofs[0].y])
+            .await
+            .expect("proof should load");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state, State::Reserved);
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wallet_mint_url_migration_waits_for_high_water_writer() {
+        use std::str::FromStr;
+
+        use cdk_common::database::WalletDatabase;
+        use cdk_common::mint_url::MintUrl;
+        use cdk_common::CurrencyUnit;
+
+        let test_id = format!("wallet_url_fence_{}", uuid::Uuid::new_v4().simple());
+        let database = provide_wallet_db(test_id.clone()).await;
+        let old_mint = MintUrl::from_str("https://old.example.com").unwrap();
+        let new_mint = MintUrl::from_str("https://new.example.com").unwrap();
+        database.add_mint(old_mint.clone(), None).await.unwrap();
+        database.add_mint(new_mint.clone(), None).await.unwrap();
+        database
+            .advance_conditional_restore_high_water(old_mint.clone(), CurrencyUnit::Sat, 100)
+            .await
+            .unwrap();
+
+        let mut writer = raw_client(&test_id).await;
+        let transaction = writer
+            .transaction()
+            .await
+            .expect("high-water writer transaction");
+        transaction
+            .execute(
+                r#"
+                UPDATE conditional_restore_high_water
+                SET high_water = $1
+                WHERE mint_url = $2 AND unit = 'sat'
+                "#,
+                &[&200_u64.to_be_bytes().to_vec(), &old_mint.to_string()],
+            )
+            .await
+            .expect("uncommitted high-water advance");
+
+        let migration_database = database.clone();
+        let migration_old = old_mint.clone();
+        let migration_new = new_mint.clone();
+        let mut migration = tokio::spawn(async move {
+            migration_database
+                .update_mint_url(migration_old, migration_new)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut migration)
+                .await
+                .is_err()
+        );
+        transaction
+            .commit()
+            .await
+            .expect("high-water writer should commit");
+        migration
+            .await
+            .expect("URL migration task should join")
+            .expect("URL migration should commit");
+        assert_eq!(
+            database
+                .advance_conditional_restore_high_water(new_mint, CurrencyUnit::Sat, 0)
+                .await
+                .unwrap(),
+            200
+        );
+    }
 }

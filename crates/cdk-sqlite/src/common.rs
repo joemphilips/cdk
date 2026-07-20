@@ -31,7 +31,7 @@ impl pool::DatabaseConfig for Config {
 }
 
 /// Sqlite connection manager
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct SqliteConnectionManager;
 
 impl DatabasePool for SqliteConnectionManager {

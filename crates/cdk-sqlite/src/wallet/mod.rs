@@ -11,6 +11,8 @@ pub type WalletSqliteDatabase = SQLWalletDatabase<SqliteConnectionManager>;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::wallet_conditional_restore_db_test;
     use cdk_common::wallet_db_test;
 
     use super::memory;
@@ -20,6 +22,234 @@ mod tests {
     }
 
     wallet_db_test!(provide_db);
+    #[cfg(feature = "conditional-tokens")]
+    wallet_conditional_restore_db_test!(provide_db);
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn conditional_restore_kind_rejects_direct_sql_mutation() {
+        let path = std::env::temp_dir().join(format!(
+            "cdk-conditional-restore-kind-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let _database = super::WalletSqliteDatabase::new(path.clone())
+            .await
+            .expect("wallet database");
+        let connection = rusqlite::Connection::open(path).expect("raw SQLite connection");
+        connection
+            .execute(
+                "INSERT INTO mint (mint_url) VALUES (?1)",
+                ["https://example.com"],
+            )
+            .expect("mint fixture");
+        connection
+            .execute(
+                r#"
+                INSERT INTO keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry, restore_kind)
+                VALUES (?1, ?2, 'sat', 0, 0, NULL, 'conditional')
+                "#,
+                [
+                    format!("01{}", "11".repeat(32)),
+                    "https://example.com".to_string(),
+                ],
+            )
+            .expect("conditional namespace fixture");
+        let error = connection
+            .execute(
+                "UPDATE keyset SET restore_kind = 'ordinary' WHERE mint_url = ?1",
+                ["https://example.com"],
+            )
+            .expect_err("namespace discriminator mutation must fail");
+        assert!(error
+            .to_string()
+            .contains("conditional restore keyset namespace is immutable"));
+        connection
+            .execute(
+                "INSERT INTO conditional_restore_high_water (mint_url, unit, high_water) VALUES (?1, 'sat', ?2)",
+                rusqlite::params!["https://example.com", 100_u64.to_be_bytes().to_vec()],
+            )
+            .expect("high-water fixture");
+        connection
+            .execute(
+                "DELETE FROM conditional_restore_high_water WHERE mint_url = ?1",
+                ["https://example.com"],
+            )
+            .expect_err("high-water deletion outside URL migration must fail");
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn conditional_restore_classification_rejects_unbound_direct_sql() {
+        let path = std::env::temp_dir().join(format!(
+            "cdk-conditional-restore-binding-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let _database = super::WalletSqliteDatabase::new(path.clone())
+            .await
+            .expect("wallet database");
+        let connection = rusqlite::Connection::open(path).expect("raw SQLite connection");
+        let id = format!("01{}", "33".repeat(32));
+        connection
+            .execute(
+                "INSERT INTO mint (mint_url) VALUES ('https://example.com')",
+                [],
+            )
+            .expect("mint fixture");
+        connection
+            .execute(
+                r#"
+                INSERT INTO keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry, restore_kind)
+                VALUES (?1, 'https://example.com', 'sat', 0, 0, NULL, 'ordinary')
+                "#,
+                [&id],
+            )
+            .expect("ordinary keyset fixture");
+        connection
+            .execute(
+                "INSERT INTO key (id, keys, restore_kind) VALUES (?1, '{}', 'ordinary')",
+                [&id],
+            )
+            .expect("ordinary keys fixture");
+        let error = connection
+            .execute(
+                r#"
+                INSERT INTO conditional_restore_keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry,
+                     condition_id, outcome_collection, outcome_collection_id, registered_at)
+                VALUES (?1, 'https://example.com', 'sat', 1, NULL, NULL,
+                        ?2, 'YES', ?3, 1)
+                "#,
+                [&id, &"11".repeat(32), &"22".repeat(32)],
+            )
+            .expect_err("ordinary key material cannot be classified as conditional");
+        assert!(error
+            .to_string()
+            .contains("conditional restore classification is not bound"));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn conditional_restore_schema_uses_utf8_byte_boundaries() {
+        let path = std::env::temp_dir().join(format!(
+            "cdk-conditional-restore-utf8-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let _database = super::WalletSqliteDatabase::new(path.clone())
+            .await
+            .expect("wallet database");
+        let connection = rusqlite::Connection::open(path).expect("raw SQLite connection");
+        connection
+            .execute(
+                "INSERT INTO mint (mint_url) VALUES ('https://example.com')",
+                [],
+            )
+            .expect("mint fixture");
+
+        let insert = |id: &str, unit: &str, outcome: &str| -> rusqlite::Result<()> {
+            connection.execute(
+                r#"
+                INSERT INTO keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry, restore_kind)
+                VALUES (?1, 'https://example.com', ?2, 0, 0, NULL, 'conditional')
+                "#,
+                rusqlite::params![id, unit],
+            )?;
+            connection.execute(
+                "INSERT INTO key (id, keys, restore_kind) VALUES (?1, '{}', 'conditional')",
+                [id],
+            )?;
+            connection.execute(
+                r#"
+                INSERT INTO conditional_restore_keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry,
+                     condition_id, outcome_collection, outcome_collection_id, registered_at)
+                VALUES (?1, 'https://example.com', ?2, 1, NULL, NULL,
+                        ?3, ?4, ?5, 1)
+                "#,
+                rusqlite::params![id, unit, "11".repeat(32), outcome, "22".repeat(32)],
+            )?;
+            Ok(())
+        };
+
+        let unit_64 = "é".repeat(32);
+        let outcome_16384 = format!("{}a", "界".repeat(5461));
+        assert_eq!(unit_64.len(), 64);
+        assert_eq!(outcome_16384.len(), 16_384);
+        insert("utf8-boundary", &unit_64, &outcome_16384)
+            .expect("exact UTF-8 byte limits should be accepted");
+        insert("unit-too-wide", &format!("{unit_64}a"), "YES")
+            .expect_err("65-byte unit must be rejected");
+        insert("outcome-too-wide", "sat", &format!("{outcome_16384}a"))
+            .expect_err("16385-byte outcome collection must be rejected");
+    }
+
+    #[cfg(all(feature = "conditional-tokens", not(feature = "sqlcipher")))]
+    #[tokio::test]
+    async fn conditional_restore_migrates_existing_sqlite_wallet_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "cdk-conditional-restore-upgrade-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let connection = rusqlite::Connection::open(&path).expect("raw SQLite connection");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMP);
+                CREATE TABLE keyset (
+                    id TEXT PRIMARY KEY, mint_url TEXT NOT NULL, unit TEXT NOT NULL,
+                    active INTEGER NOT NULL, input_fee_ppk INTEGER NOT NULL,
+                    final_expiry INTEGER, keyset_u32 INTEGER
+                );
+                CREATE TABLE key (
+                    id TEXT PRIMARY KEY, keys TEXT NOT NULL, keyset_u32 INTEGER
+                );
+                CREATE TABLE proof (
+                    mint_url TEXT, unit TEXT, state TEXT, keyset_id TEXT
+                );
+                INSERT INTO keyset
+                    (id, mint_url, unit, active, input_fee_ppk, final_expiry, keyset_u32)
+                VALUES ('legacy', 'https://example.com', 'sat', 1, 0, NULL, NULL);
+                INSERT INTO key (id, keys, keyset_u32) VALUES ('legacy', '{}', NULL);
+                "#,
+            )
+            .expect("legacy wallet schema fixture");
+        let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cdk-sql-common/src/wallet/migrations/sqlite");
+        for entry in std::fs::read_dir(migrations_dir).expect("wallet migrations directory") {
+            let entry = entry.expect("migration entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != "20260720000000_add_conditional_restore.sql" {
+                connection
+                    .execute("INSERT INTO migrations (name) VALUES (?1)", [&name])
+                    .expect("legacy migration marker");
+            }
+        }
+        drop(connection);
+
+        let _database = super::WalletSqliteDatabase::new(path.clone())
+            .await
+            .expect("conditional restore migration should upgrade an existing wallet");
+        let connection = rusqlite::Connection::open(path).expect("upgraded SQLite connection");
+        let keyset_kind: String = connection
+            .query_row(
+                "SELECT restore_kind FROM keyset WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy keyset discriminator");
+        let key_kind: String = connection
+            .query_row(
+                "SELECT restore_kind FROM key WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy key discriminator");
+        assert_eq!(keyset_kind, "ordinary");
+        assert_eq!(key_kind, "ordinary");
+    }
+
     use std::str::FromStr;
 
     use cdk_common::database::WalletDatabase;
