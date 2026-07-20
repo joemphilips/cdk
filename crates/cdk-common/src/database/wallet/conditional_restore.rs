@@ -39,78 +39,94 @@ pub struct ConditionalRestoreAdmission {
     pub counter_floor: u32,
 }
 
+/// Validate the immutable binding among conditional metadata, standard metadata, and keys.
+pub fn validate_conditional_restore_keyset(
+    unit: &CurrencyUnit,
+    conditional_keyset: &ConditionalKeySetInfo,
+    keyset: &KeySetInfo,
+    keys: &KeySet,
+) -> Result<(), Error> {
+    let conditional_unit = CurrencyUnit::from_str(&conditional_keyset.unit)
+        .map_err(|_| invalid("conditional keyset unit is invalid"))?;
+    validate_conditional_keyset_catalogue_fields(
+        &conditional_keyset.unit,
+        &conditional_keyset.condition_id,
+        &conditional_keyset.outcome_collection,
+        &conditional_keyset.outcome_collection_id,
+    )
+    .map_err(invalid)?;
+    let input_fee_ppk = conditional_keyset.input_fee_ppk.unwrap_or_default();
+    if conditional_keyset.final_expiry == Some(0) {
+        return Err(invalid("conditional keyset final expiry is not canonical"));
+    }
+    let final_expiry = conditional_keyset.final_expiry;
+
+    if conditional_keyset.id.get_version() != KeySetVersion::Version01 {
+        return Err(invalid(
+            "conditional restore requires a supported v2 keyset id",
+        ));
+    }
+    let condition_id = cashu::util::hex::decode(&conditional_keyset.condition_id)
+        .map_err(|_| invalid("conditional condition id is invalid"))?;
+    let condition_id = <[u8; 32]>::try_from(condition_id.as_slice())
+        .map_err(|_| invalid("conditional condition id is invalid"))?;
+    let expected_outcome_collection_id = compute_outcome_collection_id(
+        &[0_u8; 32],
+        &condition_id,
+        &conditional_keyset.outcome_collection,
+    )
+    .map_err(|_| invalid("conditional outcome collection id cannot be derived"))?;
+    if cashu::util::hex::encode(expected_outcome_collection_id)
+        != conditional_keyset.outcome_collection_id
+    {
+        return Err(invalid(
+            "conditional outcome collection id does not bind its condition and label",
+        ));
+    }
+
+    if conditional_keyset.id != keyset.id
+        || keyset.id != keys.id
+        || conditional_unit != *unit
+        || conditional_keyset.unit != unit.to_string()
+        || keyset.unit != *unit
+        || keys.unit != *unit
+        || keyset.active
+        || keys.active != Some(conditional_keyset.active)
+        || input_fee_ppk != keyset.input_fee_ppk
+        || keys.input_fee_ppk != keyset.input_fee_ppk
+        || keyset.final_expiry != final_expiry
+        || keys.final_expiry != final_expiry
+    {
+        return Err(invalid(
+            "conditional, standard, and public keyset metadata do not agree",
+        ));
+    }
+
+    let derived_id = Id::v2_from_data_conditional(
+        &keys.keys,
+        unit,
+        input_fee_ppk,
+        final_expiry,
+        &conditional_keyset.condition_id,
+        &conditional_keyset.outcome_collection_id,
+    );
+    if derived_id != keyset.id {
+        return Err(invalid(
+            "conditional keyset id does not bind the persisted metadata and public keys",
+        ));
+    }
+    Ok(())
+}
+
 impl ConditionalRestoreAdmission {
     /// Validate ownership and immutable metadata before any backend mutation.
     pub fn validate(&self) -> Result<(), Error> {
-        let conditional_unit = CurrencyUnit::from_str(&self.conditional_keyset.unit)
-            .map_err(|_| invalid("conditional keyset unit is invalid"))?;
-        validate_conditional_keyset_catalogue_fields(
-            &self.conditional_keyset.unit,
-            &self.conditional_keyset.condition_id,
-            &self.conditional_keyset.outcome_collection,
-            &self.conditional_keyset.outcome_collection_id,
-        )
-        .map_err(invalid)?;
-        let input_fee_ppk = self.conditional_keyset.input_fee_ppk.unwrap_or_default();
-        if self.conditional_keyset.final_expiry == Some(0) {
-            return Err(invalid("conditional keyset final expiry is not canonical"));
-        }
-        let final_expiry = self.conditional_keyset.final_expiry;
-
-        if self.conditional_keyset.id.get_version() != KeySetVersion::Version01 {
-            return Err(invalid(
-                "conditional restore requires a supported v2 keyset id",
-            ));
-        }
-        let condition_id = cashu::util::hex::decode(&self.conditional_keyset.condition_id)
-            .map_err(|_| invalid("conditional condition id is invalid"))?;
-        let condition_id = <[u8; 32]>::try_from(condition_id.as_slice())
-            .map_err(|_| invalid("conditional condition id is invalid"))?;
-        let expected_outcome_collection_id = compute_outcome_collection_id(
-            &[0_u8; 32],
-            &condition_id,
-            &self.conditional_keyset.outcome_collection,
-        )
-        .map_err(|_| invalid("conditional outcome collection id cannot be derived"))?;
-        if cashu::util::hex::encode(expected_outcome_collection_id)
-            != self.conditional_keyset.outcome_collection_id
-        {
-            return Err(invalid(
-                "conditional outcome collection id does not bind its condition and label",
-            ));
-        }
-
-        if self.conditional_keyset.id != self.keyset.id
-            || self.keyset.id != self.keys.id
-            || conditional_unit != self.unit
-            || self.conditional_keyset.unit != self.unit.to_string()
-            || self.keyset.unit != self.unit
-            || self.keys.unit != self.unit
-            || self.keyset.active
-            || self.keys.active != Some(self.conditional_keyset.active)
-            || input_fee_ppk != self.keyset.input_fee_ppk
-            || self.keys.input_fee_ppk != self.keyset.input_fee_ppk
-            || self.keyset.final_expiry != final_expiry
-            || self.keys.final_expiry != final_expiry
-        {
-            return Err(invalid(
-                "conditional, standard, and public keyset metadata do not agree",
-            ));
-        }
-
-        let derived_id = Id::v2_from_data_conditional(
-            &self.keys.keys,
+        validate_conditional_restore_keyset(
             &self.unit,
-            input_fee_ppk,
-            final_expiry,
-            &self.conditional_keyset.condition_id,
-            &self.conditional_keyset.outcome_collection_id,
-        );
-        if derived_id != self.keyset.id {
-            return Err(invalid(
-                "conditional keyset id does not bind the persisted metadata and public keys",
-            ));
-        }
+            &self.conditional_keyset,
+            &self.keyset,
+            &self.keys,
+        )?;
 
         match self.mode {
             ConditionalRestoreAdmissionMode::HeldProofs if self.proofs.is_empty() => {

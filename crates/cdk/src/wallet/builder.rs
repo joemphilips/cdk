@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use cdk_common::parking_lot::RwLock;
 use cdk_common::{database, AuthToken};
-use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
 use crate::cdk_database::WalletDatabase;
 use crate::error::Error;
@@ -244,6 +244,7 @@ impl WalletBuilder {
             seed,
             client: client.clone(),
             subscription: SubscriptionManager::new(client, self.use_http_subscription),
+            restore_lock: Arc::new(TokioMutex::new(())),
         })
     }
 }

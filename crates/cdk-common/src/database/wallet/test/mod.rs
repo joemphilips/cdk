@@ -27,6 +27,8 @@ use crate::wallet::{
 mod conditional_restore;
 #[cfg(feature = "conditional-tokens")]
 pub use conditional_restore::*;
+mod ordinary_restore;
+pub use ordinary_restore::*;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1587,7 +1589,9 @@ macro_rules! wallet_db_test {
             reserve_proofs,
             release_proofs,
             get_reserved_proofs,
-            reserve_proofs_already_reserved
+            reserve_proofs_already_reserved,
+            ordinary_restore_preserves_lifecycle_and_spent_evidence,
+            ordinary_restore_conflict_rolls_back_proofs_and_counter
         );
     };
     ($make_db_fn:ident, $($name:ident),+ $(,)?) => {

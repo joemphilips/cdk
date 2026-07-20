@@ -21,6 +21,12 @@ use bip39::Mnemonic;
 use cashu::amount::SplitTarget;
 use cashu::dhke::construct_proofs;
 use cashu::mint_url::MintUrl;
+#[cfg(feature = "conditional-tokens")]
+use cashu::nuts::nut_ctf::test_helpers::{
+    create_oracle_witness, create_test_announcement, create_test_oracle,
+};
+#[cfg(feature = "conditional-tokens")]
+use cashu::Witness;
 use cashu::{
     CurrencyUnit, Id, MeltRequest, NotificationPayload, PaymentMethod, PreMintSecrets, ProofState,
     SecretKey, SpendingConditions, State, SwapRequest,
@@ -2265,6 +2271,376 @@ async fn test_restore_after_keyset_rotation() {
         restored.unspent,
         Amount::from(total),
         "Restore should recover proofs from both active and inactive keysets"
+    );
+}
+
+/// Proves mnemonic recovery against a real in-process mint for ordinary and
+/// secp256k1 V2 conditional keysets, then spends both recovered proof classes.
+#[cfg(feature = "conditional-tokens")]
+#[tokio::test]
+async fn test_restore_recovers_and_spends_ordinary_and_conditional_proofs() {
+    use cdk::nuts::nut02::KeySetVersion;
+    use cdk::nuts::nut_ctf::{
+        CtfConvertRequest, NutCtfSettings, RedeemOutcomeRequest, RegisterConditionRequest,
+        RegistrationFeeSetting,
+    };
+
+    setup_tracing();
+
+    // CTF convert requires a non-zero input fee. A single 32-sat collateral
+    // proof therefore pays one sat and creates 31 sats in each outcome.
+    let mint = create_mint_with_fee(1000)
+        .await
+        .expect("Failed to create CTF recovery mint");
+    let mut mint_info = mint.mint_info().await.expect("Failed to read mint info");
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![RegistrationFeeSetting {
+            unit: CurrencyUnit::Sat.to_string(),
+            registration_fee_base: 0,
+            registration_fee_per_keyset: 0,
+        }],
+        ..Default::default()
+    });
+    mint.set_mint_info(mint_info)
+        .await
+        .expect("Failed to enable CTF for recovery mint");
+
+    let seed = Mnemonic::generate(12)
+        .expect("Failed to generate wallet mnemonic")
+        .to_seed_normalized("");
+    let wallet = create_test_wallet_for_mint_with_seed(mint.clone(), seed)
+        .await
+        .expect("Failed to create source wallet");
+    let ordinary_keyset_id = wallet
+        .fetch_active_keyset()
+        .await
+        .expect("Failed to load ordinary keyset")
+        .id;
+
+    fund_wallet(
+        wallet.clone(),
+        32,
+        Some(SplitTarget::Values(vec![Amount::from(32)])),
+    )
+    .await
+    .expect("Failed to fund CTF collateral");
+    let collateral = wallet
+        .get_unspent_proofs()
+        .await
+        .expect("Failed to load CTF collateral");
+    assert_eq!(
+        collateral.len(),
+        1,
+        "collateral must be one fee-bearing proof"
+    );
+    assert_eq!(collateral.total_amount().unwrap(), Amount::from(32));
+    let conversion_fee = wallet
+        .get_proofs_fee(&collateral)
+        .await
+        .expect("Failed to calculate CTF conversion fee")
+        .total;
+    assert_eq!(conversion_fee, Amount::from(1));
+    let conditional_amount = collateral
+        .total_amount()
+        .unwrap()
+        .checked_sub(conversion_fee)
+        .expect("conversion fee must fit collateral");
+
+    let oracle = create_test_oracle();
+    let (_, announcement) =
+        create_test_announcement(&oracle, &["YES", "NO"], "seed-recovery-event");
+    let condition = wallet
+        .register_condition(RegisterConditionRequest {
+            threshold: 1,
+            tags: vec![vec![
+                "description".to_string(),
+                "seed recovery integration".to_string(),
+            ]],
+            announcements: vec![announcement],
+            collateral: Some(CurrencyUnit::Sat.to_string()),
+            outcome_collections: Some(vec!["YES".to_string(), "NO".to_string()]),
+            fee: None,
+            outputs: None,
+            condition_type: "enum".to_string(),
+            lo_bound: None,
+            hi_bound: None,
+            precision: None,
+        })
+        .await
+        .expect("Failed to register recovery condition");
+    let yes_keyset_id = *condition
+        .keysets
+        .get("YES")
+        .expect("YES keyset must be registered");
+    let no_keyset_id = *condition
+        .keysets
+        .get("NO")
+        .expect("NO keyset must be registered");
+    assert_eq!(yes_keyset_id.get_version(), KeySetVersion::Version01);
+    assert_eq!(no_keyset_id.get_version(), KeySetVersion::Version01);
+
+    let yes_keys = mint
+        .keyset_pubkeys(&yes_keyset_id)
+        .expect("Failed to load YES keys")
+        .keysets
+        .into_iter()
+        .next()
+        .expect("YES keyset response must not be empty")
+        .keys;
+    let no_keys = mint
+        .keyset_pubkeys(&no_keyset_id)
+        .expect("Failed to load NO keys")
+        .keysets
+        .into_iter()
+        .next()
+        .expect("NO keyset response must not be empty")
+        .keys;
+    let yes_fee_and_amounts = (
+        1,
+        yes_keys
+            .iter()
+            .map(|(amount, _)| amount.to_u64())
+            .collect::<Vec<_>>(),
+    )
+        .into();
+    let no_fee_and_amounts = (
+        1,
+        no_keys
+            .iter()
+            .map(|(amount, _)| amount.to_u64())
+            .collect::<Vec<_>>(),
+    )
+        .into();
+    let yes_premint = PreMintSecrets::from_seed(
+        yes_keyset_id,
+        0,
+        &seed,
+        conditional_amount,
+        &SplitTarget::None,
+        &yes_fee_and_amounts,
+    )
+    .expect("Failed to derive YES outputs from seed");
+    let no_premint = PreMintSecrets::from_seed(
+        no_keyset_id,
+        0,
+        &seed,
+        conditional_amount,
+        &SplitTarget::None,
+        &no_fee_and_amounts,
+    )
+    .expect("Failed to derive NO outputs from seed");
+    assert_eq!(
+        wallet
+            .localstore
+            .increment_keyset_counter(&yes_keyset_id, yes_premint.len() as u32)
+            .await
+            .expect("Failed to reserve YES counter range"),
+        yes_premint.len() as u32
+    );
+    assert_eq!(
+        wallet
+            .localstore
+            .increment_keyset_counter(&no_keyset_id, no_premint.len() as u32)
+            .await
+            .expect("Failed to reserve NO counter range"),
+        no_premint.len() as u32
+    );
+
+    let conversion = wallet
+        .ctf_convert(CtfConvertRequest {
+            condition_id: condition.condition_id,
+            parent_collection_id: None,
+            inputs: HashMap::from([("*".to_string(), collateral)]),
+            outputs: HashMap::from([
+                ("YES".to_string(), yes_premint.blinded_messages()),
+                ("NO".to_string(), no_premint.blinded_messages()),
+            ]),
+        })
+        .await
+        .expect("Failed to convert collateral into CTF positions");
+    assert_eq!(
+        Amount::try_sum(
+            conversion
+                .signatures
+                .get("YES")
+                .expect("YES signatures must be returned")
+                .iter()
+                .map(|signature| signature.amount),
+        )
+        .unwrap(),
+        conditional_amount
+    );
+    assert_eq!(
+        Amount::try_sum(
+            conversion
+                .signatures
+                .get("NO")
+                .expect("NO signatures must be returned")
+                .iter()
+                .map(|signature| signature.amount),
+        )
+        .unwrap(),
+        conditional_amount
+    );
+
+    // Retain an ordinary proof at the mint under the same seed. Explicit
+    // splitting avoids depending on wallet refill policy in this regression.
+    fund_wallet(
+        wallet.clone(),
+        16,
+        Some(SplitTarget::Values(vec![Amount::from(16)])),
+    )
+    .await
+    .expect("Failed to retain an ordinary proof");
+
+    // Nothing except the mnemonic, public keyset IDs, and external oracle may
+    // cross the simulated device-loss boundary.
+    drop(conversion);
+    drop(yes_premint);
+    drop(no_premint);
+    drop(wallet);
+
+    let restored_wallet = create_test_wallet_for_mint_with_seed(mint.clone(), seed)
+        .await
+        .expect("Failed to create empty recovery wallet");
+    assert_eq!(restored_wallet.total_balance().await.unwrap(), Amount::ZERO);
+    let restored = restored_wallet
+        .restore()
+        .await
+        .expect("Seed restore failed");
+    assert_eq!(restored.spent, Amount::from(32));
+    assert_eq!(
+        restored.unspent,
+        Amount::from(16) + conditional_amount + conditional_amount
+    );
+    assert_eq!(restored.pending, Amount::ZERO);
+
+    let recovered = restored_wallet
+        .get_unspent_proofs()
+        .await
+        .expect("Failed to load restored proofs");
+    let recovered_ordinary = recovered
+        .iter()
+        .filter(|proof| proof.keyset_id == ordinary_keyset_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let recovered_yes = recovered
+        .iter()
+        .filter(|proof| proof.keyset_id == yes_keyset_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let recovered_no = recovered
+        .iter()
+        .filter(|proof| proof.keyset_id == no_keyset_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(recovered_ordinary.total_amount().unwrap(), Amount::from(16));
+    assert_eq!(recovered_yes.total_amount().unwrap(), conditional_amount);
+    assert_eq!(recovered_no.total_amount().unwrap(), conditional_amount);
+    for proofs in [&recovered_ordinary, &recovered_yes, &recovered_no] {
+        let states = restored_wallet
+            .check_proofs_spent(proofs.clone())
+            .await
+            .expect("Failed to check recovered proof state");
+        assert!(states.iter().all(|proof| proof.state == State::Unspent));
+    }
+
+    restored_wallet
+        .swap(
+            None,
+            SplitTarget::None,
+            recovered_ordinary.clone(),
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("Recovered ordinary proof must be spendable");
+    assert!(restored_wallet
+        .check_proofs_spent(recovered_ordinary)
+        .await
+        .expect("Failed to recheck ordinary proof")
+        .iter()
+        .all(|proof| proof.state == State::Spent));
+
+    let ctf_fee = restored_wallet
+        .get_proofs_fee(&recovered_yes)
+        .await
+        .expect("Failed to calculate recovered CTF fee")
+        .total;
+    let redeemed_amount = recovered_yes
+        .total_amount()
+        .unwrap()
+        .checked_sub(ctf_fee)
+        .expect("CTF fee must fit recovered position");
+    let mut witnessed_yes = recovered_yes;
+    let oracle_witness = create_oracle_witness(&oracle, "YES");
+    for proof in &mut witnessed_yes {
+        proof.witness = Some(Witness::OracleWitness(oracle_witness.clone()));
+    }
+
+    let ordinary_keys = mint
+        .keyset_pubkeys(&ordinary_keyset_id)
+        .expect("Failed to reload ordinary keys")
+        .keysets
+        .into_iter()
+        .next()
+        .expect("Ordinary keyset response must not be empty")
+        .keys;
+    let ordinary_fee_and_amounts = (
+        1000,
+        ordinary_keys
+            .iter()
+            .map(|(amount, _)| amount.to_u64())
+            .collect::<Vec<_>>(),
+    )
+        .into();
+    let redeem_premint = PreMintSecrets::random(
+        ordinary_keyset_id,
+        redeemed_amount,
+        &SplitTarget::None,
+        &ordinary_fee_and_amounts,
+    )
+    .expect("Failed to prepare redemption outputs");
+    let redemption = restored_wallet
+        .redeem_outcome(RedeemOutcomeRequest {
+            inputs: witnessed_yes,
+            outputs: redeem_premint.blinded_messages(),
+        })
+        .await
+        .expect("Recovered YES position must be redeemable");
+    let redeemed_proofs = construct_proofs(
+        redemption.signatures,
+        redeem_premint.rs(),
+        redeem_premint.secrets(),
+        &ordinary_keys,
+    )
+    .expect("Redemption signatures must construct valid proofs");
+    assert_eq!(redeemed_proofs.total_amount().unwrap(), redeemed_amount);
+    assert!(restored_wallet
+        .check_proofs_spent(redeemed_proofs.clone())
+        .await
+        .expect("Failed to check redeemed proofs")
+        .iter()
+        .all(|proof| proof.state == State::Unspent));
+
+    let receiver = create_test_wallet_for_mint(mint)
+        .await
+        .expect("Failed to create redemption receiver");
+    let receive_fee = receiver
+        .get_proofs_fee(&redeemed_proofs)
+        .await
+        .expect("Failed to calculate receive fee")
+        .total;
+    let received = receiver
+        .receive_proofs(redeemed_proofs, ReceiveOptions::default(), None, None)
+        .await
+        .expect("Redeemed regular proofs must be spendable");
+    assert_eq!(
+        received,
+        redeemed_amount
+            .checked_sub(receive_fee)
+            .expect("receive fee must fit redeemed amount")
     );
 }
 

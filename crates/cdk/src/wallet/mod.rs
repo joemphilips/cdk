@@ -12,27 +12,24 @@ use cdk_common::amount::FeeAndAmounts;
 use cdk_common::database::{self, WalletDatabase};
 use cdk_common::parking_lot::RwLock;
 use cdk_common::subscription::WalletParams;
-use cdk_common::wallet::ProofInfo;
 use cdk_common::{PublicKey, SecretKey, SECP256K1};
 use getrandom::getrandom;
 pub use mint_connector::http_client::{
     AuthHttpClient as BaseAuthHttpClient, HttpClient as BaseHttpClient,
 };
 use subscription::{ActiveSubscription, SubscriptionManager};
-use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 use tracing::instrument;
 use zeroize::Zeroize;
 
 use crate::amount::SplitTarget;
-use crate::dhke::construct_proofs;
 use crate::error::Error;
 use crate::fees::calculate_fee;
 use crate::mint_url::MintUrl;
 use crate::nuts::nut00::token::Token;
 use crate::nuts::nut17::Kind;
 use crate::nuts::{
-    nut10, CurrencyUnit, Id, Keys, MintInfo, MintQuoteState, PreMintSecrets, Proofs,
-    RestoreRequest, SpendingConditions, State,
+    nut10, CurrencyUnit, Id, Keys, MintInfo, MintQuoteState, Proofs, SpendingConditions, State,
 };
 use crate::wallet::mint_metadata_cache::MintMetadataCache;
 use crate::wallet::p2pk::{P2PK_ACCOUNT, P2PK_PURPOSE};
@@ -61,6 +58,7 @@ mod proofs;
 mod receive;
 mod reclaim;
 mod recovery;
+mod restore;
 pub(crate) mod saga;
 mod send;
 #[cfg(not(target_arch = "wasm32"))]
@@ -142,6 +140,7 @@ pub struct Wallet {
     seed: [u8; 64],
     client: Arc<dyn MintConnector + Send + Sync>,
     subscription: SubscriptionManager,
+    restore_lock: Arc<TokioMutex<()>>,
 }
 
 const ALPHANUMERIC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -520,173 +519,6 @@ impl Wallet {
         }
 
         Ok(SplitTarget::Values(values))
-    }
-
-    /// Restore
-    #[instrument(skip(self))]
-    pub async fn restore(&self) -> Result<Restored, Error> {
-        // Check that mint is in store of mints
-        if self
-            .localstore
-            .get_mint(self.mint_url.clone())
-            .await?
-            .is_none()
-        {
-            self.fetch_mint_info().await?;
-        }
-
-        let keysets = self.get_mint_keysets(KeysetFilter::All).await?;
-
-        let mut restored_result = Restored::default();
-
-        for keyset in keysets {
-            let keys = self.load_keyset_keys(keyset.id).await?;
-            let mut empty_batch = 0;
-            let mut start_counter = 0;
-            // Track the highest counter value that had a signature
-            let mut highest_counter: Option<u32> = None;
-
-            while empty_batch.lt(&3) {
-                let premint_secrets = PreMintSecrets::restore_batch(
-                    keyset.id,
-                    &self.seed,
-                    start_counter,
-                    start_counter + 100,
-                )?;
-
-                tracing::debug!(
-                    "Attempting to restore counter {}-{} for mint {} keyset {}",
-                    start_counter,
-                    start_counter + 100,
-                    self.mint_url,
-                    keyset.id
-                );
-
-                let restore_request = RestoreRequest {
-                    outputs: premint_secrets.blinded_messages(),
-                };
-
-                let response = self.client.post_restore(restore_request).await?;
-
-                if response.signatures.is_empty() {
-                    empty_batch += 1;
-                    start_counter += 100;
-                    continue;
-                }
-
-                // Build a map from blinded_secret to signature for O(1) lookup
-                // This ensures we match signatures to secrets correctly regardless of response order
-                let signature_map: HashMap<_, _> = response
-                    .outputs
-                    .iter()
-                    .zip(response.signatures.iter())
-                    .map(|(output, sig)| (output.blinded_secret, sig.clone()))
-                    .collect();
-
-                // Enumerate secrets to track their original index (which corresponds to counter value)
-                // and match signatures by blinded_secret to ensure correct pairing
-                let matched_secrets: Vec<_> = premint_secrets
-                    .secrets
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, p)| {
-                        signature_map
-                            .get(&p.blinded_message.blinded_secret)
-                            .map(|sig| (idx, p, sig.clone()))
-                    })
-                    .collect();
-
-                // Update highest counter based on matched indices
-                if let Some(&(max_idx, _, _)) = matched_secrets.last() {
-                    let counter_value = start_counter + max_idx as u32;
-                    highest_counter =
-                        Some(highest_counter.map_or(counter_value, |c| c.max(counter_value)));
-                }
-
-                // the response outputs and premint secrets should be the same after filtering
-                // blinded messages the mint did not have signatures for
-                if response.outputs.len() != matched_secrets.len() {
-                    return Err(Error::InvalidMintResponse(format!(
-                        "restore response outputs ({}) does not match premint secrets ({})",
-                        response.outputs.len(),
-                        matched_secrets.len()
-                    )));
-                }
-
-                // Extract signatures, rs, and secrets in matching order
-                // Each tuple (idx, premint, signature) ensures correct pairing
-                let proofs = construct_proofs(
-                    matched_secrets
-                        .iter()
-                        .map(|(_, _, sig)| sig.clone())
-                        .collect(),
-                    matched_secrets
-                        .iter()
-                        .map(|(_, p, _)| p.r.clone())
-                        .collect(),
-                    matched_secrets
-                        .iter()
-                        .map(|(_, p, _)| p.secret.clone())
-                        .collect(),
-                    &keys,
-                )?;
-
-                tracing::debug!("Restored {} proofs", proofs.len());
-
-                let states = self.check_proofs_spent(proofs.clone()).await?;
-
-                let (unspent_proofs, updated_restored) = proofs
-                    .into_iter()
-                    .zip(states)
-                    .filter_map(|(p, state)| {
-                        ProofInfo::new(p, self.mint_url.clone(), state.state, keyset.unit.clone())
-                            .ok()
-                    })
-                    .try_fold(
-                        (Vec::new(), restored_result),
-                        |(mut proofs, mut restored_result), proof_info| {
-                            match proof_info.state {
-                                State::Spent => {
-                                    restored_result.spent += proof_info.proof.amount;
-                                }
-                                State::Unspent =>  {
-                                    restored_result.unspent += proof_info.proof.amount;
-                                    proofs.push(proof_info);
-                                }
-                                State::Pending => {
-                                    restored_result.pending += proof_info.proof.amount;
-                                    proofs.push(proof_info);
-                                }
-                                _ => {
-                                    unreachable!("These states are unknown to the mint and cannot be returned")
-                                }
-                            }
-                            Ok::<(Vec<ProofInfo>, Restored), Error>((proofs, restored_result))
-                        },
-                    )?;
-
-                restored_result = updated_restored;
-
-                self.localstore
-                    .update_proofs(unspent_proofs, vec![])
-                    .await?;
-
-                empty_batch = 0;
-                start_counter += 100;
-            }
-
-            if let Some(highest) = highest_counter {
-                self.localstore
-                    .increment_keyset_counter(&keyset.id, highest + 1)
-                    .await?;
-                tracing::debug!(
-                    "Set keyset {} counter to {} after restore",
-                    keyset.id,
-                    highest + 1
-                );
-            }
-        }
-        Ok(restored_result)
     }
 
     /// Verify all proofs in token have meet the required spend

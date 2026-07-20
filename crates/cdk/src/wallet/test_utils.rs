@@ -2,8 +2,9 @@
 #![allow(missing_docs)]
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bip39::Mnemonic;
@@ -401,16 +402,24 @@ pub async fn create_test_wallet_with_mock(
 pub struct MockMintConnector {
     /// Mock mint keyset state
     pub keyset: Mutex<KeySet>,
+    /// Optional exact ordinary NUT-02 listing, including malformed duplicates.
+    pub ordinary_keyset_infos: Mutex<Option<Vec<KeySetInfo>>>,
+    /// Additional keysets addressable by ID but excluded from the ordinary
+    /// NUT-02 listing (for example conditional keysets).
+    #[cfg(feature = "conditional-tokens")]
+    pub additional_keysets: Mutex<BTreeMap<Id, KeySet>>,
     /// Mock mint info state
     pub mint_info: Mutex<MintInfo>,
     /// Response for post_check_state calls
-    pub check_state_response: Mutex<Option<Result<CheckStateResponse, Error>>>,
+    pub check_state_response: Mutex<VecDeque<Result<CheckStateResponse, Error>>>,
     /// Response for post_restore calls
-    pub restore_response: Mutex<Option<Result<RestoreResponse, Error>>>,
+    pub restore_response: Mutex<VecDeque<Result<RestoreResponse, Error>>>,
+    /// Number of NUT-09 calls made through this connector.
+    pub post_restore_calls: AtomicUsize,
     /// Response for strict conditional-keyset catalogue calls.
     #[cfg(feature = "conditional-tokens")]
     pub conditional_keyset_page_response:
-        Mutex<Option<Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error>>>,
+        Mutex<VecDeque<Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error>>>,
     /// Response for get_melt_quote_status calls
     pub melt_quote_status_response: Mutex<Option<Result<MeltQuoteBolt11Response<String>, Error>>>,
     /// Response for post_mint calls
@@ -441,11 +450,15 @@ impl MockMintConnector {
 
         Self {
             keyset: Mutex::new(keyset),
-            mint_info: Mutex::new(mint_info),
-            check_state_response: Mutex::new(None),
-            restore_response: Mutex::new(None),
+            ordinary_keyset_infos: Mutex::new(None),
             #[cfg(feature = "conditional-tokens")]
-            conditional_keyset_page_response: Mutex::new(None),
+            additional_keysets: Mutex::new(BTreeMap::new()),
+            mint_info: Mutex::new(mint_info),
+            check_state_response: Mutex::new(VecDeque::new()),
+            restore_response: Mutex::new(VecDeque::new()),
+            post_restore_calls: AtomicUsize::new(0),
+            #[cfg(feature = "conditional-tokens")]
+            conditional_keyset_page_response: Mutex::new(VecDeque::new()),
             melt_quote_status_response: Mutex::new(None),
             post_mint_response: Mutex::new(None),
             post_swap_response: Mutex::new(None),
@@ -457,7 +470,16 @@ impl MockMintConnector {
     }
 
     pub fn set_check_state_response(&self, response: Result<CheckStateResponse, Error>) {
-        *self.check_state_response.lock().unwrap() = Some(response);
+        let mut responses = self.check_state_response.lock().unwrap();
+        responses.clear();
+        responses.push_back(response);
+    }
+
+    pub fn enqueue_check_state_response(&self, response: Result<CheckStateResponse, Error>) {
+        self.check_state_response
+            .lock()
+            .unwrap()
+            .push_back(response);
     }
 
     pub fn set_mint_keys_response(&self, response: Result<Vec<KeySet>, Error>) {
@@ -477,6 +499,10 @@ impl MockMintConnector {
             Ok(keyset) => *self.keyset.lock().unwrap() = keyset,
             Err(_) => unimplemented!("error responses for key state are not supported"),
         }
+    }
+
+    pub fn set_ordinary_keyset_infos(&self, keysets: Vec<KeySetInfo>) {
+        *self.ordinary_keyset_infos.lock().unwrap() = Some(keysets);
     }
 
     pub fn set_mint_keysets_response(&self, response: Result<KeysetResponse, Error>) {
@@ -519,13 +545,27 @@ impl MockMintConnector {
         }));
     }
 
+    #[cfg(feature = "conditional-tokens")]
+    pub fn set_additional_keyset(&self, keyset: KeySet) {
+        self.additional_keysets
+            .lock()
+            .unwrap()
+            .insert(keyset.id, keyset);
+    }
+
     pub fn reset_default_mint_state(&self) {
         self.set_active_keyset(test_keyset());
         self.set_mint_info_response(Ok(test_mint_info()));
     }
 
     pub fn _set_restore_response(&self, response: Result<RestoreResponse, Error>) {
-        *self.restore_response.lock().unwrap() = Some(response);
+        let mut responses = self.restore_response.lock().unwrap();
+        responses.clear();
+        responses.push_back(response);
+    }
+
+    pub fn enqueue_restore_response(&self, response: Result<RestoreResponse, Error>) {
+        self.restore_response.lock().unwrap().push_back(response);
     }
 
     #[cfg(feature = "conditional-tokens")]
@@ -533,7 +573,20 @@ impl MockMintConnector {
         &self,
         response: Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error>,
     ) {
-        *self.conditional_keyset_page_response.lock().unwrap() = Some(response);
+        let mut responses = self.conditional_keyset_page_response.lock().unwrap();
+        responses.clear();
+        responses.push_back(response);
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    pub fn enqueue_conditional_keyset_page_response(
+        &self,
+        response: Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error>,
+    ) {
+        self.conditional_keyset_page_response
+            .lock()
+            .unwrap()
+            .push_back(response);
     }
 
     pub fn set_melt_quote_status_response(
@@ -614,11 +667,26 @@ impl MintConnector for MockMintConnector {
 
         match keyset.id == keyset_id {
             true => Ok(keyset),
-            false => Err(Error::UnknownKeySet),
+            false => {
+                #[cfg(feature = "conditional-tokens")]
+                if let Some(keyset) = self
+                    .additional_keysets
+                    .lock()
+                    .unwrap()
+                    .get(&keyset_id)
+                    .cloned()
+                {
+                    return Ok(keyset);
+                }
+                Err(Error::UnknownKeySet)
+            }
         }
     }
 
     async fn get_mint_keysets(&self) -> Result<KeysetResponse, Error> {
+        if let Some(keysets) = self.ordinary_keyset_infos.lock().unwrap().clone() {
+            return Ok(KeysetResponse { keysets });
+        }
         let keyset = self.keyset.lock().unwrap().clone();
 
         Ok(KeysetResponse {
@@ -701,15 +769,16 @@ impl MintConnector for MockMintConnector {
         self.check_state_response
             .lock()
             .unwrap()
-            .take()
+            .pop_front()
             .expect("MockMintConnector: post_check_state called without configured response")
     }
 
     async fn post_restore(&self, _request: RestoreRequest) -> Result<RestoreResponse, Error> {
+        self.post_restore_calls.fetch_add(1, Ordering::Relaxed);
         self.restore_response
             .lock()
             .unwrap()
-            .take()
+            .pop_front()
             .expect("MockMintConnector: post_restore called without configured response")
     }
 
@@ -787,7 +856,7 @@ impl MintConnector for MockMintConnector {
         self.conditional_keyset_page_response
             .lock()
             .unwrap()
-            .take()
+            .pop_front()
             .expect("MockMintConnector: strict catalogue called without configured response")
     }
 

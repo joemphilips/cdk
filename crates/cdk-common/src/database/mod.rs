@@ -224,6 +224,18 @@ pub enum Error {
     #[error("Concurrent update detected")]
     ConcurrentUpdate,
 
+    /// Backend does not support atomic ordinary NUT-09 restore storage.
+    #[error("Atomic ordinary restore storage is unsupported by this backend")]
+    OrdinaryRestoreUnsupported,
+
+    /// Ordinary restore admission was internally inconsistent.
+    #[error("Invalid ordinary restore admission: {0}")]
+    InvalidOrdinaryRestore(String),
+
+    /// Existing ordinary proof metadata conflicts with authenticated recovery evidence.
+    #[error("Ordinary restore metadata conflicts with persisted state")]
+    OrdinaryRestoreMetadataConflict,
+
     /// Backend does not support atomic conditional-token restore storage.
     #[cfg(feature = "conditional-tokens")]
     #[error("Atomic conditional restore storage is unsupported by this backend")]

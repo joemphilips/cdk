@@ -12,11 +12,11 @@ use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::rand::rngs::OsRng;
 use cdk_common::auth::oidc::OidcClient;
 use cdk_common::common::ProofInfo;
-use cdk_common::database::wallet::Database;
 #[cfg(feature = "conditional-tokens")]
 use cdk_common::database::wallet::{
     ConditionalRestoreAdmission, ConditionalRestoreAdmissionResult,
 };
+use cdk_common::database::wallet::{Database, OrdinaryRestoreAdmission};
 use cdk_common::database::{Error as DatabaseError, KVStoreDatabase};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::{
@@ -744,8 +744,7 @@ impl SupabaseWalletDatabase {
         }
     }
 
-    #[cfg(feature = "conditional-tokens")]
-    async fn conditional_restore_proof_json(
+    async fn restore_proof_json(
         &self,
         proof: ProofInfo,
     ) -> Result<serde_json::Value, DatabaseError> {
@@ -770,16 +769,19 @@ impl SupabaseWalletDatabase {
         Ok(value)
     }
 
-    #[cfg(feature = "conditional-tokens")]
-    fn conditional_rpc_error(error: Error) -> DatabaseError {
+    fn restore_rpc_error(error: Error) -> DatabaseError {
         let message = error.to_string();
-        if message.contains("conditional_restore_metadata_conflict") {
-            DatabaseError::ConditionalRestoreMetadataConflict
-        } else if message.contains("keyset_counter_overflow") {
-            DatabaseError::AmountOverflow
-        } else {
-            error.into()
+        if message.contains("ordinary_restore_metadata_conflict") {
+            return DatabaseError::OrdinaryRestoreMetadataConflict;
         }
+        #[cfg(feature = "conditional-tokens")]
+        if message.contains("conditional_restore_metadata_conflict") {
+            return DatabaseError::ConditionalRestoreMetadataConflict;
+        }
+        if message.contains("keyset_counter_overflow") {
+            return DatabaseError::AmountOverflow;
+        }
+        error.into()
     }
 }
 
@@ -854,6 +856,46 @@ impl KVStoreDatabase for SupabaseWalletDatabase {
 }
 #[async_trait]
 impl Database<DatabaseError> for SupabaseWalletDatabase {
+    async fn commit_ordinary_restore(
+        &self,
+        admission: OrdinaryRestoreAdmission,
+    ) -> Result<(), DatabaseError> {
+        admission.validate()?;
+        if admission
+            .proofs
+            .iter()
+            .chain(&admission.spent_proofs)
+            .any(|proof| proof.proof.amount.to_u64() > i64::MAX as u64)
+        {
+            return Err(DatabaseError::InvalidOrdinaryRestore(
+                "Supabase restore payload exceeds the SQL integer domain".to_string(),
+            ));
+        }
+        let mut proofs = Vec::with_capacity(admission.proofs.len());
+        for proof in admission.proofs {
+            proofs.push(self.restore_proof_json(proof).await?);
+        }
+        let mut spent_proofs = Vec::with_capacity(admission.spent_proofs.len());
+        for proof in admission.spent_proofs {
+            spent_proofs.push(self.restore_proof_json(proof).await?);
+        }
+        self.call_rpc(
+            "commit_ordinary_restore",
+            &serde_json::json!({
+                "p_mint_url": admission.mint_url.to_string(),
+                "p_unit": admission.unit.to_string(),
+                "p_keyset_id": admission.keyset_id.to_string(),
+                "p_proofs": proofs,
+                "p_spent_proofs": spent_proofs,
+                "p_counter_floor": admission.counter_floor,
+            })
+            .to_string(),
+        )
+        .await
+        .map_err(Self::restore_rpc_error)?;
+        Ok(())
+    }
+
     #[cfg(feature = "conditional-tokens")]
     async fn advance_conditional_restore_high_water(
         &self,
@@ -872,7 +914,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
                 .to_string(),
             )
             .await
-            .map_err(Self::conditional_rpc_error)?;
+            .map_err(Self::restore_rpc_error)?;
         let high_water: String = serde_json::from_str(&response)?;
         u64::from_str_radix(&high_water, 16).map_err(|_| DatabaseError::InvalidDbResponse)
     }
@@ -903,11 +945,11 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         let keys = KeyTable::from_keyset(&admission.keys)?;
         let mut proofs = Vec::with_capacity(admission.proofs.len());
         for proof in admission.proofs.clone() {
-            proofs.push(self.conditional_restore_proof_json(proof).await?);
+            proofs.push(self.restore_proof_json(proof).await?);
         }
         let mut spent_proofs = Vec::with_capacity(admission.spent_proofs.len());
         for proof in admission.spent_proofs.clone() {
-            spent_proofs.push(self.conditional_restore_proof_json(proof).await?);
+            spent_proofs.push(self.restore_proof_json(proof).await?);
         }
         let mode = match admission.mode {
             cdk_common::database::wallet::ConditionalRestoreAdmissionMode::HeldProofs => {
@@ -935,7 +977,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
                 .to_string(),
             )
             .await
-            .map_err(Self::conditional_rpc_error)?;
+            .map_err(Self::restore_rpc_error)?;
         let result: serde_json::Value = serde_json::from_str(&response)?;
         let effective_hex = result
             .get("effective_time")
@@ -973,7 +1015,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
                 .to_string(),
             )
             .await
-            .map_err(Self::conditional_rpc_error)?;
+            .map_err(Self::restore_rpc_error)?;
         let mut result = Vec::new();
         for mut proof in serde_json::from_str::<Vec<ProofTable>>(&response)? {
             self.decrypt_proof_table(&mut proof).await;
@@ -988,6 +1030,28 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
             }
         }
         Ok(result)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditional_restore_keysets(
+        &self,
+        mint_url: MintUrl,
+    ) -> Result<Vec<cdk_common::nuts::nut_ctf::ConditionalKeySetInfo>, DatabaseError> {
+        let path = format!(
+            "rest/v1/conditional_restore_keyset?select=*&mint_url=eq.{}&order=id.asc",
+            url_encode(&mint_url.to_string())
+        );
+        let (status, text) = self.get_request(&path).await?;
+        if !status.is_success() {
+            return Err(DatabaseError::Internal(format!(
+                "get_conditional_restore_keysets failed: HTTP {status}"
+            )));
+        }
+        Self::parse_response::<ConditionalRestoreKeysetTable>(&text)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| record.try_into_for_mint(&mint_url))
+            .collect()
     }
 
     async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, DatabaseError> {
@@ -1514,7 +1578,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
                 .to_string(),
             )
             .await
-            .map_err(Self::conditional_rpc_error)?;
+            .map_err(Self::restore_rpc_error)?;
             return Ok(());
         }
 
@@ -2523,6 +2587,50 @@ struct KeySetTable {
     _extra: serde_json::Map<String, serde_json::Value>,
 }
 
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Serialize, Deserialize)]
+struct ConditionalRestoreKeysetTable {
+    id: String,
+    mint_url: String,
+    unit: String,
+    active: bool,
+    input_fee_ppk: Option<i64>,
+    final_expiry: Option<i64>,
+    condition_id: String,
+    outcome_collection: String,
+    outcome_collection_id: String,
+    registered_at: i64,
+    #[serde(default, skip_serializing, flatten)]
+    _extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[cfg(feature = "conditional-tokens")]
+impl ConditionalRestoreKeysetTable {
+    fn try_into_for_mint(
+        self,
+        mint_url: &MintUrl,
+    ) -> Result<cdk_common::nuts::nut_ctf::ConditionalKeySetInfo, DatabaseError> {
+        if self.mint_url != mint_url.to_string()
+            || self.input_fee_ppk.is_some_and(|value| value < 0)
+            || self.final_expiry.is_some_and(|value| value <= 0)
+            || self.registered_at < 0
+        {
+            return Err(DatabaseError::ConditionalRestoreMetadataConflict);
+        }
+        Ok(cdk_common::nuts::nut_ctf::ConditionalKeySetInfo {
+            id: Id::from_str(&self.id).map_err(|_| DatabaseError::InvalidKeysetId)?,
+            unit: self.unit,
+            active: self.active,
+            input_fee_ppk: self.input_fee_ppk.map(|value| value as u64),
+            final_expiry: self.final_expiry.map(|value| value as u64),
+            condition_id: self.condition_id,
+            outcome_collection: self.outcome_collection,
+            outcome_collection_id: self.outcome_collection_id,
+            registered_at: self.registered_at as u64,
+        })
+    }
+}
+
 impl KeySetTable {
     fn from_info(mint_url: MintUrl, info: KeySetInfo) -> Result<Self, DatabaseError> {
         Ok(Self {
@@ -3113,6 +3221,7 @@ mod tests {
         for required in [
             "CREATE TABLE IF NOT EXISTS conditional_restore_high_water",
             "CREATE TABLE IF NOT EXISTS conditional_restore_keyset",
+            "CREATE OR REPLACE FUNCTION public.commit_ordinary_restore",
             "CREATE OR REPLACE FUNCTION public.advance_conditional_restore_high_water",
             "CREATE OR REPLACE FUNCTION public.commit_conditional_restore",
             "WHERE y = v_proof->>'y' AND wallet_id = v_wallet\n                      AND state = 'UNSPENT';",

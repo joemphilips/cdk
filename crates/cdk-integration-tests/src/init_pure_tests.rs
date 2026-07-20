@@ -342,9 +342,9 @@ impl MintConnector for DirectMintConnection {
     #[cfg(feature = "conditional-tokens")]
     async fn post_register_condition(
         &self,
-        _request: cdk::nuts::nut_ctf::RegisterConditionRequest,
+        request: cdk::nuts::nut_ctf::RegisterConditionRequest,
     ) -> Result<cdk::nuts::nut_ctf::RegisterConditionResponse, Error> {
-        unimplemented!()
+        self.mint.register_condition(request).await
     }
 
     #[cfg(feature = "conditional-tokens")]
@@ -382,17 +382,17 @@ impl MintConnector for DirectMintConnection {
     #[cfg(feature = "conditional-tokens")]
     async fn post_ctf_convert(
         &self,
-        _request: cdk::nuts::nut_ctf::CtfConvertRequest,
+        request: cdk::nuts::nut_ctf::CtfConvertRequest,
     ) -> Result<cdk::nuts::nut_ctf::CtfConvertResponse, Error> {
-        unimplemented!()
+        self.mint.process_ctf_convert(request).await
     }
 
     #[cfg(feature = "conditional-tokens")]
     async fn post_redeem_outcome(
         &self,
-        _request: cdk::nuts::nut_ctf::RedeemOutcomeRequest,
+        request: cdk::nuts::nut_ctf::RedeemOutcomeRequest,
     ) -> Result<cdk::nuts::nut_ctf::RedeemOutcomeResponse, Error> {
-        unimplemented!()
+        self.mint.process_redeem_outcome(request).await
     }
 }
 

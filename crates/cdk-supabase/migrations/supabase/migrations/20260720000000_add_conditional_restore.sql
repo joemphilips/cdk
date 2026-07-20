@@ -116,6 +116,110 @@ CREATE TRIGGER conditional_restore_keyset_immutable
 BEFORE INSERT OR UPDATE OR DELETE ON conditional_restore_keyset
 FOR EACH ROW EXECUTE FUNCTION public.reject_conditional_restore_classification_mutation();
 
+CREATE OR REPLACE FUNCTION public.commit_ordinary_restore(
+    p_mint_url TEXT,
+    p_unit TEXT,
+    p_keyset_id TEXT,
+    p_proofs JSONB,
+    p_spent_proofs JSONB,
+    p_counter_floor BIGINT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $body$
+DECLARE
+    v_wallet TEXT := public.get_current_wallet_id();
+    v_proof JSONB;
+    v_stored proof%ROWTYPE;
+BEGIN
+    IF p_counter_floor <= 0 OR p_counter_floor > 4294967295
+       OR jsonb_array_length(p_proofs) + jsonb_array_length(p_spent_proofs) = 0
+       OR jsonb_array_length(p_proofs) + jsonb_array_length(p_spent_proofs) <>
+          (SELECT count(DISTINCT item->>'y')
+           FROM jsonb_array_elements(p_proofs || p_spent_proofs) AS item) THEN
+        RAISE EXCEPTION 'invalid_ordinary_restore_admission';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext(v_wallet || E'\n' || p_mint_url));
+    IF EXISTS (
+        SELECT 1 FROM conditional_restore_keyset
+        WHERE id = p_keyset_id AND wallet_id = v_wallet
+    ) THEN
+        RAISE EXCEPTION 'ordinary_restore_metadata_conflict';
+    END IF;
+
+    FOR v_proof IN SELECT value FROM jsonb_array_elements(p_proofs) LOOP
+        IF v_proof->>'state' NOT IN ('UNSPENT', 'PENDING')
+           OR v_proof->>'mint_url' IS DISTINCT FROM p_mint_url
+           OR v_proof->>'unit' IS DISTINCT FROM p_unit
+           OR v_proof->>'keyset_id' IS DISTINCT FROM p_keyset_id
+           OR v_proof->>'restore_fingerprint' !~ '^[0-9a-f]{64}$' THEN
+            RAISE EXCEPTION 'invalid_ordinary_restore_admission';
+        END IF;
+        SELECT * INTO v_stored FROM proof
+        WHERE y = v_proof->>'y' AND wallet_id = v_wallet;
+        IF FOUND THEN
+            IF v_stored.mint_url IS DISTINCT FROM p_mint_url
+               OR v_stored.unit IS DISTINCT FROM p_unit
+               OR v_stored.keyset_id IS DISTINCT FROM p_keyset_id
+               OR v_stored.amount IS DISTINCT FROM (v_proof->>'amount')::BIGINT
+               OR v_stored.spending_condition IS DISTINCT FROM v_proof->>'spending_condition'
+               OR v_stored.restore_fingerprint IS DISTINCT FROM v_proof->>'restore_fingerprint' THEN
+                RAISE EXCEPTION 'ordinary_restore_metadata_conflict';
+            END IF;
+            IF v_stored.state = 'UNSPENT' AND v_proof->>'state' = 'PENDING' THEN
+                UPDATE proof SET state = 'PENDING'
+                WHERE y = v_proof->>'y' AND wallet_id = v_wallet
+                  AND state = 'UNSPENT';
+            END IF;
+        ELSE
+            INSERT INTO proof (
+                y, wallet_id, mint_url, state, spending_condition, unit, amount,
+                keyset_id, secret, c, witness, dleq_e, dleq_s, dleq_r,
+                used_by_operation, created_by_operation, p2pk_e, restore_fingerprint
+            ) VALUES (
+                v_proof->>'y', v_wallet, p_mint_url, v_proof->>'state',
+                v_proof->>'spending_condition', p_unit, (v_proof->>'amount')::BIGINT,
+                p_keyset_id, v_proof->>'secret', v_proof->>'c', v_proof->>'witness',
+                v_proof->>'dleq_e', v_proof->>'dleq_s', v_proof->>'dleq_r',
+                v_proof->>'used_by_operation', v_proof->>'created_by_operation',
+                v_proof->>'p2pk_e', v_proof->>'restore_fingerprint'
+            );
+        END IF;
+    END LOOP;
+
+    FOR v_proof IN SELECT value FROM jsonb_array_elements(p_spent_proofs) LOOP
+        IF v_proof->>'state' IS DISTINCT FROM 'SPENT'
+           OR v_proof->>'mint_url' IS DISTINCT FROM p_mint_url
+           OR v_proof->>'unit' IS DISTINCT FROM p_unit
+           OR v_proof->>'keyset_id' IS DISTINCT FROM p_keyset_id
+           OR v_proof->>'restore_fingerprint' !~ '^[0-9a-f]{64}$' THEN
+            RAISE EXCEPTION 'invalid_ordinary_restore_admission';
+        END IF;
+        SELECT * INTO v_stored FROM proof
+        WHERE y = v_proof->>'y' AND wallet_id = v_wallet;
+        IF FOUND THEN
+            IF v_stored.mint_url IS DISTINCT FROM p_mint_url
+               OR v_stored.unit IS DISTINCT FROM p_unit
+               OR v_stored.keyset_id IS DISTINCT FROM p_keyset_id
+               OR v_stored.amount IS DISTINCT FROM (v_proof->>'amount')::BIGINT
+               OR v_stored.spending_condition IS DISTINCT FROM v_proof->>'spending_condition'
+               OR v_stored.restore_fingerprint IS DISTINCT FROM v_proof->>'restore_fingerprint' THEN
+                RAISE EXCEPTION 'ordinary_restore_metadata_conflict';
+            END IF;
+            UPDATE proof SET state = 'SPENT'
+            WHERE y = v_proof->>'y' AND wallet_id = v_wallet;
+        END IF;
+    END LOOP;
+
+    INSERT INTO keyset_counter (keyset_id, wallet_id, counter)
+    VALUES (p_keyset_id, v_wallet, p_counter_floor)
+    ON CONFLICT (keyset_id, wallet_id) DO UPDATE
+    SET counter = GREATEST(keyset_counter.counter, EXCLUDED.counter);
+END
+$body$;
+
 CREATE OR REPLACE FUNCTION public.advance_conditional_restore_high_water(
     p_mint_url TEXT,
     p_unit TEXT,
@@ -448,6 +552,7 @@ END
 $body$;
 
 GRANT EXECUTE ON FUNCTION public.advance_conditional_restore_high_water(TEXT, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.commit_ordinary_restore(TEXT, TEXT, TEXT, JSONB, JSONB, BIGINT) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.commit_conditional_restore(TEXT, TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, JSONB, BIGINT) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.get_ordinary_proofs(TEXT, TEXT) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.update_mint_url_atomic(TEXT, TEXT) TO authenticated;

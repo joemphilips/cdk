@@ -16,12 +16,16 @@ use crate::wallet::{
     self, MintQuote as WalletMintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
 };
 
+mod ordinary_restore;
+pub use ordinary_restore::{join_restore_proof_state, OrdinaryRestoreAdmission};
+
 #[cfg(feature = "conditional-tokens")]
 mod conditional_restore;
 #[cfg(feature = "conditional-tokens")]
 pub use conditional_restore::{
-    join_conditional_restore_proof_state, ConditionalRestoreAdmission,
-    ConditionalRestoreAdmissionMode, ConditionalRestoreAdmissionResult,
+    join_conditional_restore_proof_state, validate_conditional_restore_keyset,
+    ConditionalRestoreAdmission, ConditionalRestoreAdmissionMode,
+    ConditionalRestoreAdmissionResult,
 };
 
 #[cfg(feature = "test")]
@@ -34,6 +38,14 @@ pub trait Database<Err>: Debug
 where
     Err: Into<Error> + From<Error>,
 {
+    /// Atomically admit ordinary recovered proofs and their absolute counter floor.
+    async fn commit_ordinary_restore(
+        &self,
+        _admission: OrdinaryRestoreAdmission,
+    ) -> Result<(), Err> {
+        Err(Error::OrdinaryRestoreUnsupported.into())
+    }
+
     /// Atomically advance and return the conditional-restore high-water time.
     #[cfg(feature = "conditional-tokens")]
     async fn advance_conditional_restore_high_water(
@@ -63,6 +75,15 @@ where
         _state: Option<Vec<State>>,
         _spending_conditions: Option<Vec<SpendingConditions>>,
     ) -> Result<Vec<ProofInfo>, Err> {
+        Err(Error::ConditionalRestoreUnsupported.into())
+    }
+
+    /// Load authenticated conditional keyset classifications owned by this mint.
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditional_restore_keysets(
+        &self,
+        _mint_url: MintUrl,
+    ) -> Result<Vec<crate::nuts::nut_ctf::ConditionalKeySetInfo>, Err> {
         Err(Error::ConditionalRestoreUnsupported.into())
     }
 

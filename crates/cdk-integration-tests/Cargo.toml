@@ -14,6 +14,7 @@ http_subscription = ["cdk/http_subscription"]
 conditional-tokens = [
     "cdk/conditional-tokens",
     "cashu/conditional-tokens",
+    "cashu/test-utils",
     "cdk-common/conditional-tokens",
     "cdk-ffi/conditional-tokens",
 ]

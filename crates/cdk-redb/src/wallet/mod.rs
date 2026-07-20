@@ -13,6 +13,7 @@ use cdk_common::database::wallet::{
     join_conditional_restore_proof_state, ConditionalRestoreAdmission,
     ConditionalRestoreAdmissionMode, ConditionalRestoreAdmissionResult,
 };
+use cdk_common::database::wallet::{join_restore_proof_state, OrdinaryRestoreAdmission};
 use cdk_common::database::{validate_kvstore_params, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nut00::KnownMethod;
@@ -81,6 +82,20 @@ const DATABASE_VERSION: u32 = 6;
 struct ConditionalRestoreKeysetRecord {
     mint_url: MintUrl,
     info: cdk_common::nuts::nut_ctf::ConditionalKeySetInfo,
+}
+
+fn validate_existing_restore_proof(
+    existing: &ProofInfo,
+    incoming: &ProofInfo,
+) -> Result<(), database::Error> {
+    let mut expected = incoming.clone();
+    expected.state = existing.state;
+    expected.used_by_operation = existing.used_by_operation;
+    expected.created_by_operation = existing.created_by_operation;
+    if expected != *existing {
+        return Err(database::Error::OrdinaryRestoreMetadataConflict);
+    }
+    Ok(())
 }
 
 /// Wallet Redb Database
@@ -231,6 +246,96 @@ impl WalletRedbDatabase {
 
 #[async_trait]
 impl WalletDatabase<database::Error> for WalletRedbDatabase {
+    #[instrument(skip(self, admission))]
+    async fn commit_ordinary_restore(
+        &self,
+        admission: OrdinaryRestoreAdmission,
+    ) -> Result<(), database::Error> {
+        admission.validate()?;
+        let keyset_id_text = admission.keyset_id.to_string();
+        let write_txn = self.db.begin_write().map_err(Error::from)?;
+
+        #[cfg(feature = "conditional-tokens")]
+        if write_txn
+            .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+            .map_err(Error::from)?
+            .get(admission.keyset_id.to_bytes().as_slice())
+            .map_err(Error::from)?
+            .is_some()
+        {
+            return Err(database::Error::OrdinaryRestoreMetadataConflict);
+        }
+
+        {
+            let mut proofs = write_txn.open_table(PROOFS_TABLE).map_err(Error::from)?;
+            for proof in &admission.proofs {
+                let y = proof.y.to_bytes();
+                let stored = proofs
+                    .get(y.as_slice())
+                    .map_err(Error::from)?
+                    .map(|stored| stored.value().to_owned());
+                match stored {
+                    Some(stored) => {
+                        let mut existing: ProofInfo =
+                            serde_json::from_str(&stored).map_err(Error::from)?;
+                        validate_existing_restore_proof(&existing, proof)?;
+                        let joined = join_restore_proof_state(existing.state, proof.state);
+                        if joined != existing.state {
+                            existing.state = joined;
+                            let existing = serde_json::to_string(&existing).map_err(Error::from)?;
+                            proofs
+                                .insert(y.as_slice(), existing.as_str())
+                                .map_err(Error::from)?;
+                        }
+                    }
+                    None => {
+                        let proof = serde_json::to_string(proof).map_err(Error::from)?;
+                        proofs
+                            .insert(y.as_slice(), proof.as_str())
+                            .map_err(Error::from)?;
+                    }
+                }
+            }
+            for evidence in &admission.spent_proofs {
+                let y = evidence.y.to_bytes();
+                let Some(stored) = proofs
+                    .get(y.as_slice())
+                    .map_err(Error::from)?
+                    .map(|stored| stored.value().to_owned())
+                else {
+                    continue;
+                };
+                let mut existing: ProofInfo = serde_json::from_str(&stored).map_err(Error::from)?;
+                validate_existing_restore_proof(&existing, evidence)?;
+                if existing.state != State::Spent {
+                    existing.state = State::Spent;
+                    let existing = serde_json::to_string(&existing).map_err(Error::from)?;
+                    proofs
+                        .insert(y.as_slice(), existing.as_str())
+                        .map_err(Error::from)?;
+                }
+            }
+        }
+
+        {
+            let mut counters = write_txn.open_table(KEYSET_COUNTER).map_err(Error::from)?;
+            let current = counters
+                .get(keyset_id_text.as_str())
+                .map_err(Error::from)?
+                .map(|counter| counter.value())
+                .unwrap_or_default();
+            counters
+                .insert(
+                    keyset_id_text.as_str(),
+                    current.max(admission.counter_floor),
+                )
+                .map_err(Error::from)?;
+        }
+
+        write_txn.commit().map_err(Error::from)?;
+        Ok(())
+    }
+
     #[cfg(feature = "conditional-tokens")]
     #[instrument(skip(self))]
     async fn advance_conditional_restore_high_water(
@@ -597,6 +702,29 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             }
         }
         Ok(ordinary)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self))]
+    async fn get_conditional_restore_keysets(
+        &self,
+        mint_url: MintUrl,
+    ) -> Result<Vec<cdk_common::nuts::nut_ctf::ConditionalKeySetInfo>, database::Error> {
+        let read_txn = self.db.begin_read().map_err(Error::from)?;
+        let table = read_txn
+            .open_table(CONDITIONAL_RESTORE_KEYSETS_TABLE)
+            .map_err(Error::from)?;
+        let mut keysets = Vec::new();
+        for row in table.iter().map_err(Error::from)? {
+            let (_, record) = row.map_err(Error::from)?;
+            let record: ConditionalRestoreKeysetRecord =
+                serde_json::from_str(record.value()).map_err(Error::from)?;
+            if record.mint_url == mint_url {
+                keysets.push(record.info);
+            }
+        }
+        keysets.sort_by_key(|keyset| keyset.id);
+        Ok(keysets)
     }
 
     #[instrument(skip(self))]

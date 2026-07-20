@@ -12,6 +12,7 @@ use cdk_common::database::wallet::{
     join_conditional_restore_proof_state, ConditionalRestoreAdmission,
     ConditionalRestoreAdmissionMode, ConditionalRestoreAdmissionResult,
 };
+use cdk_common::database::wallet::{join_restore_proof_state, OrdinaryRestoreAdmission};
 use cdk_common::database::{ConversionError, Error, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
 #[cfg(feature = "conditional-tokens")]
@@ -195,7 +196,6 @@ where
     decode_restore_high_water(stored)
 }
 
-#[cfg(feature = "conditional-tokens")]
 async fn lock_restore_mint_namespace<T>(
     conn: &T,
     postgres: bool,
@@ -246,10 +246,25 @@ where
     .transpose()
 }
 
-#[cfg(feature = "conditional-tokens")]
-async fn apply_conditional_restore_spent_evidence<T>(
+fn validate_existing_restore_proof(
+    existing: &ProofInfo,
+    incoming: &ProofInfo,
+    conflict: fn() -> Error,
+) -> Result<(), Error> {
+    let mut expected = incoming.clone();
+    expected.state = existing.state;
+    expected.used_by_operation = existing.used_by_operation;
+    expected.created_by_operation = existing.created_by_operation;
+    if expected != *existing {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
+async fn apply_restore_spent_evidence<T>(
     conn: &T,
     spent_proofs: &[ProofInfo],
+    conflict: fn() -> Error,
 ) -> Result<(), Error>
 where
     T: DatabaseExecutor,
@@ -258,13 +273,7 @@ where
         let Some(existing) = load_proof_by_y(conn, &evidence.y).await? else {
             continue;
         };
-        let mut expected = evidence.clone();
-        expected.state = existing.state;
-        expected.used_by_operation = existing.used_by_operation;
-        expected.created_by_operation = existing.created_by_operation;
-        if expected != existing {
-            return Err(Error::ConditionalRestoreMetadataConflict);
-        }
+        validate_existing_restore_proof(&existing, evidence, conflict)?;
         if existing.state != State::Spent {
             query("UPDATE proof SET state = :state WHERE y = :y")?
                 .bind("state", State::Spent.to_string())
@@ -276,11 +285,109 @@ where
     Ok(())
 }
 
+fn ordinary_restore_conflict() -> Error {
+    Error::OrdinaryRestoreMetadataConflict
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn conditional_restore_conflict() -> Error {
+    Error::ConditionalRestoreMetadataConflict
+}
+
 #[async_trait]
 impl<RM> WalletDatabase<database::Error> for SQLWalletDatabase<RM>
 where
     RM: DatabasePool + 'static,
 {
+    #[instrument(skip(self, admission))]
+    async fn commit_ordinary_restore(
+        &self,
+        admission: OrdinaryRestoreAdmission,
+    ) -> Result<(), database::Error> {
+        admission.validate()?;
+        for proof in admission.proofs.iter().chain(&admission.spent_proofs) {
+            i64::try_from(u64::from(proof.proof.amount)).map_err(|_| {
+                Error::InvalidOrdinaryRestore(
+                    "proof amount exceeds the SQL integer domain".to_string(),
+                )
+            })?;
+        }
+
+        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let tx = ConnectionWithTransaction::new(conn).await?;
+        let operation: Result<(), Error> = async {
+            lock_restore_mint_namespace(
+                &tx,
+                RM::Connection::name() == "postgres",
+                &admission.mint_url,
+            )
+            .await?;
+
+            #[cfg(feature = "conditional-tokens")]
+            if load_conditional_restore_keyset(&tx, &admission.keyset_id)
+                .await?
+                .is_some()
+            {
+                return Err(Error::OrdinaryRestoreMetadataConflict);
+            }
+
+            for proof in &admission.proofs {
+                match load_proof_by_y(&tx, &proof.y).await? {
+                    Some(existing) => {
+                        validate_existing_restore_proof(
+                            &existing,
+                            proof,
+                            ordinary_restore_conflict,
+                        )?;
+                        let joined = join_restore_proof_state(existing.state, proof.state);
+                        if joined != existing.state {
+                            query(
+                                "UPDATE proof SET state = :state \
+                                 WHERE y = :y AND state = 'UNSPENT'",
+                            )?
+                            .bind("state", joined.to_string())
+                            .bind("y", proof.y.to_bytes().to_vec())
+                            .execute(&tx)
+                            .await?;
+                        }
+                    }
+                    None => insert_restore_proof(&tx, proof).await?,
+                }
+            }
+            apply_restore_spent_evidence(&tx, &admission.spent_proofs, ordinary_restore_conflict)
+                .await?;
+
+            query(
+                r#"
+                INSERT INTO keyset_counter (keyset_id, counter)
+                VALUES (:keyset_id, :counter_floor)
+                ON CONFLICT(keyset_id) DO UPDATE SET
+                    counter = CASE
+                        WHEN keyset_counter.counter < excluded.counter THEN excluded.counter
+                        ELSE keyset_counter.counter
+                    END
+                "#,
+            )?
+            .bind("keyset_id", admission.keyset_id.to_string())
+            .bind("counter_floor", admission.counter_floor)
+            .execute(&tx)
+            .await?;
+            Ok(())
+        }
+        .await;
+
+        match operation {
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
     #[cfg(feature = "conditional-tokens")]
     #[instrument(skip(self))]
     async fn advance_conditional_restore_high_water(
@@ -381,8 +488,12 @@ where
                         {
                             return Err(Error::ConditionalRestoreMetadataConflict);
                         }
-                        apply_conditional_restore_spent_evidence(&tx, &admission.spent_proofs)
-                            .await?;
+                        apply_restore_spent_evidence(
+                            &tx,
+                            &admission.spent_proofs,
+                            conditional_restore_conflict,
+                        )
+                        .await?;
                     }
                     None => {
                         if stored_keyset.is_some() || stored_keys.is_some() {
@@ -579,7 +690,12 @@ where
                     None => insert_restore_proof(&tx, proof).await?,
                 }
             }
-            apply_conditional_restore_spent_evidence(&tx, &admission.spent_proofs).await?;
+            apply_restore_spent_evidence(
+                &tx,
+                &admission.spent_proofs,
+                conditional_restore_conflict,
+            )
+            .await?;
 
             query(
                 r#"
@@ -664,6 +780,37 @@ where
             proof.matches_conditions(&mint_filter, &unit_filter, &state, &spending_conditions)
         })
         .collect())
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self))]
+    async fn get_conditional_restore_keysets(
+        &self,
+        mint_url: MintUrl,
+    ) -> Result<Vec<ConditionalKeySetInfo>, database::Error> {
+        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        query(
+            r#"
+            SELECT id, mint_url, unit, active, input_fee_ppk, final_expiry,
+                   condition_id, outcome_collection, outcome_collection_id, registered_at
+            FROM conditional_restore_keyset
+            WHERE mint_url = :mint_url
+            ORDER BY id
+            "#,
+        )?
+        .bind("mint_url", mint_url.to_string())
+        .fetch_all(&*conn)
+        .await?
+        .into_iter()
+        .map(sql_row_to_conditional_restore_keyset)
+        .map(|record| {
+            let (stored_mint_url, keyset) = record?;
+            if stored_mint_url != mint_url {
+                return Err(Error::ConditionalRestoreMetadataConflict);
+            }
+            Ok(keyset)
+        })
+        .collect::<Result<Vec<_>, Error>>()
     }
 
     #[instrument(skip(self))]
@@ -2621,7 +2768,6 @@ fn sql_row_to_conditional_restore_keyset(
     ))
 }
 
-#[cfg(feature = "conditional-tokens")]
 async fn load_proof_by_y<T>(conn: &T, y: &PublicKey) -> Result<Option<ProofInfo>, Error>
 where
     T: DatabaseExecutor,
@@ -2641,12 +2787,13 @@ where
     .transpose()
 }
 
-#[cfg(feature = "conditional-tokens")]
 async fn insert_restore_proof<T>(conn: &T, proof: &ProofInfo) -> Result<(), Error>
 where
     T: DatabaseExecutor,
 {
-    let amount = checked_sql_u64(u64::from(proof.proof.amount), "proof amount")?;
+    let amount = i64::try_from(u64::from(proof.proof.amount)).map_err(|_| {
+        Error::InvalidOrdinaryRestore("proof amount exceeds the SQL integer domain".to_string())
+    })?;
     let spending_condition = proof
         .spending_condition
         .as_ref()
