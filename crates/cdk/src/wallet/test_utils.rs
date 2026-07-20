@@ -407,6 +407,10 @@ pub struct MockMintConnector {
     pub check_state_response: Mutex<Option<Result<CheckStateResponse, Error>>>,
     /// Response for post_restore calls
     pub restore_response: Mutex<Option<Result<RestoreResponse, Error>>>,
+    /// Response for strict conditional-keyset catalogue calls.
+    #[cfg(feature = "conditional-tokens")]
+    pub conditional_keyset_page_response:
+        Mutex<Option<Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error>>>,
     /// Response for get_melt_quote_status calls
     pub melt_quote_status_response: Mutex<Option<Result<MeltQuoteBolt11Response<String>, Error>>>,
     /// Response for post_mint calls
@@ -440,6 +444,8 @@ impl MockMintConnector {
             mint_info: Mutex::new(mint_info),
             check_state_response: Mutex::new(None),
             restore_response: Mutex::new(None),
+            #[cfg(feature = "conditional-tokens")]
+            conditional_keyset_page_response: Mutex::new(None),
             melt_quote_status_response: Mutex::new(None),
             post_mint_response: Mutex::new(None),
             post_swap_response: Mutex::new(None),
@@ -520,6 +526,14 @@ impl MockMintConnector {
 
     pub fn _set_restore_response(&self, response: Result<RestoreResponse, Error>) {
         *self.restore_response.lock().unwrap() = Some(response);
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    pub fn set_conditional_keyset_page_response(
+        &self,
+        response: Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error>,
+    ) {
+        *self.conditional_keyset_page_response.lock().unwrap() = Some(response);
     }
 
     pub fn set_melt_quote_status_response(
@@ -763,6 +777,18 @@ impl MintConnector for MockMintConnector {
         _active: Option<bool>,
     ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
         unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditional_keysets_page(
+        &self,
+        _request: crate::nuts::nut_ctf::GetConditionalKeysetsRequest,
+    ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
+        self.conditional_keyset_page_response
+            .lock()
+            .unwrap()
+            .take()
+            .expect("MockMintConnector: strict catalogue called without configured response")
     }
 
     #[cfg(feature = "conditional-tokens")]

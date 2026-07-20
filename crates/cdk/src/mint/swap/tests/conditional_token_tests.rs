@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::panic;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,12 +27,139 @@ use cdk_common::nuts::{
 };
 use cdk_common::{Amount, CurrencyUnit, State};
 use cdk_fake_wallet::FakeWallet;
+use cdk_signatory::signatory::{
+    ConditionalKeysetInstallReservation, PreparedConditionalKeySet, RotateKeyArguments, Signatory,
+    SignatoryKeySet, SignatoryKeysets,
+};
 use tokio::time::sleep;
 
 use crate::mint::{Mint, MintBuilder, MintMeltLimits, UnitConfig};
 use crate::test_helpers::mint::mint_test_proofs;
 use crate::types::{FeeReserve, QuoteTTL};
 use crate::Error;
+
+struct RegistrationAdmissionProbeSignatory {
+    inner: Arc<dyn Signatory + Send + Sync>,
+    corrupt_install_response: bool,
+    reserve_calls: AtomicUsize,
+    verify_calls: AtomicUsize,
+    prepare_calls: AtomicUsize,
+    install_calls: AtomicUsize,
+}
+
+impl RegistrationAdmissionProbeSignatory {
+    fn new(inner: Arc<dyn Signatory + Send + Sync>) -> Self {
+        Self {
+            inner,
+            corrupt_install_response: false,
+            reserve_calls: AtomicUsize::new(0),
+            verify_calls: AtomicUsize::new(0),
+            prepare_calls: AtomicUsize::new(0),
+            install_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn corrupting(inner: Arc<dyn Signatory + Send + Sync>) -> Self {
+        Self {
+            corrupt_install_response: true,
+            ..Self::new(inner)
+        }
+    }
+
+    fn maybe_corrupt_install_response(&self, keysets: &mut [SignatoryKeySet]) {
+        if self.corrupt_install_response {
+            if let Some(first) = keysets.first_mut() {
+                first.input_fee_ppk = first.input_fee_ppk.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Signatory for RegistrationAdmissionProbeSignatory {
+    fn name(&self) -> String {
+        "registration-admission-probe".to_string()
+    }
+
+    async fn blind_sign(
+        &self,
+        blinded_messages: Vec<cdk_common::BlindedMessage>,
+    ) -> Result<Vec<cdk_common::BlindSignature>, Error> {
+        self.inner.blind_sign(blinded_messages).await
+    }
+
+    async fn verify_proofs(&self, proofs: Vec<cdk_common::Proof>) -> Result<(), Error> {
+        self.verify_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.verify_proofs(proofs).await
+    }
+
+    async fn keysets(&self) -> Result<SignatoryKeysets, Error> {
+        self.inner.keysets().await
+    }
+
+    async fn rotate_keyset(&self, args: RotateKeyArguments) -> Result<SignatoryKeySet, Error> {
+        self.inner.rotate_keyset(args).await
+    }
+
+    async fn prepare_conditional_keyset(
+        &self,
+        unit: CurrencyUnit,
+        condition_id: &str,
+        outcome_collection: &str,
+        outcome_collection_id: &str,
+        amounts: Vec<u64>,
+        input_fee_ppk: u64,
+        final_expiry: Option<u64>,
+    ) -> Result<PreparedConditionalKeySet, Error> {
+        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .prepare_conditional_keyset(
+                unit,
+                condition_id,
+                outcome_collection,
+                outcome_collection_id,
+                amounts,
+                input_fee_ppk,
+                final_expiry,
+            )
+            .await
+    }
+
+    async fn reserve_conditional_keyset_install(
+        &self,
+    ) -> Result<ConditionalKeysetInstallReservation, Error> {
+        self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.reserve_conditional_keyset_install().await
+    }
+
+    async fn install_reserved_conditional_keysets(
+        &self,
+        reservation: ConditionalKeysetInstallReservation,
+        keysets: Vec<cdk_common::mint::MintKeySetInfo>,
+    ) -> Result<Vec<SignatoryKeySet>, Error> {
+        self.install_calls.fetch_add(1, Ordering::SeqCst);
+        let mut installed = self
+            .inner
+            .install_reserved_conditional_keysets(reservation, keysets)
+            .await?;
+        self.maybe_corrupt_install_response(&mut installed);
+        Ok(installed)
+    }
+
+    async fn install_conditional_keysets(
+        &self,
+        keysets: Vec<cdk_common::mint::MintKeySetInfo>,
+    ) -> Result<Vec<SignatoryKeySet>, Error> {
+        self.install_calls.fetch_add(1, Ordering::SeqCst);
+        let mut installed = self.inner.install_conditional_keysets(keysets).await?;
+        self.maybe_corrupt_install_response(&mut installed);
+        Ok(installed)
+    }
+
+    async fn reload_keysets_from_storage(&self) -> Result<(), Error> {
+        self.inner.reload_keysets_from_storage().await
+    }
+}
 
 /// Helper: create an enum RegisterConditionRequest with all fields
 fn enum_condition_request(
@@ -377,6 +505,12 @@ async fn test_register_condition_creates_keysets() {
     assert_eq!(keysets.len(), 2, "should create one keyset per outcome");
     assert!(keysets.contains_key("YES"));
     assert!(keysets.contains_key("NO"));
+    for keyset_id in keysets.values() {
+        assert!(
+            mint.keyset_pubkeys(keyset_id).is_ok(),
+            "committed keyset must become immediately usable without a full signatory reload"
+        );
+    }
 }
 
 /// Test that registering the same condition twice is idempotent
@@ -940,10 +1074,9 @@ async fn test_register_condition_with_custom_outcome_collections() {
 async fn test_register_condition_one_vs_rest_default_creates_managed_keysets() {
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
-    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        default_keyset_creation: "one-vs-rest".to_string(),
-        ..NutCtfSettings::default()
-    });
+    let mut settings = mint_info.nuts.nut_ctf.take().unwrap_or_default();
+    settings.default_keyset_creation = "one-vs-rest".to_string();
+    mint_info.nuts.nut_ctf = Some(settings);
     mint.set_mint_info(mint_info).await.unwrap();
 
     let oracle = create_test_oracle();
@@ -967,10 +1100,9 @@ async fn test_register_condition_one_vs_rest_default_creates_managed_keysets() {
 async fn test_register_condition_one_vs_rest_rejects_client_collections() {
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
-    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        default_keyset_creation: "one-vs-rest".to_string(),
-        ..NutCtfSettings::default()
-    });
+    let mut settings = mint_info.nuts.nut_ctf.take().unwrap_or_default();
+    settings.default_keyset_creation = "one-vs-rest".to_string();
+    mint_info.nuts.nut_ctf = Some(settings);
     mint.set_mint_info(mint_info).await.unwrap();
 
     let oracle = create_test_oracle();
@@ -989,10 +1121,9 @@ async fn test_register_condition_one_vs_rest_rejects_client_collections() {
 async fn test_register_condition_all_default_rejects_client_collections() {
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
-    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        default_keyset_creation: "all".to_string(),
-        ..NutCtfSettings::default()
-    });
+    let mut settings = mint_info.nuts.nut_ctf.take().unwrap_or_default();
+    settings.default_keyset_creation = "all".to_string();
+    mint_info.nuts.nut_ctf = Some(settings);
     mint.set_mint_info(mint_info).await.unwrap();
 
     let oracle = create_test_oracle();
@@ -1061,6 +1192,258 @@ async fn test_register_condition_charges_registration_fee_once() {
         second.change.is_none(),
         "idempotent retry must not return change"
     );
+}
+
+#[tokio::test]
+async fn test_register_condition_reserves_install_before_spending_fee_and_retries_cleanly() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 2, 3)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let fee_proofs = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+    let fee_ys = fee_proofs.ys().unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "admission-retry");
+    let mut request = enum_condition_request("Admission retry", vec![hex_tlv]);
+    request.fee = Some(fee_proofs);
+
+    let mut held_admission = Vec::new();
+    while let Ok(reservation) = mint.signatory.reserve_conditional_keyset_install().await {
+        held_admission.push(reservation);
+    }
+    assert!(!held_admission.is_empty());
+
+    let saturated = mint
+        .register_condition(request.clone())
+        .await
+        .expect_err("saturated install admission must reject before registration commits");
+    assert!(saturated.to_string().contains("admission is saturated"));
+    let states = mint.localstore().get_proofs_states(&fee_ys).await.unwrap();
+    assert!(
+        states.iter().all(Option::is_none),
+        "saturated registration must not spend its fee proofs"
+    );
+    assert!(
+        mint.get_conditions(None, None, &[])
+            .await
+            .unwrap()
+            .conditions
+            .is_empty(),
+        "saturated registration must not commit a condition or catalogue rows"
+    );
+
+    drop(held_admission);
+    let registered = mint
+        .register_condition(request)
+        .await
+        .expect("retry should consume the reserved install capacity after commit");
+    assert_eq!(registered.keysets.len(), 2);
+    let states = mint.localstore().get_proofs_states(&fee_ys).await.unwrap();
+    assert!(states.iter().all(|state| *state == Some(State::Spent)));
+
+    for keyset_id in registered.keysets.values() {
+        let (outputs, _) = create_premint(&mint, *keyset_id, Amount::from(1));
+        let signatures = mint
+            .blind_sign(outputs)
+            .await
+            .expect("committed conditional keyset must be immediately signable");
+        assert_eq!(signatures.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_oversized_fee_before_install_admission() {
+    let mut mint = create_test_mint().await.unwrap();
+    mint.max_inputs = 1;
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 1, 0)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let fee_proofs = mint_test_proofs(&mint, Amount::from(3)).await.unwrap();
+    assert_eq!(
+        fee_proofs.len(),
+        2,
+        "fixture must exceed the one-input limit"
+    );
+    let fee_ys = fee_proofs.ys().unwrap();
+    let signatory = Arc::new(RegistrationAdmissionProbeSignatory::new(
+        mint.signatory.clone(),
+    ));
+    mint.signatory = signatory.clone();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "oversized-fee");
+    let mut request = enum_condition_request("Oversized fee", vec![hex_tlv]);
+    request.fee = Some(fee_proofs);
+
+    let error = mint
+        .register_condition(request)
+        .await
+        .expect_err("fee count must reject before install admission is consulted");
+    assert!(matches!(
+        error,
+        Error::MaxInputsExceeded { actual: 2, max: 1 }
+    ));
+    assert_eq!(signatory.reserve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signatory.verify_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signatory.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signatory.install_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        mint.localstore()
+            .get_proofs_states(&fee_ys)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none),
+        "oversized fee rejection must not mutate proof state"
+    );
+    assert!(
+        mint.get_conditions(None, None, &[])
+            .await
+            .unwrap()
+            .conditions
+            .is_empty(),
+        "oversized fee rejection must not prepare or commit a condition"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_register_condition_healthy_retries_bypass_install_and_cache_publication() {
+    const CONCURRENT_RETRIES: usize = 8;
+
+    let mut mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 2, 3)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let fee_proofs = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+    let fee_ys = fee_proofs.ys().unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "healthy-retry");
+    let mut request = enum_condition_request("Healthy retry", vec![hex_tlv]);
+    request.fee = Some(fee_proofs);
+
+    let registered = mint
+        .register_condition(request.clone())
+        .await
+        .expect("initial registration should commit and publish keysets");
+    let cache_before = mint.keysets.load_full();
+    let entries_before = registered
+        .keysets
+        .values()
+        .map(|id| {
+            cache_before
+                .get(id)
+                .expect("registered keyset must be cached")
+                .clone()
+        })
+        .collect::<Vec<_>>();
+
+    let signatory = Arc::new(RegistrationAdmissionProbeSignatory::new(
+        mint.signatory.clone(),
+    ));
+    mint.signatory = signatory.clone();
+    let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_RETRIES + 1));
+    let mut retries = Vec::new();
+    for _ in 0..CONCURRENT_RETRIES {
+        let mint = mint.clone();
+        let request = request.clone();
+        let barrier = barrier.clone();
+        retries.push(tokio::spawn(async move {
+            barrier.wait().await;
+            mint.register_condition(request).await
+        }));
+    }
+    barrier.wait().await;
+    for retry in retries {
+        let response = retry
+            .await
+            .expect("healthy retry task should join")
+            .expect("healthy retry should remain idempotent");
+        assert_eq!(response.condition_id, registered.condition_id);
+        assert_eq!(response.keysets, registered.keysets);
+        assert!(response.change.is_none());
+    }
+
+    assert_eq!(signatory.reserve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signatory.verify_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signatory.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signatory.install_calls.load(Ordering::SeqCst), 0);
+    let cache_after = mint.keysets.load_full();
+    assert!(
+        Arc::ptr_eq(&cache_before, &cache_after),
+        "healthy retries must not replace the ArcSwap map"
+    );
+    for (id, before) in registered.keysets.values().zip(entries_before) {
+        assert!(
+            Arc::ptr_eq(
+                &before,
+                cache_after
+                    .get(id)
+                    .expect("registered cache entry must remain present")
+            ),
+            "healthy retries must not churn cached keyset payloads"
+        );
+    }
+    assert!(
+        mint.localstore()
+            .get_proofs_states(&fee_ys)
+            .await
+            .unwrap()
+            .iter()
+            .all(|state| *state == Some(State::Spent)),
+        "healthy retries must not alter the already-charged fee state"
+    );
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_malicious_install_response_without_cache_mutation() {
+    let mut mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "malicious-install");
+    let request = enum_condition_request("Malicious install", vec![hex_tlv]);
+    let registered = mint
+        .register_condition(request.clone())
+        .await
+        .expect("initial registration should succeed");
+
+    let current = mint.keysets.load_full();
+    let mut missing = (*current).clone();
+    for id in registered.keysets.values() {
+        missing.remove(id);
+    }
+    mint.keysets.store(Arc::new(missing));
+    let cache_before = mint.keysets.load_full();
+    let signatory = Arc::new(RegistrationAdmissionProbeSignatory::corrupting(
+        mint.signatory.clone(),
+    ));
+    mint.signatory = signatory.clone();
+
+    mint.register_condition(request)
+        .await
+        .expect_err("mint must reject mismatched signatory installation output");
+    assert_eq!(signatory.reserve_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(signatory.install_calls.load(Ordering::SeqCst), 1);
+    let cache_after = mint.keysets.load_full();
+    assert!(
+        Arc::ptr_eq(&cache_before, &cache_after),
+        "rejected signatory output must not replace the cache map"
+    );
+    for id in registered.keysets.values() {
+        assert!(
+            !cache_after.contains_key(id),
+            "rejected signatory output must not publish any committed keyset"
+        );
+    }
 }
 
 #[tokio::test]

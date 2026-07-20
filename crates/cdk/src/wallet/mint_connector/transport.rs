@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use cdk_common::HttpClientBuilder;
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::HttpError;
 use cdk_common::{AuthToken, HttpClient};
 #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
@@ -45,6 +47,26 @@ pub trait Transport: Default + Send + Sync + Debug + Clone {
     ) -> Result<R, super::Error>
     where
         R: serde::de::DeserializeOwned;
+
+    /// HTTP GET with a hard response-body byte limit before deserialization.
+    ///
+    /// The default fails closed so custom transports cannot silently bypass a
+    /// recovery catalogue's memory bound.
+    #[cfg(feature = "conditional-tokens")]
+    async fn http_get_with_response_limit<R>(
+        &self,
+        url: url::Url,
+        auth: Option<cdk_common::AuthToken>,
+        max_bytes: usize,
+    ) -> Result<R, super::Error>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        let _ = (url, auth, max_bytes);
+        Err(Error::InvalidConditionalKeysetCatalogueResponse(
+            "transport does not support bounded catalogue responses".to_string(),
+        ))
+    }
 
     /// HTTP Post request
     async fn http_post<P, R>(
@@ -190,6 +212,56 @@ impl Transport for Async {
         serde_json::from_str::<R>(&body).map_err(|err| {
             tracing::warn!("Http Response error: {}", err);
             match ErrorResponse::from_json(&body) {
+                Ok(ok) => <ErrorResponse as Into<Error>>::into(ok),
+                Err(err) => err.into(),
+            }
+        })
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn http_get_with_response_limit<R>(
+        &self,
+        url: Url,
+        auth: Option<AuthToken>,
+        max_bytes: usize,
+    ) -> Result<R, Error>
+    where
+        R: DeserializeOwned,
+    {
+        let url_str = url.to_string();
+        let mut request = self.inner.get(&url_str);
+        if let Some(auth) = auth {
+            request = request.header(auth.header_key(), auth.to_string());
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|err| Error::HttpError(None, err.to_string()))?;
+        let status = response.status();
+        let body = response
+            .bytes_with_limit(max_bytes)
+            .await
+            .map_err(|err| match err {
+                HttpError::ResponseBodyTooLarge { .. } => {
+                    Error::InvalidConditionalKeysetCatalogueResponse(format!(
+                        "conditional-keyset catalogue response exceeded {max_bytes} bytes"
+                    ))
+                }
+                other => Error::HttpError(None, other.to_string()),
+            })?;
+
+        if !(200..300).contains(&status) {
+            let text = String::from_utf8_lossy(&body).into_owned();
+            if let Ok(err_resp) = serde_json::from_slice::<ErrorResponse>(&body) {
+                return Err(err_resp.into());
+            }
+            return Err(Error::HttpError(Some(status), text));
+        }
+
+        serde_json::from_slice::<R>(&body).map_err(|err| {
+            tracing::warn!("Http Response error: {}", err);
+            match ErrorResponse::from_json(&String::from_utf8_lossy(&body)) {
                 Ok(ok) => <ErrorResponse as Into<Error>>::into(ok),
                 Err(err) => err.into(),
             }

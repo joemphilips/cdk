@@ -1,5 +1,6 @@
 //! HTTP response types
 
+use futures::StreamExt;
 use serde::de::DeserializeOwned;
 
 use crate::error::HttpError;
@@ -44,6 +45,11 @@ impl RawResponse {
         (500..600).contains(&self.status)
     }
 
+    /// Return the server-declared response length, when present.
+    pub fn content_length(&self) -> Option<u64> {
+        self.inner.content_length()
+    }
+
     /// Get the response body as text
     pub async fn text(self) -> Response<String> {
         self.inner.text().await.map_err(HttpError::from)
@@ -61,6 +67,42 @@ impl RawResponse {
             .await
             .map(|b| b.to_vec())
             .map_err(HttpError::from)
+    }
+
+    /// Read a response body without retaining more than `max_bytes`.
+    ///
+    /// A declared oversized `Content-Length` is rejected before polling the
+    /// body. The streamed byte count remains authoritative because responses
+    /// may omit or misstate that header, or use chunked transfer encoding.
+    pub async fn bytes_with_limit(self, max_bytes: usize) -> Response<Vec<u8>> {
+        if self
+            .inner
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(HttpError::ResponseBodyTooLarge { limit: max_bytes });
+        }
+
+        let mut body = Vec::with_capacity(
+            self.inner
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(max_bytes),
+        );
+        let mut stream = self.inner.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(HttpError::from)?;
+            let next_len = body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(HttpError::ResponseBodyTooLarge { limit: max_bytes })?;
+            if next_len > max_bytes {
+                return Err(HttpError::ResponseBodyTooLarge { limit: max_bytes });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 

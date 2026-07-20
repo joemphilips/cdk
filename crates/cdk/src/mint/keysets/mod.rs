@@ -38,11 +38,10 @@ impl Mint {
     pub fn keyset_pubkeys(&self, keyset_id: &Id) -> Result<KeysResponse, Error> {
         self.keysets
             .load()
-            .iter()
-            .find(|keyset| &keyset.id == keyset_id)
+            .get(keyset_id)
             .ok_or(Error::UnknownKeySet)
             .map(|key| KeysResponse {
-                keysets: vec![key.into()],
+                keysets: vec![key.as_ref().into()],
             })
     }
 
@@ -54,9 +53,9 @@ impl Mint {
             keysets: self
                 .keysets
                 .load()
-                .iter()
+                .values()
                 .filter(|keyset| keyset.active && Self::is_listable_keyset(keyset))
-                .map(|key| key.into())
+                .map(|key| key.as_ref().into())
                 .collect::<Vec<_>>(),
         }
     }
@@ -68,7 +67,7 @@ impl Mint {
             keysets: self
                 .keysets
                 .load()
-                .iter()
+                .values()
                 .filter(|k| Self::is_listable_keyset(k))
                 .map(|k| KeySetInfo {
                     id: k.id,
@@ -86,9 +85,8 @@ impl Mint {
     pub fn keyset(&self, id: &Id) -> Option<KeySet> {
         self.keysets
             .load()
-            .iter()
-            .find(|key| &key.id == id)
-            .map(|x| x.into())
+            .get(id)
+            .map(|keyset| keyset.as_ref().into())
     }
 
     /// Add current keyset to inactive keysets
@@ -102,6 +100,7 @@ impl Mint {
         use_keyset_v2: bool,
         final_expiry: Option<u64>,
     ) -> Result<MintKeySetInfo, Error> {
+        let _rotation_guard = self.keyset_rotation_lock.lock().await;
         let result = self
             .signatory
             .rotate_keyset(RotateKeyArguments {
@@ -117,8 +116,32 @@ impl Mint {
             })
             .await?;
 
-        let new_keyset = self.signatory.keysets().await?;
-        self.keysets.store(new_keyset.keysets.into());
+        #[cfg(all(test, feature = "conditional-tokens"))]
+        {
+            use std::sync::atomic::Ordering;
+
+            let publication_number = self
+                .rotation_test_hooks
+                .returned_rotation_count
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            self.rotation_test_hooks
+                .returned_rotation_notify
+                .notify_waiters();
+            if publication_number == 1
+                && self
+                    .rotation_test_hooks
+                    .pause_first_publication
+                    .load(Ordering::SeqCst)
+            {
+                self.rotation_test_hooks
+                    .first_publication_release
+                    .notified()
+                    .await;
+            }
+        }
+
+        super::merge_rotated_keyset_cache(&self.keysets, &result);
 
         Ok(result.into())
     }

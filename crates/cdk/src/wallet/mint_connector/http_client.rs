@@ -16,6 +16,11 @@ use url::Url;
 use web_time::{Duration, Instant};
 
 use super::transport::Transport;
+#[cfg(feature = "conditional-tokens")]
+use super::{
+    validate_conditional_keyset_catalogue_request, validate_conditional_keyset_catalogue_response,
+    MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE, MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES,
+};
 use super::{Error, MintConnector};
 use crate::mint_url::MintUrl;
 use crate::nuts::nut00::{KnownMethod, PaymentMethod};
@@ -678,7 +683,7 @@ where
         self.transport.http_post(url, auth_token, &request).await
     }
 
-    /// Get conditional keysets [NUT-CTF]
+    /// Get conditional keysets through the legacy raw-listing contract [NUT-CTF].
     #[cfg(feature = "conditional-tokens")]
     #[instrument(skip(self), fields(mint_url = %self.mint_url))]
     async fn get_conditional_keysets(
@@ -688,23 +693,71 @@ where
         active: Option<bool>,
     ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
         let mut url = self.mint_url.join_paths(&["v1", "conditional_keysets"])?;
-        let mut query_parts = Vec::new();
-        if let Some(since_ts) = since {
-            query_parts.push(format!("since={}", since_ts));
-        }
-        if let Some(limit_val) = limit {
-            query_parts.push(format!("limit={}", limit_val));
-        }
-        if let Some(active_val) = active {
-            query_parts.push(format!("active={}", active_val));
-        }
-        if !query_parts.is_empty() {
-            url.set_query(Some(&query_parts.join("&")));
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(since) = since {
+                query.append_pair("since", &since.to_string());
+            }
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(active) = active {
+                query.append_pair("active", &active.to_string());
+            }
         }
         let auth_token = self
             .get_auth_token(Method::Get, RoutePath::ConditionalKeysets)
             .await?;
         self.transport.http_get(url, auth_token).await
+    }
+
+    /// Get one capability-gated authenticated catalogue page [NUT-CTF].
+    #[cfg(feature = "conditional-tokens")]
+    #[instrument(skip(self), fields(mint_url = %self.mint_url))]
+    async fn get_conditional_keysets_page(
+        &self,
+        request: crate::nuts::nut_ctf::GetConditionalKeysetsRequest,
+    ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
+        validate_conditional_keyset_catalogue_request(
+            &request,
+            MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+        )?;
+        let mut url = self.mint_url.join_paths(&["v1", "conditional_keysets"])?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(version) = request.catalogue_version {
+                query.append_pair("catalogue", &version.to_string());
+            }
+            if let Some(since) = request.since {
+                query.append_pair("since", &since.to_string());
+            }
+            if let Some(limit) = request.limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(active) = request.active {
+                query.append_pair("active", &active.to_string());
+            }
+            if let Some(cursor) = request.cursor.as_deref() {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        let auth_token = self
+            .get_auth_token(Method::Get, RoutePath::ConditionalKeysets)
+            .await?;
+        let mut response: crate::nuts::nut_ctf::ConditionalKeysetsResponse = self
+            .transport
+            .http_get_with_response_limit(
+                url,
+                auth_token,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES,
+            )
+            .await?;
+        validate_conditional_keyset_catalogue_response(
+            &request,
+            &mut response,
+            MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+        )?;
+        Ok(response)
     }
 
     /// CTF convert [NUT-CTF-split-merge]
@@ -835,6 +888,21 @@ mod tests {
     use super::*;
     use crate::nuts::nut04::MintQuoteCustomRequest;
 
+    #[cfg(feature = "conditional-tokens")]
+    fn catalogue_keyset(id: &str) -> crate::nuts::nut_ctf::ConditionalKeySetInfo {
+        crate::nuts::nut_ctf::ConditionalKeySetInfo {
+            id: Id::from_str(id).expect("keyset id should parse"),
+            unit: "sat".to_string(),
+            active: false,
+            input_fee_ppk: Some(1),
+            final_expiry: Some(2_000),
+            condition_id: "11".repeat(32),
+            outcome_collection: "YES".to_string(),
+            outcome_collection_id: "22".repeat(32),
+            registered_at: 1_000,
+        }
+    }
+
     /// A mock transport that captures the serialized POST payload and returns
     /// a canned JSON response. Follows the same canned-response pattern as
     /// `MockMintConnector` in `wallet/test_utils.rs`.
@@ -844,6 +912,13 @@ mod tests {
         captured_payload: Arc<Mutex<Option<serde_json::Value>>>,
         /// Canned JSON string returned by `http_post`.
         post_response: Arc<Mutex<Option<String>>>,
+        /// Last GET URL, including its encoded query.
+        captured_get_url: Arc<Mutex<Option<Url>>>,
+        /// Canned JSON string returned by `http_get`.
+        get_response: Arc<Mutex<Option<String>>>,
+        /// Hard response limit requested by the strict catalogue path.
+        #[cfg(feature = "conditional-tokens")]
+        captured_get_limit: Arc<Mutex<Option<usize>>>,
     }
 
     impl fmt::Debug for MockTransport {
@@ -869,11 +944,32 @@ mod tests {
             Ok(())
         }
 
-        async fn http_get<R>(&self, _url: Url, _auth: Option<AuthToken>) -> Result<R, Error>
+        async fn http_get<R>(&self, url: Url, _auth: Option<AuthToken>) -> Result<R, Error>
         where
             R: DeserializeOwned,
         {
-            unimplemented!()
+            *self.captured_get_url.lock().expect("lock") = Some(url);
+            let json = self
+                .get_response
+                .lock()
+                .expect("lock")
+                .clone()
+                .expect("no mock GET response set");
+            serde_json::from_str(&json).map_err(|e| Error::Custom(e.to_string()))
+        }
+
+        #[cfg(feature = "conditional-tokens")]
+        async fn http_get_with_response_limit<R>(
+            &self,
+            url: Url,
+            auth: Option<AuthToken>,
+            max_bytes: usize,
+        ) -> Result<R, Error>
+        where
+            R: DeserializeOwned,
+        {
+            *self.captured_get_limit.lock().expect("lock") = Some(max_bytes);
+            self.http_get(url, auth).await
         }
 
         async fn http_post<P, R>(
@@ -925,6 +1021,7 @@ mod tests {
         let transport = MockTransport {
             captured_payload: Arc::new(Mutex::new(None)),
             post_response: Arc::new(Mutex::new(Some(canned_json))),
+            ..Default::default()
         };
         let captured = transport.captured_payload.clone();
 
@@ -972,5 +1069,323 @@ mod tests {
         let parsed = parsed.expect("already checked");
         assert_eq!(parsed.amount, cdk_common::Amount::from(1000));
         assert_eq!(parsed.unit, cdk_common::CurrencyUnit::Sat);
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn conditional_keyset_cursor_is_percent_encoded_in_get_query() {
+        let response = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: None,
+            complete: true,
+        };
+        let transport = MockTransport {
+            get_response: Arc::new(Mutex::new(Some(
+                serde_json::to_string(&response).expect("response should serialize"),
+            ))),
+            ..Default::default()
+        };
+        let captured = transport.captured_get_url.clone();
+        let captured_limit = transport.captured_get_limit.clone();
+        let client = HttpClient::with_transport(
+            MintUrl::from_str("https://mint.example.com").unwrap(),
+            transport,
+            None,
+        );
+
+        client
+            .get_conditional_keysets_page(crate::nuts::nut_ctf::GetConditionalKeysetsRequest {
+                catalogue_version: Some(1),
+                cursor: Some("a+b/c?= &".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("request should succeed");
+
+        let url = captured.lock().unwrap().clone().expect("URL was captured");
+        assert_eq!(
+            *captured_limit.lock().expect("limit lock"),
+            Some(MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES)
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "cursor")
+                .map(|(_, value)| value.into_owned()),
+            Some("a+b/c?= &".to_string())
+        );
+        let encoded = url.as_str();
+        assert!(encoded.contains("cursor=a%2Bb%2Fc%3F%3D+%26"), "{encoded}");
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn conditional_keyset_catalogue_no_progress_is_typed() {
+        let request = crate::nuts::nut_ctf::GetConditionalKeysetsRequest {
+            catalogue_version: Some(1),
+            cursor: Some("same".to_string()),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let mut response = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: Some("same".to_string()),
+            complete: false,
+        };
+
+        assert!(matches!(
+            validate_conditional_keyset_catalogue_response(
+                &request,
+                &mut response,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+            ),
+            Err(Error::ConditionalKeysetCatalogueNoProgress)
+        ));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn conditional_keyset_catalogue_accepts_empty_page_with_advanced_cursor() {
+        let request = crate::nuts::nut_ctf::GetConditionalKeysetsRequest {
+            catalogue_version: Some(1),
+            cursor: Some("before".to_string()),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let mut response = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: Some("after".to_string()),
+            complete: false,
+        };
+
+        assert!(validate_conditional_keyset_catalogue_response(
+            &request,
+            &mut response,
+            MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+        )
+        .is_ok());
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn conditional_keyset_catalogue_deduplicates_only_identical_metadata() {
+        let request = crate::nuts::nut_ctf::GetConditionalKeysetsRequest {
+            catalogue_version: Some(1),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let keyset = catalogue_keyset("00916bbf7ef91a36");
+        let mut identical = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: vec![keyset.clone(), keyset.clone()],
+            next_cursor: None,
+            complete: true,
+        };
+        assert!(matches!(
+            validate_conditional_keyset_catalogue_response(
+                &request,
+                &mut identical,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+            ),
+            Err(Error::InvalidConditionalKeysetCatalogueResponse(_))
+        ));
+
+        let request = crate::nuts::nut_ctf::GetConditionalKeysetsRequest {
+            catalogue_version: Some(1),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let mut identical = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: vec![keyset.clone(), keyset.clone()],
+            next_cursor: None,
+            complete: true,
+        };
+        assert!(validate_conditional_keyset_catalogue_response(
+            &request,
+            &mut identical,
+            MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+        )
+        .is_ok());
+        assert_eq!(identical.keysets, vec![keyset.clone()]);
+
+        let mut variants = Vec::new();
+        let mut changed = keyset.clone();
+        changed.unit = "usd".to_string();
+        variants.push(changed);
+        let mut changed = keyset.clone();
+        changed.active = true;
+        variants.push(changed);
+        let mut changed = keyset.clone();
+        changed.input_fee_ppk = Some(2);
+        variants.push(changed);
+        let mut changed = keyset.clone();
+        changed.final_expiry = Some(2_001);
+        variants.push(changed);
+        let mut changed = keyset.clone();
+        changed.condition_id = "33".repeat(32);
+        variants.push(changed);
+        let mut changed = keyset.clone();
+        changed.outcome_collection = "NO".to_string();
+        variants.push(changed);
+        let mut changed = keyset.clone();
+        changed.outcome_collection_id = "44".repeat(32);
+        variants.push(changed);
+        let mut changed = keyset.clone();
+        changed.registered_at = 1_001;
+        variants.push(changed);
+
+        for conflicting in variants {
+            let mut response = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+                keysets: vec![keyset.clone(), conflicting],
+                next_cursor: None,
+                complete: true,
+            };
+            assert!(matches!(
+                validate_conditional_keyset_catalogue_response(
+                    &request,
+                    &mut response,
+                    MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+                ),
+                Err(Error::InvalidConditionalKeysetCatalogueResponse(_))
+            ));
+        }
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn conditional_keyset_catalogue_rejects_over_limit_and_invalid_completion_shapes() {
+        let request = crate::nuts::nut_ctf::GetConditionalKeysetsRequest {
+            catalogue_version: Some(1),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let mut over_limit = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: vec![
+                catalogue_keyset("00916bbf7ef91a36"),
+                catalogue_keyset("009a1f293253e41e"),
+            ],
+            next_cursor: None,
+            complete: true,
+        };
+        assert!(matches!(
+            validate_conditional_keyset_catalogue_response(
+                &request,
+                &mut over_limit,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+            ),
+            Err(Error::InvalidConditionalKeysetCatalogueResponse(_))
+        ));
+
+        let mut complete_with_cursor = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: Some("unexpected".to_string()),
+            complete: true,
+        };
+        assert!(matches!(
+            validate_conditional_keyset_catalogue_response(
+                &request,
+                &mut complete_with_cursor,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+            ),
+            Err(Error::InvalidConditionalKeysetCatalogueResponse(_))
+        ));
+
+        let mut incomplete_without_cursor = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: None,
+            complete: false,
+        };
+        assert!(matches!(
+            validate_conditional_keyset_catalogue_response(
+                &request,
+                &mut incomplete_without_cursor,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+            ),
+            Err(Error::ConditionalKeysetCatalogueNoProgress)
+        ));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn conditional_keyset_catalogue_rejects_noncanonical_and_oversize_fields() {
+        let request = crate::nuts::nut_ctf::GetConditionalKeysetsRequest {
+            catalogue_version: Some(1),
+            limit: Some(1),
+            ..Default::default()
+        };
+
+        let mut uppercase = catalogue_keyset("00916bbf7ef91a36");
+        uppercase.condition_id = "AB".repeat(32);
+        let mut response = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: vec![uppercase],
+            next_cursor: None,
+            complete: true,
+        };
+        assert!(matches!(
+            validate_conditional_keyset_catalogue_response(
+                &request,
+                &mut response,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+            ),
+            Err(Error::InvalidConditionalKeysetCatalogueResponse(_))
+        ));
+
+        let mut uppercase = catalogue_keyset("00916bbf7ef91a36");
+        uppercase.outcome_collection_id = "CD".repeat(32);
+        let mut response = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: vec![uppercase],
+            next_cursor: None,
+            complete: true,
+        };
+        assert!(matches!(
+            validate_conditional_keyset_catalogue_response(
+                &request,
+                &mut response,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+            ),
+            Err(Error::InvalidConditionalKeysetCatalogueResponse(_))
+        ));
+
+        let mut oversize = catalogue_keyset("00916bbf7ef91a36");
+        oversize.outcome_collection = "x".repeat(16_384 + 1);
+        let mut response = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: vec![oversize],
+            next_cursor: None,
+            complete: true,
+        };
+        assert!(matches!(
+            validate_conditional_keyset_catalogue_response(
+                &request,
+                &mut response,
+                MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+            ),
+            Err(Error::InvalidConditionalKeysetCatalogueResponse(_))
+        ));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn conditional_keyset_legacy_empty_response_is_not_strictly_validated() {
+        let response = crate::nuts::nut_ctf::ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: None,
+            complete: false,
+        };
+        let transport = MockTransport {
+            get_response: Arc::new(Mutex::new(Some(
+                serde_json::to_string(&response).expect("response should serialize"),
+            ))),
+            ..Default::default()
+        };
+        let client = HttpClient::with_transport(
+            MintUrl::from_str("https://mint.example.com").unwrap(),
+            transport,
+            None,
+        );
+
+        let response = client
+            .get_conditional_keysets(None, Some(100), None)
+            .await
+            .expect("legacy empty listing must remain valid without catalogue capability");
+        assert!(!response.complete);
+        assert!(response.next_cursor.is_none());
     }
 }

@@ -40,12 +40,23 @@ use cdk_prometheus::METRICS;
 use migrations::MIGRATIONS;
 
 /// Mint SQL Database
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SQLMintDatabase<RM>
 where
     RM: DatabasePool + 'static,
 {
     pub(crate) pool: Arc<Pool<RM>>,
+}
+
+impl<RM> Clone for SQLMintDatabase<RM>
+where
+    RM: DatabasePool + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            pool: Arc::clone(&self.pool),
+        }
+    }
 }
 
 /// SQL Transaction Writer

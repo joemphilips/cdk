@@ -1,9 +1,11 @@
 //! ConditionsDatabase tests (NUT-CTF)
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use bitcoin::bip32::DerivationPath;
 use cashu::{CurrencyUnit, Id};
+use zeroize::Zeroizing;
 
 use crate::database::mint::{ConditionsDatabase, Database, Error, KeysDatabase};
 use crate::mint::{MintKeySetInfo, StoredCondition};
@@ -198,6 +200,51 @@ where
     assert_eq!(keysets.get("NO"), Some(&ks_no));
 }
 
+/// Test full conditional keyset metadata lookup for signatory reconciliation.
+pub async fn get_conditional_mint_keyset_infos_for_condition<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let condition = test_condition(&"f1".repeat(32));
+    let other_condition = test_condition(&"f2".repeat(32));
+    db.add_condition(condition.clone()).await.unwrap();
+    db.add_condition(other_condition.clone()).await.unwrap();
+
+    let yes = test_conditional_keyset_info(
+        Id::from_str("00916bbf7ef91a36").unwrap(),
+        &condition.condition_id,
+        "YES",
+        &"d1".repeat(32),
+    );
+    let unrelated = test_conditional_keyset_info(
+        Id::from_str("0095000000000000").unwrap(),
+        &other_condition.condition_id,
+        "OTHER",
+        &"d2".repeat(32),
+    );
+    let no = test_conditional_keyset_info(
+        Id::from_str("009a1f293253e41e").unwrap(),
+        &condition.condition_id,
+        "NO",
+        &"d3".repeat(32),
+    );
+    for (info, created_at) in [
+        (yes.clone(), 1_000_000),
+        (unrelated, 1_000_001),
+        (no.clone(), 1_000_002),
+    ] {
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info, created_at)
+            .await
+            .unwrap();
+    }
+
+    let keysets = db
+        .get_conditional_mint_keyset_infos_for_condition(&condition.condition_id)
+        .await
+        .unwrap();
+    assert_eq!(keysets, vec![yes, no]);
+}
+
 /// Test get_condition_for_keyset lookup by keyset_id
 pub async fn get_condition_for_keyset<DB>(db: DB)
 where
@@ -324,5 +371,278 @@ where
     assert!(
         all[0].created_at <= all[1].created_at && all[1].created_at <= all[2].created_at,
         "conditions should be sorted ascending by created_at"
+    );
+}
+
+/// Stable catalogue snapshots exclude registrations committed after page one,
+/// even when every row has the same wall-clock registration timestamp.
+pub async fn conditional_keyset_catalogue_stable_snapshot<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let cond = test_condition(&"e3".repeat(32));
+    db.add_condition(cond.clone()).await.unwrap();
+    let first_id = Id::from_str("00916bbf7ef91a36").unwrap();
+    let second_id = Id::from_str("009a1f293253e41e").unwrap();
+    <DB as KeysDatabase>::add_conditional_keyset(
+        &db,
+        test_conditional_keyset_info(first_id, &cond.condition_id, "A", &"11".repeat(32)),
+        1_000,
+    )
+    .await
+    .unwrap();
+    <DB as KeysDatabase>::add_conditional_keyset(
+        &db,
+        test_conditional_keyset_info(second_id, &cond.condition_id, "B", &"12".repeat(32)),
+        1_000,
+    )
+    .await
+    .unwrap();
+
+    let first = db
+        .get_conditional_keyset_catalogue_page(None, 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.keysets.len(), 1);
+    assert!(first.has_more);
+    let after = first.keysets[0].sequence;
+
+    <DB as KeysDatabase>::add_conditional_keyset(
+        &db,
+        test_conditional_keyset_info(
+            Id::from_str("0095000000000000").unwrap(),
+            &cond.condition_id,
+            "LATE",
+            &"13".repeat(32),
+        ),
+        1_000,
+    )
+    .await
+    .unwrap();
+
+    let second = db
+        .get_conditional_keyset_catalogue_page(Some(first.snapshot), after, 1)
+        .await
+        .unwrap();
+    assert_eq!(second.keysets.len(), 1);
+    assert_eq!(second.keysets[0].keyset.id, second_id);
+    assert!(!second.has_more);
+}
+
+/// Exact retries preserve the existing sequence; timestamp or metadata changes conflict.
+pub async fn conditional_keyset_catalogue_is_append_only<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let cond = test_condition(&"e4".repeat(32));
+    db.add_condition(cond.clone()).await.unwrap();
+    let id = Id::from_str("00916bbf7ef91a36").unwrap();
+    let info = test_conditional_keyset_info(id, &cond.condition_id, "YES", &"21".repeat(32));
+    <DB as KeysDatabase>::add_conditional_keyset(&db, info.clone(), 1_000)
+        .await
+        .unwrap();
+    <DB as KeysDatabase>::add_conditional_keyset(&db, info.clone(), 1_000)
+        .await
+        .unwrap();
+
+    assert!(
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info.clone(), 2_000)
+            .await
+            .is_err(),
+        "a retry with a changed registration timestamp must conflict"
+    );
+
+    let page = db
+        .get_conditional_keyset_catalogue_page(None, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.snapshot, 1);
+    assert_eq!(page.keysets.len(), 1);
+    assert_eq!(page.keysets[0].keyset.registered_at, 1_000);
+
+    let mut conflicting = info;
+    conflicting.input_fee_ppk = 1;
+    assert!(
+        <DB as KeysDatabase>::add_conditional_keyset(&db, conflicting, 1_000)
+            .await
+            .is_err()
+    );
+    let page = db
+        .get_conditional_keyset_catalogue_page(None, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.snapshot, 1);
+    assert_eq!(page.keysets[0].keyset.input_fee_ppk, Some(0));
+}
+
+/// One maximum-sized registration receives one contiguous sequence block.
+pub async fn conditional_keyset_catalogue_allocates_registration_batch<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + Sync,
+{
+    const BATCH_SIZE: usize = 256;
+    let cond = test_condition(&"e7".repeat(32));
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_condition(cond.clone()).await.unwrap();
+    let batch = (0..BATCH_SIZE)
+        .map(|index| {
+            let id = Id::from_str(&format!("00{:014x}", index + 1)).unwrap();
+            (
+                test_conditional_keyset_info(
+                    id,
+                    &cond.condition_id,
+                    &format!("OUTCOME-{index}"),
+                    &format!("{:064x}", index + 1),
+                ),
+                1_000,
+            )
+        })
+        .collect();
+    tx.add_conditional_keysets(batch).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let page = db
+        .get_conditional_keyset_catalogue_page(None, 0, BATCH_SIZE as u64)
+        .await
+        .unwrap();
+    assert_eq!(page.snapshot, BATCH_SIZE as u64);
+    assert_eq!(page.keysets.len(), BATCH_SIZE);
+    assert!(!page.has_more);
+    assert_eq!(
+        page.keysets
+            .iter()
+            .map(|keyset| keyset.sequence)
+            .collect::<Vec<_>>(),
+        (1..=BATCH_SIZE as u64).collect::<Vec<_>>()
+    );
+}
+
+/// Unsigned catalogue values must fail before they can wrap into signed SQL storage.
+pub async fn conditional_keyset_catalogue_rejects_unsigned_sql_overflow<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let mut overflowing_condition = test_condition(&"e8".repeat(32));
+    overflowing_condition.created_at = u64::MAX;
+    assert!(
+        db.add_condition(overflowing_condition).await.is_err(),
+        "condition created_at must not wrap into a negative SQL value"
+    );
+
+    let cond = test_condition(&"e9".repeat(32));
+    db.add_condition(cond.clone()).await.unwrap();
+    let id = Id::from_str("00916bbf7ef91a36").unwrap();
+    let info = test_conditional_keyset_info(id, &cond.condition_id, "YES", &"41".repeat(32));
+
+    assert!(
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info.clone(), u64::MAX)
+            .await
+            .is_err(),
+        "conditional keyset created_at must not wrap into a negative SQL value"
+    );
+    <DB as KeysDatabase>::add_conditional_keyset(&db, info, 1_000)
+        .await
+        .unwrap();
+
+    assert!(
+        db.get_all_conditional_keyset_infos(Some(u64::MAX), Some(1), None)
+            .await
+            .is_err(),
+        "legacy since must reject values outside signed SQL range"
+    );
+    assert!(
+        db.get_all_conditional_keyset_infos(None, Some(u64::MAX), None)
+            .await
+            .is_err(),
+        "legacy limit must reject values outside signed SQL range"
+    );
+    assert!(
+        db.get_conditional_keyset_catalogue_page(None, 0, u64::MAX)
+            .await
+            .is_err(),
+        "catalogue limit must reject values outside signed SQL range"
+    );
+    assert!(
+        db.get_conditional_keyset_catalogue_page(Some(u64::MAX), 0, 1)
+            .await
+            .is_err(),
+        "catalogue snapshot must reject values outside signed SQL range"
+    );
+    assert!(
+        db.get_conditional_keyset_catalogue_page(Some(1), u64::MAX, 1)
+            .await
+            .is_err(),
+        "catalogue after must reject values outside signed SQL range"
+    );
+}
+
+/// First-page snapshot acquisition remains read-only while an unrelated write is open.
+pub async fn conditional_keyset_catalogue_first_page_does_not_block_writer<DB>(db: DB)
+where
+    DB: Database<Error>
+        + ConditionsDatabase<Err = Error>
+        + KeysDatabase<Err = Error>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let cond = test_condition(&"e5".repeat(32));
+    let id = Id::from_str("00916bbf7ef91a36").unwrap();
+    db.add_condition(cond.clone()).await.unwrap();
+    <DB as KeysDatabase>::add_conditional_keyset(
+        &db,
+        test_conditional_keyset_info(id, &cond.condition_id, "YES", &"31".repeat(32)),
+        1_000,
+    )
+    .await
+    .unwrap();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_condition(test_condition(&"e6".repeat(32)))
+        .await
+        .unwrap();
+
+    let reader = db.clone();
+    let page = tokio::time::timeout(Duration::from_millis(250), async move {
+        reader
+            .get_conditional_keyset_catalogue_page(None, 0, 10)
+            .await
+    })
+    .await
+    .expect("read-only first-page acquisition must not wait for an unrelated writer")
+    .unwrap();
+    assert_eq!(page.snapshot, 1);
+    assert_eq!(page.keysets.len(), 1);
+    assert_eq!(page.keysets[0].keyset.id, id);
+    tx.rollback().await.unwrap();
+}
+
+/// Concurrent processes converge on one persisted cursor authority.
+pub async fn conditional_keyset_cursor_authority_is_atomic<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + Clone + Send + Sync + 'static,
+{
+    let first_db = db.clone();
+    let second_db = db.clone();
+    let first = tokio::spawn(async move {
+        first_db
+            .get_or_create_conditional_keyset_cursor_key(Zeroizing::new([0x11; 32]))
+            .await
+    });
+    let second = tokio::spawn(async move {
+        second_db
+            .get_or_create_conditional_keyset_cursor_key(Zeroizing::new([0x22; 32]))
+            .await
+    });
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(first, second);
+    assert!(*first == [0x11; 32] || *first == [0x22; 32]);
+    assert_eq!(
+        db.get_or_create_conditional_keyset_cursor_key(Zeroizing::new([0x33; 32]))
+            .await
+            .unwrap(),
+        first
     );
 }

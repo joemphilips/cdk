@@ -1783,6 +1783,29 @@ async fn test_direct_connector_custom_melt_enum_roundtrip() {
     assert_eq!(quote_status.extra, quote_response.extra);
 }
 
+#[cfg(feature = "conditional-tokens")]
+#[tokio::test]
+async fn test_direct_connector_calls_strict_conditional_keyset_catalogue() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let connector = DirectMintConnection::new(mint);
+
+    let page = connector
+        .get_conditional_keysets_page(cdk::nuts::nut_ctf::GetConditionalKeysetsRequest {
+            catalogue_version: Some(1),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .expect("direct connector should execute the real strict catalogue call");
+
+    assert!(page.complete);
+    assert!(page.keysets.is_empty());
+    assert!(page.next_cursor.is_none());
+}
+
 #[tokio::test]
 async fn test_batch_mint_unknown_quote() {
     setup_tracing();

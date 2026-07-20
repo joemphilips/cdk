@@ -1,8 +1,21 @@
 use anyhow::Result;
+#[cfg(feature = "conditional-tokens")]
+use std::convert::Infallible;
+#[cfg(feature = "conditional-tokens")]
+use std::io::Write;
+#[cfg(feature = "conditional-tokens")]
+use std::pin::Pin;
+#[cfg(feature = "conditional-tokens")]
+use std::task::{Context, Poll};
+
+#[cfg(feature = "conditional-tokens")]
+use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
 #[cfg(feature = "conditional-tokens")]
 use axum::extract::Query;
 use axum::extract::{Json, Path, State};
+#[cfg(feature = "conditional-tokens")]
+use axum::http::header;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use cdk::error::ErrorResponse;
@@ -12,12 +25,155 @@ use cdk::nuts::{
     RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
 use cdk::util::unix_time;
+#[cfg(feature = "conditional-tokens")]
+use futures::Stream;
 use paste::paste;
+#[cfg(feature = "conditional-tokens")]
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::instrument;
 
 use crate::auth::AuthHeader;
 use crate::ws::main_websocket;
 use crate::MintState;
+
+#[cfg(feature = "conditional-tokens")]
+struct BoundedCatalogueWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+#[cfg(feature = "conditional-tokens")]
+impl Write for BoundedCatalogueWriter {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(input.len())
+            .ok_or_else(|| std::io::Error::other("catalogue response length overflowed"))?;
+        if next_len > self.limit {
+            return Err(std::io::Error::other(
+                "catalogue response exceeded its hard byte cap",
+            ));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+struct ConditionalKeysetCatalogueBody {
+    bytes: Option<Bytes>,
+    _count_permit: OwnedSemaphorePermit,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
+#[cfg(feature = "conditional-tokens")]
+impl Stream for ConditionalKeysetCatalogueBody {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.bytes.take().map(Ok))
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalKeysetCatalogueResponseError {
+    Internal,
+    Saturated,
+}
+
+#[cfg(feature = "conditional-tokens")]
+impl ConditionalKeysetCatalogueResponseError {
+    fn status(self) -> StatusCode {
+        match self {
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Saturated => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+impl IntoResponse for ConditionalKeysetCatalogueResponseError {
+    fn into_response(self) -> Response {
+        self.status().into_response()
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn serialize_conditional_keyset_catalogue_response(
+    response: &cdk::nuts::nut_ctf::ConditionalKeysetsResponse,
+    limit: usize,
+) -> Result<Vec<u8>, ConditionalKeysetCatalogueResponseError> {
+    let mut writer = BoundedCatalogueWriter {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut writer, response).map_err(|error| {
+        tracing::error!("Could not serialize bounded conditional-keyset catalogue: {error}");
+        ConditionalKeysetCatalogueResponseError::Internal
+    })?;
+    Ok(writer.bytes)
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn conditional_keyset_catalogue_response(
+    response: &cdk::nuts::nut_ctf::ConditionalKeysetsResponse,
+    count_permit: OwnedSemaphorePermit,
+    byte_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    response_limit: usize,
+) -> Result<Response, ConditionalKeysetCatalogueResponseError> {
+    conditional_keyset_catalogue_response_with_serializer(
+        response,
+        count_permit,
+        byte_slots,
+        response_limit,
+        serialize_conditional_keyset_catalogue_response,
+    )
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn conditional_keyset_catalogue_response_with_serializer<F>(
+    response: &cdk::nuts::nut_ctf::ConditionalKeysetsResponse,
+    count_permit: OwnedSemaphorePermit,
+    byte_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    response_limit: usize,
+    serializer: F,
+) -> Result<Response, ConditionalKeysetCatalogueResponseError>
+where
+    F: FnOnce(
+        &cdk::nuts::nut_ctf::ConditionalKeysetsResponse,
+        usize,
+    ) -> Result<Vec<u8>, ConditionalKeysetCatalogueResponseError>,
+{
+    // Reserve the entire per-response budget before allocating a serialized
+    // body. The global semaphore is sized for exactly two maximum responses,
+    // so a third request fails before entering serialization. Retaining the
+    // fixed reservation avoids unsafe permit splitting and still bounds both
+    // allocation and response-body lifetime.
+    let byte_count = u32::try_from(response_limit)
+        .map_err(|_| ConditionalKeysetCatalogueResponseError::Internal)?;
+    let byte_permit = byte_slots
+        .try_acquire_many_owned(byte_count)
+        .map_err(|_| ConditionalKeysetCatalogueResponseError::Saturated)?;
+    let bytes = serializer(response, response_limit)?;
+    let content_length = bytes.len();
+    let body = Body::from_stream(ConditionalKeysetCatalogueBody {
+        bytes: Some(Bytes::from(bytes)),
+        _count_permit: count_permit,
+        _byte_permit: byte_permit,
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, content_length)
+        .body(body)
+        .map_err(|_| ConditionalKeysetCatalogueResponseError::Internal)
+}
 
 /// Macro to add cache to endpoint
 #[macro_export]
@@ -1285,7 +1441,7 @@ pub(crate) async fn get_conditional_keysets(
     #[cfg(feature = "auth")] auth: AuthHeader,
     State(state): State<MintState>,
     Query(params): Query<cdk::nuts::nut_ctf::GetConditionalKeysetsRequest>,
-) -> Result<Json<cdk::nuts::nut_ctf::ConditionalKeysetsResponse>, Response> {
+) -> Result<Response, Response> {
     #[cfg(feature = "auth")]
     {
         state
@@ -1298,15 +1454,40 @@ pub(crate) async fn get_conditional_keysets(
             .map_err(into_response)?;
     }
 
-    let response = state
-        .mint
-        .get_conditional_keysets(params.since, params.limit, params.active)
-        .await
-        .map_err(|err| {
-            tracing::error!("Could not get conditional keysets: {}", err);
-            into_response(err)
-        })?;
-    Ok(Json(response))
+    let strict_catalogue = params.catalogue_version.is_some() || params.cursor.is_some();
+    let catalogue_permit = state
+        .conditional_keyset_catalogue_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    let response = if strict_catalogue {
+        state
+            .mint
+            .get_conditional_keysets_catalogue_page(params)
+            .await
+    } else {
+        state
+            .mint
+            .get_conditional_keysets(params.since, params.limit, params.active)
+            .await
+    }
+    .map_err(|err| {
+        match &err {
+            cdk::Error::InvalidConditionalKeysetCatalogueCursor
+            | cdk::Error::ConditionalKeysetCataloguePageLimitExceeded { .. } => {
+                tracing::debug!("Rejected conditional keyset catalogue request: {}", err);
+            }
+            _ => tracing::error!("Could not get conditional keysets: {}", err),
+        }
+        into_response(err)
+    })?;
+    conditional_keyset_catalogue_response(
+        &response,
+        catalogue_permit,
+        state.conditional_keyset_catalogue_bytes,
+        cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES,
+    )
+    .map_err(IntoResponse::into_response)
 }
 
 /// POST /v1/ctf/convert - Convert conditional/collateral positions
@@ -1369,4 +1550,507 @@ pub(crate) async fn post_redeem_outcome(
             into_response(err)
         })?;
     Ok(Json(response))
+}
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod conditional_keyset_catalogue_tests {
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use axum::body::{to_bytes, Body};
+    use axum::extract::{Query, State};
+    use axum::http::{Request, StatusCode};
+    use cdk::error::{ErrorCode, ErrorResponse};
+    use cdk::mint::{MintBuilder, MintKeySetInfo, UnitConfig};
+    use cdk::nuts::nut_ctf::{
+        ConditionalKeysetsResponse, GetConditionalKeysetsRequest, NutCtfSettings,
+    };
+    use cdk::nuts::{CurrencyUnit, Id};
+    use cdk_common::mint::StoredCondition;
+    use tower::ServiceExt;
+
+    use super::{
+        conditional_keyset_catalogue_response,
+        conditional_keyset_catalogue_response_with_serializer, get_conditional_keysets,
+        serialize_conditional_keyset_catalogue_response,
+    };
+    use crate::{cache::HttpCache, create_mint_router, MintState};
+
+    async fn test_mint() -> Arc<cdk::Mint> {
+        let db = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("database should open"),
+        );
+        let mut builder = MintBuilder::new(db.clone());
+        builder
+            .configure_unit(
+                CurrencyUnit::Sat,
+                UnitConfig {
+                    amounts: vec![1, 2, 4, 8],
+                    input_fee_ppk: 0,
+                },
+            )
+            .expect("unit should configure");
+        let mint = builder
+            .build_with_seed(db, &[0x63; 64])
+            .await
+            .expect("mint should build");
+        Arc::new(mint)
+    }
+
+    async fn test_state() -> MintState {
+        MintState {
+            mint: test_mint().await,
+            cache: Arc::new(HttpCache::default()),
+            conditional_keyset_catalogue_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+            conditional_keyset_catalogue_bytes: Arc::new(tokio::sync::Semaphore::new(
+                cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES,
+            )),
+        }
+    }
+
+    async fn insert_catalogue_fixture(mint: &cdk::Mint) {
+        let condition_id = "ab".repeat(32);
+        let mut tx = mint
+            .localstore()
+            .begin_transaction()
+            .await
+            .expect("transaction should start");
+        tx.add_condition(StoredCondition {
+            condition_id: condition_id.clone(),
+            threshold: 1,
+            tags_json: "[]".to_string(),
+            announcements_json: "[]".to_string(),
+            collateral: Some(CurrencyUnit::Sat),
+            attestation_status: "pending".to_string(),
+            winning_outcome: None,
+            attested_at: None,
+            created_at: 1_000,
+            condition_type: "enum".to_string(),
+            lo_bound: None,
+            hi_bound: None,
+            precision: None,
+        })
+        .await
+        .expect("condition should insert");
+        let keysets = [
+            ("00916bbf7ef91a36", "YES", "01".repeat(32)),
+            ("009a1f293253e41e", "NO", "02".repeat(32)),
+        ]
+        .into_iter()
+        .map(|(id, outcome, outcome_id)| {
+            (
+                MintKeySetInfo {
+                    id: Id::from_str(id).expect("keyset id should parse"),
+                    unit: CurrencyUnit::Sat,
+                    active: false,
+                    valid_from: 0,
+                    derivation_path: "m/0'/0'/0'".parse().expect("derivation path should parse"),
+                    derivation_path_index: Some(0),
+                    amounts: vec![1, 2, 4, 8],
+                    input_fee_ppk: 0,
+                    final_expiry: None,
+                    issuer_version: None,
+                    condition_id: Some(condition_id.clone()),
+                    outcome_collection: Some(outcome.to_string()),
+                    outcome_collection_id: Some(outcome_id),
+                },
+                1_000,
+            )
+        })
+        .collect();
+        tx.add_conditional_keysets(keysets)
+            .await
+            .expect("catalogue batch should insert");
+        tx.commit().await.expect("transaction should commit");
+
+        let mut info = mint.mint_info().await.expect("mint info should load");
+        info.nuts.nut_ctf = Some(NutCtfSettings::default());
+        mint.set_mint_info(info)
+            .await
+            .expect("CTF mint info should persist");
+    }
+
+    #[tokio::test]
+    async fn forged_catalogue_cursor_returns_typed_cashu_http_error() {
+        let response = get_conditional_keysets(
+            State(test_state().await),
+            Query(GetConditionalKeysetsRequest {
+                cursor: Some("forged".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("forged cursor should fail");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("response body should read");
+        let error: ErrorResponse =
+            serde_json::from_slice(&body).expect("Cashu error response should decode");
+        assert_eq!(
+            error.code,
+            ErrorCode::InvalidConditionalKeysetCatalogueCursor
+        );
+        assert_eq!(error.code.to_code(), 13049);
+    }
+
+    #[tokio::test]
+    async fn router_serializes_legacy_and_authenticated_multi_page_boundaries() {
+        let mint = test_mint().await;
+        insert_catalogue_fixture(&mint).await;
+        let router = create_mint_router(mint, Vec::new())
+            .await
+            .expect("router should build");
+
+        let legacy = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?limit=1")
+                    .body(Body::empty())
+                    .expect("legacy request should build"),
+            )
+            .await
+            .expect("legacy route should respond");
+        assert_eq!(legacy.status(), StatusCode::OK);
+        let legacy: ConditionalKeysetsResponse = serde_json::from_slice(
+            &to_bytes(legacy.into_body(), 64 * 1024)
+                .await
+                .expect("legacy body should read"),
+        )
+        .expect("legacy response should deserialize");
+        assert_eq!(legacy.keysets.len(), 1);
+        assert!(!legacy.complete);
+        assert!(legacy.next_cursor.is_none());
+
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?catalogue=1&limit=1")
+                    .body(Body::empty())
+                    .expect("first request should build"),
+            )
+            .await
+            .expect("first route should respond");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: ConditionalKeysetsResponse = serde_json::from_slice(
+            &to_bytes(first.into_body(), 64 * 1024)
+                .await
+                .expect("first body should read"),
+        )
+        .expect("first response should deserialize");
+        assert_eq!(first.keysets.len(), 1);
+        assert!(!first.complete);
+        let cursor = first.next_cursor.expect("first page should continue");
+
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/conditional_keysets?catalogue=1&limit=1&cursor={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .expect("second request should build"),
+            )
+            .await
+            .expect("second route should respond");
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: ConditionalKeysetsResponse = serde_json::from_slice(
+            &to_bytes(second.into_body(), 64 * 1024)
+                .await
+                .expect("second body should read"),
+        )
+        .expect("second response should deserialize");
+        assert_eq!(second.keysets.len(), 1);
+        assert!(second.complete);
+        assert!(second.next_cursor.is_none());
+        assert_ne!(first.keysets[0].id, second.keysets[0].id);
+    }
+
+    #[tokio::test]
+    async fn all_catalogue_routes_fail_fast_when_concurrency_bound_is_saturated() {
+        let mut state = test_state().await;
+        state.conditional_keyset_catalogue_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = state
+            .conditional_keyset_catalogue_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test should hold the only catalogue permit");
+        let router = axum::Router::new()
+            .route(
+                "/v1/conditional_keysets",
+                axum::routing::get(get_conditional_keysets),
+            )
+            .with_state(state);
+
+        let saturated = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            router.clone().oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?catalogue=1&limit=1")
+                    .body(Body::empty())
+                    .expect("strict request should build"),
+            ),
+        )
+        .await
+        .expect("strict overload response must not queue")
+        .expect("strict overload route should respond");
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let legacy = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            router.clone().oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?limit=1")
+                    .body(Body::empty())
+                    .expect("legacy request should build"),
+            ),
+        )
+        .await
+        .expect("legacy overload response must not queue")
+        .expect("legacy overload route should respond");
+        assert_eq!(legacy.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(held);
+        let recovered = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?catalogue=1&limit=1")
+                    .body(Body::empty())
+                    .expect("strict recovery request should build"),
+            )
+            .await
+            .expect("strict route should recover when capacity returns");
+        assert_eq!(recovered.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn catalogue_count_admission_is_held_until_response_body_is_dropped() {
+        let mut state = test_state().await;
+        insert_catalogue_fixture(&state.mint).await;
+        state.conditional_keyset_catalogue_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let router = axum::Router::new()
+            .route(
+                "/v1/conditional_keysets",
+                axum::routing::get(get_conditional_keysets),
+            )
+            .with_state(state);
+
+        let held_body = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?catalogue=1&limit=1")
+                    .body(Body::empty())
+                    .expect("first request should build"),
+            )
+            .await
+            .expect("first route should respond");
+        assert_eq!(held_body.status(), StatusCode::OK);
+
+        let saturated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?catalogue=1&limit=1")
+                    .body(Body::empty())
+                    .expect("second request should build"),
+            )
+            .await
+            .expect("second route should respond");
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(held_body);
+        let recovered = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?catalogue=1&limit=1")
+                    .body(Body::empty())
+                    .expect("recovery request should build"),
+            )
+            .await
+            .expect("route should recover after body drop");
+        assert_eq!(recovered.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn worst_case_escaped_catalogue_field_fits_the_shared_hard_cap() {
+        let response = ConditionalKeysetsResponse {
+            keysets: vec![cdk::nuts::nut_ctf::ConditionalKeySetInfo {
+                id: Id::from_str("00916bbf7ef91a36").expect("keyset id should parse"),
+                unit: "sat".to_string(),
+                active: true,
+                input_fee_ppk: Some(u64::MAX),
+                final_expiry: Some(u64::MAX),
+                condition_id: "ab".repeat(32),
+                outcome_collection: "\u{0001}".repeat(
+                    cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_OUTCOME_COLLECTION_LENGTH,
+                ),
+                outcome_collection_id: "cd".repeat(32),
+                registered_at: u64::MAX,
+            }],
+            next_cursor: Some("x".repeat(
+                cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_CURSOR_LENGTH,
+            )),
+            complete: false,
+        };
+
+        let serialized = serialize_conditional_keyset_catalogue_response(
+            &response,
+            cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES,
+        )
+        .expect("one maximally escaped item should fit the page cap");
+        assert!(
+            serialized.len()
+                <= cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
+    fn catalogue_serializer_fails_closed_at_its_hard_cap() {
+        let response = ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: None,
+            complete: true,
+        };
+        let serialized = serde_json::to_vec(&response).expect("fixture should serialize");
+        let error = serialize_conditional_keyset_catalogue_response(
+            &response,
+            serialized.len().saturating_sub(1),
+        )
+        .expect_err("hard byte cap must stop serialization");
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn catalogue_weighted_admission_is_held_until_response_body_is_dropped() {
+        let response = ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: None,
+            complete: true,
+        };
+        let count_slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let response_limit =
+            cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES;
+        let byte_slots = Arc::new(tokio::sync::Semaphore::new(response_limit));
+
+        let held_body = conditional_keyset_catalogue_response(
+            &response,
+            count_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("count permit should acquire"),
+            byte_slots.clone(),
+            response_limit,
+        )
+        .expect("first response should acquire the byte budget");
+
+        let saturated = conditional_keyset_catalogue_response(
+            &response,
+            count_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("second count permit should acquire"),
+            byte_slots.clone(),
+            response_limit,
+        )
+        .expect_err("second response must not reuse held byte admission");
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(held_body);
+        conditional_keyset_catalogue_response(
+            &response,
+            count_slots
+                .acquire_owned()
+                .await
+                .expect("recovery count permit should acquire"),
+            byte_slots,
+            response_limit,
+        )
+        .expect("byte admission should recover after body drop");
+    }
+
+    #[tokio::test]
+    async fn third_catalogue_serialization_cannot_enter_beyond_global_budget() {
+        let response = ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: None,
+            complete: true,
+        };
+        let response_limit =
+            cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES;
+        let count_slots = Arc::new(tokio::sync::Semaphore::new(3));
+        let byte_slots = Arc::new(tokio::sync::Semaphore::new(response_limit * 2));
+        let serialization_count = Arc::new(AtomicUsize::new(0));
+
+        let build_response = || {
+            let serialization_count = serialization_count.clone();
+            conditional_keyset_catalogue_response_with_serializer(
+                &response,
+                count_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("count admission should remain available"),
+                byte_slots.clone(),
+                response_limit,
+                move |response, limit| {
+                    serialization_count.fetch_add(1, Ordering::SeqCst);
+                    serialize_conditional_keyset_catalogue_response(response, limit)
+                },
+            )
+        };
+
+        let first = build_response().expect("first response should reserve its byte budget");
+        let second = build_response().expect("second response should reserve its byte budget");
+        let third = build_response().expect_err("third response must fail before serialization");
+
+        assert_eq!(third.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(serialization_count.load(Ordering::SeqCst), 2);
+
+        drop(first);
+        build_response()
+            .expect("serialization should resume after a body releases its reservation");
+        assert_eq!(serialization_count.load(Ordering::SeqCst), 3);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn legacy_catalogue_applies_a_default_limit_and_rejects_oversized_limit() {
+        let mint = test_mint().await;
+        insert_catalogue_fixture(&mint).await;
+        let router = create_mint_router(mint, Vec::new())
+            .await
+            .expect("router should build");
+
+        let defaulted = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets")
+                    .body(Body::empty())
+                    .expect("legacy request should build"),
+            )
+            .await
+            .expect("legacy route should respond");
+        assert_eq!(defaulted.status(), StatusCode::OK);
+
+        let oversized = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/conditional_keysets?limit=101")
+                    .body(Body::empty())
+                    .expect("oversized legacy request should build"),
+            )
+            .await
+            .expect("legacy route should respond");
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+    }
 }

@@ -6,6 +6,7 @@ use arti_hyper::ArtiHttpConnector;
 use async_trait::async_trait;
 use cdk_common::AuthToken;
 use http::header::{self, HeaderName, HeaderValue};
+use hyper::body::HttpBody as _;
 use hyper::http::{Method, Request, Uri};
 use hyper::{Body, Client};
 use serde::de::DeserializeOwned;
@@ -19,6 +20,41 @@ use crate::wallet::mint_connector::transport::{ErrorResponse, Transport};
 
 /// Fixed-size pool size
 pub const DEFAULT_TOR_POOL_SIZE: usize = 5;
+
+fn validate_declared_response_length(
+    content_length: Option<u64>,
+    response_limit: Option<usize>,
+) -> Result<(), Error> {
+    if let Some(limit) = response_limit {
+        if content_length.is_some_and(|length| length > limit as u64) {
+            return Err(Error::InvalidConditionalKeysetCatalogueResponse(format!(
+                "conditional-keyset catalogue response exceeded {limit} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn append_bounded_response_chunk(
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    response_limit: Option<usize>,
+) -> Result<(), Error> {
+    let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+        Error::InvalidConditionalKeysetCatalogueResponse(
+            "conditional-keyset catalogue response length overflowed".to_string(),
+        )
+    })?;
+    if let Some(limit) = response_limit {
+        if next_len > limit {
+            return Err(Error::InvalidConditionalKeysetCatalogueResponse(format!(
+                "conditional-keyset catalogue response exceeded {limit} bytes"
+            )));
+        }
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
 
 /// Tor transport that maintains a pool of isolated TorClient handles
 #[derive(Clone)]
@@ -150,6 +186,7 @@ impl TorAsync {
         url: Url,
         auth: Option<AuthToken>,
         mut body: Option<Vec<u8>>,
+        response_limit: Option<usize>,
     ) -> Result<R, Error>
     where
         R: DeserializeOwned,
@@ -201,9 +238,19 @@ impl TorAsync {
             .map_err(|e| Error::HttpError(None, e.to_string()))?;
 
         let status = resp.status().as_u16();
-        let bytes = hyper::body::to_bytes(resp.into_body())
-            .await
-            .map_err(|e| Error::HttpError(None, e.to_string()))?;
+        validate_declared_response_length(
+            resp.headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok()),
+            response_limit,
+        )?;
+        let mut response_body = resp.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response_body.data().await {
+            let chunk = chunk.map_err(|e| Error::HttpError(None, e.to_string()))?;
+            append_bounded_response_chunk(&mut bytes, &chunk, response_limit)?;
+        }
 
         if !(200..300).contains(&status) {
             let text = String::from_utf8_lossy(&bytes).to_string();
@@ -221,6 +268,27 @@ impl TorAsync {
                 Err(err) => err.into(),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tor_rejects_oversize_declared_response_before_reading_body() {
+        assert!(validate_declared_response_length(Some(9), Some(8)).is_err());
+        assert!(validate_declared_response_length(Some(8), Some(8)).is_ok());
+    }
+
+    #[test]
+    fn tor_streaming_body_enforces_exact_limit_without_appending_overshoot() {
+        let mut body = Vec::new();
+        append_bounded_response_chunk(&mut body, b"1234", Some(8)).expect("first chunk should fit");
+        append_bounded_response_chunk(&mut body, b"5678", Some(8)).expect("exact limit should fit");
+        assert_eq!(body, b"12345678");
+        assert!(append_bounded_response_chunk(&mut body, b"9", Some(8)).is_err());
+        assert_eq!(body, b"12345678");
     }
 }
 
@@ -243,7 +311,21 @@ impl Transport for TorAsync {
     where
         R: serde::de::DeserializeOwned,
     {
-        self.request::<R>(Method::GET, url, auth, None).await
+        self.request::<R>(Method::GET, url, auth, None, None).await
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn http_get_with_response_limit<R>(
+        &self,
+        url: url::Url,
+        auth: Option<cdk_common::AuthToken>,
+        max_bytes: usize,
+    ) -> Result<R, super::super::Error>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        self.request::<R>(Method::GET, url, auth, None, Some(max_bytes))
+            .await
     }
 
     async fn http_post<P, R>(
@@ -257,7 +339,7 @@ impl Transport for TorAsync {
         R: serde::de::DeserializeOwned,
     {
         let body = serde_json::to_vec(payload).map_err(|e| Error::Custom(e.to_string()))?;
-        self.request::<R>(Method::POST, url, auth_token, Some(body))
+        self.request::<R>(Method::POST, url, auth_token, Some(body), None)
             .await
     }
 
@@ -318,7 +400,7 @@ impl Transport for TorAsync {
         }
 
         let resp: DnsResp = self
-            .request::<DnsResp>(Method::GET, url, None, None::<Vec<u8>>)
+            .request::<DnsResp>(Method::GET, url, None, None::<Vec<u8>>, None)
             .await?;
 
         let answers = resp.Answer.unwrap_or_default();

@@ -215,6 +215,8 @@ mod tests {
                 HashMap::new(),
                 1000,
                 1000,
+                #[cfg(feature = "conditional-tokens")]
+                cdk::nuts::nut_ctf::MAX_OUTCOMES,
             )
             .await
             .expect("mint"),
@@ -237,6 +239,12 @@ mod tests {
         let state = MintState {
             mint,
             cache: Arc::new(HttpCache::default()),
+            #[cfg(feature = "conditional-tokens")]
+            conditional_keyset_catalogue_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+            #[cfg(feature = "conditional-tokens")]
+            conditional_keyset_catalogue_bytes: Arc::new(tokio::sync::Semaphore::new(
+                cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES,
+            )),
         };
         let (publisher, _receiver) = tokio::sync::mpsc::channel(100);
         WsContext {

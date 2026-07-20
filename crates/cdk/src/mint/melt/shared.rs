@@ -11,7 +11,6 @@ use cdk_common::database::{self, DynMintDatabase};
 use cdk_common::mint::{self as mint_types};
 use cdk_common::nuts::{BlindSignature, BlindedMessage, MeltQuoteState, Proofs, State};
 use cdk_common::{Amount, CurrencyUnit, Error, PublicKey, QuoteId};
-use cdk_signatory::signatory::SignatoryKeySet;
 
 use crate::mint::subscription::PubSubManager;
 use crate::mint::MeltQuote;
@@ -31,12 +30,12 @@ use crate::Mint;
 ///
 /// Fee per thousand and allowed amounts for the keyset, or default if not found
 pub fn get_keyset_fee_and_amounts(
-    keysets: &arc_swap::ArcSwap<Vec<SignatoryKeySet>>,
+    keysets: &arc_swap::ArcSwap<super::super::KeysetCache>,
     outputs: &[BlindedMessage],
 ) -> cdk_common::amount::FeeAndAmounts {
     keysets
         .load()
-        .iter()
+        .values()
         .filter_map(|keyset| {
             if keyset.active && Some(keyset.id) == outputs.first().map(|x| x.keyset_id) {
                 Some((keyset.input_fee_ppk, keyset.amounts.clone()).into())

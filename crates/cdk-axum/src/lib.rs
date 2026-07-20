@@ -13,6 +13,8 @@ use axum::Router;
 use cache::HttpCache;
 use cdk::mint::Mint;
 use router_handlers::*;
+#[cfg(feature = "conditional-tokens")]
+use tokio::sync::Semaphore;
 
 mod metrics;
 
@@ -58,7 +60,18 @@ use swagger_imports::*;
 pub struct MintState {
     mint: Arc<Mint>,
     cache: Arc<cache::HttpCache>,
+    #[cfg(feature = "conditional-tokens")]
+    conditional_keyset_catalogue_slots: Arc<Semaphore>,
+    #[cfg(feature = "conditional-tokens")]
+    conditional_keyset_catalogue_bytes: Arc<Semaphore>,
 }
+
+#[cfg(feature = "conditional-tokens")]
+const CONDITIONAL_KEYSET_CATALOGUE_CONCURRENCY_LIMIT: usize = 16;
+
+#[cfg(feature = "conditional-tokens")]
+const CONDITIONAL_KEYSET_CATALOGUE_IN_FLIGHT_BYTES: usize =
+    cdk_common::database::mint::MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES * 2;
 
 #[cfg(feature = "swagger")]
 macro_rules! define_api_doc {
@@ -221,6 +234,14 @@ pub async fn create_mint_router_with_custom_cache(
     let state = MintState {
         mint,
         cache: Arc::new(cache),
+        #[cfg(feature = "conditional-tokens")]
+        conditional_keyset_catalogue_slots: Arc::new(Semaphore::new(
+            CONDITIONAL_KEYSET_CATALOGUE_CONCURRENCY_LIMIT,
+        )),
+        #[cfg(feature = "conditional-tokens")]
+        conditional_keyset_catalogue_bytes: Arc::new(Semaphore::new(
+            CONDITIONAL_KEYSET_CATALOGUE_IN_FLIGHT_BYTES,
+        )),
     };
 
     let v1_router = Router::new()

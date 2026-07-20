@@ -118,7 +118,9 @@ pub fn create_new_keyset<C: secp256k1::Signing>(
 /// Uses a derivation path based on a SHA-256 hash of the condition_id and outcome_collection_id
 /// to derive a unique child index: `m/0'/<unit_index>'/<hash_derived_index>'`
 #[cfg(feature = "conditional-tokens")]
-#[allow(clippy::too_many_arguments)]
+// Conditional key derivation is already deployed with the legacy unit index;
+// changing to the newer hashed index would derive different signing keys.
+#[allow(deprecated, clippy::too_many_arguments)]
 pub fn create_conditional_keyset<C: secp256k1::Signing>(
     secp: &secp256k1::Secp256k1<C>,
     xpriv: Xpriv,
@@ -201,16 +203,12 @@ pub fn derivation_path_from_unit(unit: CurrencyUnit, index: u32) -> Option<Deriv
     ]))
 }
 
-/// take all the keyset units and if te new keyset is a new unit we check
-pub fn check_unit_string_collision(
-    keysets: Vec<crate::signatory::SignatoryKeySet>,
+/// Check derivation-index collisions without materializing public keysets.
+pub fn check_unit_string_collision_for_units(
+    keyset_units: impl IntoIterator<Item = CurrencyUnit>,
     new_keyset: &MintKeySetInfo,
 ) -> Result<(), Error> {
-    let mut unit_hash: HashSet<CurrencyUnit> = HashSet::new();
-
-    for key in keysets {
-        unit_hash.insert(key.unit);
-    }
+    let unit_hash = keyset_units.into_iter().collect::<HashSet<_>>();
 
     if unit_hash.contains(&new_keyset.unit) {
         // the currency unit already exists so we don't have to check it

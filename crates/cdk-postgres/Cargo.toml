@@ -14,6 +14,7 @@ rust-version.workspace = true                            # MSRV
 default = ["mint", "wallet"]
 mint = ["cdk-common/mint", "cdk-sql-common/mint"]
 wallet = ["cdk-common/wallet", "cdk-sql-common/wallet"]
+conditional-tokens = ["cdk-common/conditional-tokens", "cdk-sql-common/conditional-tokens"]
 
 [dependencies]
 async-trait.workspace = true
@@ -34,6 +35,7 @@ postgres-native-tls = "0.5.1"
 native-tls = "=0.2.14"
 once_cell.workspace = true
 paste = "1.0.15"
+zeroize = "1"
 
 [lints]
 workspace = true

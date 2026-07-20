@@ -30,6 +30,21 @@ pub trait DatabaseExecutor: Debug + Sync + Send {
 
     /// Batch execution
     async fn batch(&self, statement: Statement) -> Result<(), Error>;
+
+    /// Atomically initialize or load the conditional catalogue cursor key.
+    ///
+    /// This driver-owned path keeps secret bind buffers out of the public
+    /// exhaustive [`crate::value::Value`] API.
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_or_create_conditional_keyset_cursor_key(
+        &self,
+        candidate: zeroize::Zeroizing<[u8; 32]>,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
+        let _ = candidate;
+        Err(Error::Internal(
+            "database driver does not support conditional catalogue cursor authority".to_string(),
+        ))
+    }
 }
 
 /// Database transaction trait

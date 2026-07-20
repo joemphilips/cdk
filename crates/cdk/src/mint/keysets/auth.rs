@@ -14,13 +14,13 @@ impl Mint {
         let key = self
             .keysets
             .load()
-            .iter()
+            .values()
             .find(|key| key.unit == CurrencyUnit::Auth)
-            .ok_or(Error::NoActiveKeyset)?
-            .clone();
+            .cloned()
+            .ok_or(Error::NoActiveKeyset)?;
 
         Ok(KeysResponse {
-            keysets: vec![key.into()],
+            keysets: vec![key.as_ref().into()],
         })
     }
 
@@ -31,7 +31,7 @@ impl Mint {
             keysets: self
                 .keysets
                 .load()
-                .iter()
+                .values()
                 .filter_map(|key| {
                     if key.unit == CurrencyUnit::Auth {
                         Some(KeySetInfo {

@@ -120,7 +120,7 @@ pub fn verify_digit_attestation(
     let mut abs_value: i64 = 0;
     for i in value_digits_start..nb_digits {
         let digit_outcomes: Vec<String> = (0..base).map(|d| d.to_string()).collect();
-        let digit_strs: Vec<&str> = digit_outcomes.iter().map(|s| s.as_str()).collect();
+        let digit_strs: Vec<&str> = digit_outcomes.iter().map(String::as_str).collect();
 
         let digit_str =
             find_attested_digit(oracle_pubkey, &digit_sigs[i], &nonce_points[i], &digit_strs)?;

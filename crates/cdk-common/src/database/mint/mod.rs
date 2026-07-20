@@ -6,6 +6,8 @@ use std::ops::{Deref, DerefMut};
 use async_trait::async_trait;
 use cashu::quote_id::QuoteId;
 use cashu::Amount;
+#[cfg(feature = "conditional-tokens")]
+use zeroize::Zeroizing;
 
 use super::{DbTransactionFinalizer, Error};
 #[cfg(feature = "conditional-tokens")]
@@ -644,6 +646,130 @@ pub trait ConditionsTransaction {
         keyset_info: MintKeySetInfo,
         created_at: u64,
     ) -> Result<(), Self::Err>;
+
+    /// Add one registration's conditional keysets as one sequence-allocation batch.
+    async fn add_conditional_keysets(
+        &mut self,
+        keysets: Vec<(MintKeySetInfo, u64)>,
+    ) -> Result<(), Self::Err> {
+        for (keyset, created_at) in keysets {
+            self.add_conditional_keyset(keyset, created_at).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated conditional-keyset catalogue protocol version.
+#[cfg(feature = "conditional-tokens")]
+pub const CONDITIONAL_KEYSET_CATALOGUE_VERSION: u8 = 1;
+
+/// Maximum number of conditional keysets in one catalogue page.
+#[cfg(feature = "conditional-tokens")]
+pub const MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE: u64 = 100;
+
+/// Maximum encoded length of an authenticated catalogue cursor.
+#[cfg(feature = "conditional-tokens")]
+pub const MAX_CONDITIONAL_KEYSET_CATALOGUE_CURSOR_LENGTH: usize = 2_048;
+
+/// Maximum byte length of a wire-visible currency unit.
+#[cfg(feature = "conditional-tokens")]
+pub const MAX_CONDITIONAL_KEYSET_UNIT_LENGTH: usize = 64;
+
+/// Maximum byte length of one canonical outcome-collection expression.
+///
+/// A page can contain 100 expressions and JSON escaping can expand every
+/// source byte to six bytes (`\\u00xx`). Keeping the field at 16 KiB leaves
+/// ample room below the shared hard response cap for all fixed metadata.
+#[cfg(feature = "conditional-tokens")]
+pub const MAX_CONDITIONAL_KEYSET_OUTCOME_COLLECTION_LENGTH: usize = 16 * 1_024;
+
+#[cfg(feature = "conditional-tokens")]
+const MAX_JSON_ESCAPED_BYTES_PER_INPUT_BYTE: usize = 6;
+#[cfg(feature = "conditional-tokens")]
+const MAX_CONDITIONAL_KEYSET_JSON_FIXED_OVERHEAD: usize = 4_096;
+#[cfg(feature = "conditional-tokens")]
+const MAX_CONDITIONAL_KEYSET_RESPONSE_JSON_FIXED_OVERHEAD: usize = 1_024;
+
+#[cfg(feature = "conditional-tokens")]
+const MAX_CONDITIONAL_KEYSET_CATALOGUE_DERIVED_RESPONSE_BYTES: usize =
+    MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE as usize
+        * (MAX_CONDITIONAL_KEYSET_OUTCOME_COLLECTION_LENGTH
+            * MAX_JSON_ESCAPED_BYTES_PER_INPUT_BYTE
+            + MAX_CONDITIONAL_KEYSET_JSON_FIXED_OVERHEAD)
+        + MAX_CONDITIONAL_KEYSET_CATALOGUE_CURSOR_LENGTH * MAX_JSON_ESCAPED_BYTES_PER_INPUT_BYTE
+        + MAX_CONDITIONAL_KEYSET_RESPONSE_JSON_FIXED_OVERHEAD;
+
+/// Hard byte cap shared by catalogue servers and HTTP transports.
+///
+/// This is derived from the negotiated page count, the canonical field
+/// bounds, worst-case six-byte JSON escaping, and a conservative 4 KiB
+/// allowance for every item's fixed fields. The compile-time assertion keeps
+/// the chosen transport cap above that derived worst case. A mint enforcing
+/// the canonical item bounds cannot emit a valid page that a conforming
+/// strict HTTP client rejects for size.
+#[cfg(feature = "conditional-tokens")]
+pub const MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES: usize = 16 * 1_024 * 1_024;
+
+#[cfg(feature = "conditional-tokens")]
+const _: () = assert!(
+    MAX_CONDITIONAL_KEYSET_CATALOGUE_DERIVED_RESPONSE_BYTES
+        <= MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES
+);
+
+/// Whether a value is the canonical lowercase encoding of a 32-byte hash.
+#[cfg(feature = "conditional-tokens")]
+pub fn is_canonical_conditional_keyset_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Validate the bounded wire/persistence fields shared by registrations,
+/// database rows, server responses, and wallet connectors.
+#[cfg(feature = "conditional-tokens")]
+pub fn validate_conditional_keyset_catalogue_fields(
+    unit: &str,
+    condition_id: &str,
+    outcome_collection: &str,
+    outcome_collection_id: &str,
+) -> Result<(), &'static str> {
+    if unit.is_empty() || unit.len() > MAX_CONDITIONAL_KEYSET_UNIT_LENGTH {
+        return Err("catalogue keyset unit is invalid");
+    }
+    if !is_canonical_conditional_keyset_hash(condition_id)
+        || !is_canonical_conditional_keyset_hash(outcome_collection_id)
+    {
+        return Err("catalogue keyset identifiers are not canonical lowercase 32-byte hex values");
+    }
+    if outcome_collection.is_empty()
+        || outcome_collection.len() > MAX_CONDITIONAL_KEYSET_OUTCOME_COLLECTION_LENGTH
+    {
+        return Err("catalogue outcome collection exceeds its field bound");
+    }
+    Ok(())
+}
+
+/// A conditional keyset paired with its immutable catalogue sequence.
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CataloguedConditionalKeyset {
+    /// Monotonic sequence allocated in the condition-registration transaction.
+    pub sequence: u64,
+    /// Wire-visible conditional keyset metadata.
+    pub keyset: cashu::nuts::nut_ctf::ConditionalKeySetInfo,
+}
+
+/// One bounded raw database window from an immutable conditional-keyset catalogue snapshot.
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalKeysetCataloguePage {
+    /// Snapshot high-water sequence fixed by the first page.
+    pub snapshot: u64,
+    /// Ordered, unfiltered keysets whose sequence belongs to the snapshot.
+    pub keysets: Vec<CataloguedConditionalKeyset>,
+    /// Whether another raw sequence window exists within the same snapshot.
+    pub has_more: bool,
 }
 
 /// Conditions Database trait (NUT-CTF)
@@ -653,14 +779,30 @@ pub trait ConditionsDatabase {
     /// Conditions Database Error
     type Err: Into<Error> + From<Error>;
 
+    /// Whether this backend provides persistent authenticated catalogue authority.
+    fn supports_conditional_keyset_catalogue(&self) -> bool {
+        false
+    }
+
     /// Add a stored condition
     async fn add_condition(&self, condition: StoredCondition) -> Result<(), Self::Err>;
 
-    /// Delete a condition and any conditional keysets created for the same registration attempt.
+    /// Delete a condition registration created by a failed legacy workflow.
     ///
-    /// Used to clean up partial condition registration failures so one-shot
-    /// condition registration cannot strand an unrepairable condition row.
-    async fn delete_condition_registration(&self, condition_id: &str) -> Result<(), Self::Err>;
+    /// Authenticated catalogue rows are immutable, so catalogue-capable
+    /// backends fail closed by default. The method remains for source
+    /// compatibility with custom database implementations compiled against the
+    /// earlier conditional-token API.
+    #[deprecated(
+        note = "conditional-keyset catalogues are append-only; registration writes must be transactional"
+    )]
+    async fn delete_condition_registration(&self, condition_id: &str) -> Result<(), Self::Err> {
+        let _ = condition_id;
+        Err(
+            Error::Internal("conditional-keyset catalogue registrations are immutable".to_string())
+                .into(),
+        )
+    }
 
     /// Get a condition by condition_id
     async fn get_condition(&self, condition_id: &str)
@@ -691,6 +833,19 @@ pub trait ConditionsDatabase {
         condition_id: &str,
     ) -> Result<HashMap<String, Id>, Self::Err>;
 
+    /// Get full conditional keyset metadata for idempotent signatory reconciliation.
+    async fn get_conditional_mint_keyset_infos_for_condition(
+        &self,
+        condition_id: &str,
+    ) -> Result<Vec<MintKeySetInfo>, Self::Err> {
+        let _ = condition_id;
+        Err(Error::Internal(
+            "conditional keyset reconciliation lookup is not implemented by this backend"
+                .to_string(),
+        )
+        .into())
+    }
+
     /// Get all conditional keyset infos (for GET /v1/conditional_keysets)
     async fn get_all_conditional_keyset_infos(
         &self,
@@ -699,12 +854,118 @@ pub trait ConditionsDatabase {
         active: Option<bool>,
     ) -> Result<Vec<cashu::nuts::nut_ctf::ConditionalKeySetInfo>, Self::Err>;
 
+    /// Read a bounded raw sequence window from a stable conditional-keyset catalogue snapshot.
+    ///
+    /// When `snapshot` is `None`, implementations read the committed catalogue
+    /// high-water mark without acquiring a writer lock. Registrations must
+    /// update that mark and insert their rows atomically in one transaction.
+    async fn get_conditional_keyset_catalogue_page(
+        &self,
+        snapshot: Option<u64>,
+        after: u64,
+        limit: u64,
+    ) -> Result<ConditionalKeysetCataloguePage, Self::Err> {
+        let _ = (snapshot, after, limit);
+        Err(Error::Internal(
+            "conditional keyset catalogue pagination is not implemented by this backend"
+                .to_string(),
+        )
+        .into())
+    }
+
+    /// Atomically initialize or load the shared cursor MAC key.
+    async fn get_or_create_conditional_keyset_cursor_key(
+        &self,
+        candidate: Zeroizing<[u8; 32]>,
+    ) -> Result<Zeroizing<[u8; 32]>, Self::Err> {
+        let _ = candidate;
+        Err(Error::Internal(
+            "conditional keyset catalogue cursor authority is not implemented by this backend"
+                .to_string(),
+        )
+        .into())
+    }
+
     /// Get condition info for a specific keyset ID
     /// Returns (condition_id, outcome_collection, outcome_collection_id) if this is a conditional keyset
     async fn get_condition_for_keyset(
         &self,
         keyset_id: &Id,
     ) -> Result<Option<(String, String, String)>, Self::Err>;
+}
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod conditions_database_default_tests {
+    use super::*;
+
+    struct DefaultMetadataLookupDatabase;
+
+    #[async_trait]
+    impl ConditionsDatabase for DefaultMetadataLookupDatabase {
+        type Err = Error;
+
+        async fn add_condition(&self, _condition: StoredCondition) -> Result<(), Self::Err> {
+            unreachable!("not used by the default lookup test")
+        }
+
+        async fn get_condition(
+            &self,
+            _condition_id: &str,
+        ) -> Result<Option<StoredCondition>, Self::Err> {
+            unreachable!("not used by the default lookup test")
+        }
+
+        async fn get_conditions(
+            &self,
+            _since: Option<u64>,
+            _limit: Option<u64>,
+            _status: &[String],
+        ) -> Result<Vec<StoredCondition>, Self::Err> {
+            unreachable!("not used by the default lookup test")
+        }
+
+        async fn update_condition_attestation(
+            &self,
+            _condition_id: &str,
+            _status: &str,
+            _winning_outcome: Option<&str>,
+            _attested_at: Option<u64>,
+        ) -> Result<bool, Self::Err> {
+            unreachable!("not used by the default lookup test")
+        }
+
+        async fn get_conditional_keysets_for_condition(
+            &self,
+            _condition_id: &str,
+        ) -> Result<HashMap<String, Id>, Self::Err> {
+            unreachable!("not used by the default lookup test")
+        }
+
+        async fn get_all_conditional_keyset_infos(
+            &self,
+            _since: Option<u64>,
+            _limit: Option<u64>,
+            _active: Option<bool>,
+        ) -> Result<Vec<cashu::nuts::nut_ctf::ConditionalKeySetInfo>, Self::Err> {
+            unreachable!("not used by the default lookup test")
+        }
+
+        async fn get_condition_for_keyset(
+            &self,
+            _keyset_id: &Id,
+        ) -> Result<Option<(String, String, String)>, Self::Err> {
+            unreachable!("not used by the default lookup test")
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_keyset_metadata_lookup_fails_closed_by_default() {
+        let error = DefaultMetadataLookupDatabase
+            .get_conditional_mint_keyset_infos_for_condition(&"ab".repeat(32))
+            .await
+            .expect_err("out-of-tree backend without reconciliation lookup must fail closed");
+        assert!(matches!(error, Error::Internal(_)));
+    }
 }
 
 /// Base database writer

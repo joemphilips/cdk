@@ -5,6 +5,8 @@ use cdk_sql_common::run_db_operation_sync;
 use cdk_sql_common::stmt::{query, Column, SqlPart, Statement};
 use rusqlite::{ffi, CachedStatement, Connection, Error as SqliteError, ErrorCode};
 use tokio::sync::Mutex;
+#[cfg(feature = "conditional-tokens")]
+use zeroize::Zeroizing;
 
 use crate::common::{from_sqlite, to_sqlite};
 
@@ -205,5 +207,33 @@ impl DatabaseExecutor for AsyncSqlite {
         let conn = self.inner.lock().await;
 
         run_db_operation_sync(&sql, || conn.execute_batch(&sql), to_sqlite_error)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_or_create_conditional_keyset_cursor_key(
+        &self,
+        candidate: Zeroizing<[u8; 32]>,
+    ) -> Result<Zeroizing<[u8; 32]>, Error> {
+        let conn = self.inner.lock().await;
+        let stored = conn
+            .query_row(
+                r#"
+                UPDATE conditional_keyset_catalogue_state
+                SET cursor_signing_key = COALESCE(cursor_signing_key, ?1)
+                WHERE singleton = 1
+                RETURNING cursor_signing_key
+                "#,
+                rusqlite::params![candidate.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|err| Error::Database(Box::new(err)))?;
+        let stored = Zeroizing::new(stored);
+        let key = <[u8; 32]>::try_from(stored.as_slice()).map_err(|_| {
+            Error::Internal(format!(
+                "conditional keyset cursor key has invalid length {}",
+                stored.len()
+            ))
+        })?;
+        Ok(Zeroizing::new(key))
     }
 }

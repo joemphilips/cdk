@@ -17,14 +17,72 @@ use cdk_signatory::signatory::{Signatory, SignatoryKeySet};
 use futures::StreamExt;
 use nut21::ProtectedEndpoint;
 use subscription::PubSubManager;
+#[cfg(feature = "conditional-tokens")]
+use tokio::sync::OnceCell;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::instrument;
+#[cfg(feature = "conditional-tokens")]
+use zeroize::Zeroizing;
 
 use crate::error::Error;
 use crate::fees::calculate_fee;
 use crate::nuts::*;
 use crate::{Amount, OidcClient};
+
+pub(crate) type KeysetCache = HashMap<Id, Arc<SignatoryKeySet>>;
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+#[derive(Default)]
+struct MintRotationTestHooks {
+    pause_first_publication: std::sync::atomic::AtomicBool,
+    returned_rotation_count: std::sync::atomic::AtomicUsize,
+    returned_rotation_notify: Notify,
+    first_publication_release: Notify,
+}
+
+fn keyset_cache(keysets: Vec<SignatoryKeySet>) -> KeysetCache {
+    keysets
+        .into_iter()
+        .map(|keyset| (keyset.id, Arc::new(keyset)))
+        .collect()
+}
+
+fn merge_rotated_keyset_cache(cache: &ArcSwap<KeysetCache>, rotated: &SignatoryKeySet) {
+    cache.rcu(|current| {
+        // ArcSwap's RCU retry preserves concurrent conditional registrations.
+        // Only the previous active regular keyset for this unit is cloned to
+        // flip its status; every unrelated key payload remains shared.
+        let mut updated = (**current).clone();
+        for (id, keyset) in current.iter() {
+            #[cfg(feature = "conditional-tokens")]
+            let is_regular = keyset.condition_id.is_none();
+            #[cfg(not(feature = "conditional-tokens"))]
+            let is_regular = true;
+
+            if *id != rotated.id && is_regular && keyset.active && keyset.unit == rotated.unit {
+                let mut inactive = keyset.as_ref().clone();
+                inactive.active = false;
+                updated.insert(*id, Arc::new(inactive));
+            }
+        }
+        updated.insert(rotated.id, Arc::new(rotated.clone()));
+        updated
+    });
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn merge_keyset_cache(cache: &ArcSwap<KeysetCache>, additions: &[(Id, Arc<SignatoryKeySet>)]) {
+    cache.rcu(|current| {
+        // HashMap cloning only clones Arc pointers. Existing public key payloads
+        // remain shared even when the catalogue contains thousands of markets.
+        let mut updated = (**current).clone();
+        for (id, keyset) in additions {
+            updated.insert(*id, keyset.clone());
+        }
+        updated
+    });
+}
 
 pub(crate) mod auth;
 mod builder;
@@ -76,7 +134,11 @@ pub struct Mint {
     pubsub_manager: Arc<PubSubManager>,
     oidc_client: Option<OidcClient>,
     /// In-memory keyset
-    keysets: Arc<ArcSwap<Vec<SignatoryKeySet>>>,
+    keysets: Arc<ArcSwap<KeysetCache>>,
+    /// Serializes signatory rotation through Mint cache publication.
+    keyset_rotation_lock: Arc<Mutex<()>>,
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    rotation_test_hooks: Arc<MintRotationTestHooks>,
     /// Background task management
     task_state: Arc<Mutex<TaskState>>,
     /// Maximum number of inputs allowed per transaction
@@ -86,6 +148,12 @@ pub struct Mint {
     /// Maximum number of outcomes allowed per conditional-token condition
     #[cfg(feature = "conditional-tokens")]
     max_outcomes_per_condition: usize,
+    /// Whether the storage backend can persist authenticated catalogue authority.
+    #[cfg(feature = "conditional-tokens")]
+    conditional_keyset_catalogue_available: bool,
+    /// Shared database-backed authority for authenticated catalogue cursors.
+    #[cfg(feature = "conditional-tokens")]
+    conditional_keyset_cursor_key: Arc<OnceCell<Zeroizing<[u8; 32]>>>,
 }
 
 impl std::fmt::Debug for Mint {
@@ -129,6 +197,8 @@ impl Mint {
     }
 
     /// Create new [`Mint`] with authentication support
+    // This stable constructor mirrors `new` and adds the authentication store.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_with_auth(
         mint_info: MintInfo,
         signatory: Arc<dyn Signatory + Send + Sync>,
@@ -155,6 +225,9 @@ impl Mint {
 
     /// Internal function to create a new [`Mint`] with shared logic
     #[inline]
+    // Keeping constructor delegation here prevents authenticated and
+    // unauthenticated initialization from drifting.
+    #[allow(clippy::too_many_arguments)]
     async fn new_internal(
         mint_info: MintInfo,
         signatory: Arc<dyn Signatory + Send + Sync>,
@@ -246,6 +319,9 @@ impl Mint {
             }
         }
 
+        #[cfg(feature = "conditional-tokens")]
+        let conditional_keyset_catalogue_available =
+            localstore.supports_conditional_keyset_catalogue();
         let payment_processors = Arc::new(payment_processors);
 
         Ok(Self {
@@ -260,12 +336,19 @@ impl Mint {
             }),
             payment_processors,
             auth_localstore,
-            keysets: Arc::new(ArcSwap::new(keysets.keysets.into())),
+            keysets: Arc::new(ArcSwap::new(Arc::new(keyset_cache(keysets.keysets)))),
+            keyset_rotation_lock: Arc::new(Mutex::new(())),
+            #[cfg(all(test, feature = "conditional-tokens"))]
+            rotation_test_hooks: Arc::new(MintRotationTestHooks::default()),
             task_state: Arc::new(Mutex::new(TaskState::default())),
             max_inputs,
             max_outputs,
             #[cfg(feature = "conditional-tokens")]
             max_outcomes_per_condition,
+            #[cfg(feature = "conditional-tokens")]
+            conditional_keyset_catalogue_available,
+            #[cfg(feature = "conditional-tokens")]
+            conditional_keyset_cursor_key: Arc::new(OnceCell::new()),
         })
     }
 
@@ -560,6 +643,23 @@ impl Mint {
         } else {
             mint_info
         };
+
+        #[cfg(feature = "conditional-tokens")]
+        let mut mint_info = mint_info;
+
+        #[cfg(feature = "conditional-tokens")]
+        if let Some(settings) = mint_info.nuts.nut_ctf.as_mut() {
+            if settings.supported && self.conditional_keyset_catalogue_available {
+                self.conditional_keyset_cursor_key().await?;
+                settings.conditional_keyset_catalogue =
+                    Some(nut_ctf::ConditionalKeysetCatalogueSettings {
+                        version: conditions::CONDITIONAL_KEYSET_CATALOGUE_VERSION,
+                        max_page_size: conditions::MAX_PAGE_SIZE,
+                    });
+            } else {
+                settings.conditional_keyset_catalogue = None;
+            }
+        }
 
         Ok(mint_info)
     }
@@ -1095,7 +1195,7 @@ impl Mint {
     pub fn get_active_keysets(&self) -> HashMap<CurrencyUnit, Id> {
         self.keysets
             .load()
-            .iter()
+            .values()
             .filter_map(|keyset| {
                 if keyset.active {
                     Some((keyset.unit.clone(), keyset.id))
@@ -1110,15 +1210,8 @@ impl Mint {
     pub fn get_keyset_info(&self, id: &Id) -> Option<MintKeySetInfo> {
         self.keysets
             .load()
-            .iter()
-            .filter_map(|keyset| {
-                if keyset.id == *id {
-                    Some(keyset.into())
-                } else {
-                    None
-                }
-            })
-            .next()
+            .get(id)
+            .map(|keyset| keyset.as_ref().into())
     }
 
     /// Blind Sign
@@ -1312,6 +1405,8 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::database::MintKeysDatabase;
     use cdk_common::melt::MeltQuoteRequest;
     use cdk_common::mint::{OperationKind, SagaStateEnum};
     use cdk_common::nut00::KnownMethod;
@@ -1325,6 +1420,96 @@ mod tests {
     use super::*;
     use crate::mint::melt::melt_saga::{MeltSaga, PaymentOutcome};
     use crate::test_helpers::mint::{create_test_mint, mint_test_proofs};
+
+    #[cfg(feature = "conditional-tokens")]
+    fn cached_test_keyset(index: usize) -> SignatoryKeySet {
+        SignatoryKeySet {
+            id: Id::from_str(&format!("00{index:014x}")).expect("keyset id should parse"),
+            unit: CurrencyUnit::Sat,
+            active: false,
+            keys: crate::nuts::Keys::new(std::collections::BTreeMap::new()),
+            amounts: (0..32).map(|bit| 1_u64 << bit).collect(),
+            input_fee_ppk: 0,
+            final_expiry: None,
+            issuer_version: None,
+            version: 1,
+            condition_id: Some("ab".repeat(32)),
+        }
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    fn cached_regular_keyset(index: usize, active: bool) -> SignatoryKeySet {
+        SignatoryKeySet {
+            active,
+            condition_id: None,
+            ..cached_test_keyset(index)
+        }
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn conditional_cache_update_shares_existing_payloads_and_keeps_concurrent_batches() {
+        const BINARY_MARKETS: usize = 1_000;
+        let mut initial = keyset_cache((0..BINARY_MARKETS * 2).map(cached_test_keyset).collect());
+        let existing = initial
+            .iter()
+            .map(|(id, keyset)| (*id, keyset.clone()))
+            .collect::<Vec<_>>();
+        let previous_regular = cached_regular_keyset(BINARY_MARKETS * 3, true);
+        let previous_regular_id = previous_regular.id;
+        initial.insert(previous_regular_id, Arc::new(previous_regular));
+        let cache = Arc::new(ArcSwap::new(Arc::new(initial)));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let mut updates = [BINARY_MARKETS * 2, BINARY_MARKETS * 2 + 1]
+            .into_iter()
+            .map(|index| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let keyset = Arc::new(cached_test_keyset(index));
+                    let addition = [(keyset.id, keyset)];
+                    barrier.wait();
+                    merge_keyset_cache(&cache, &addition);
+                })
+            })
+            .collect::<Vec<_>>();
+        let rotated = cached_regular_keyset(BINARY_MARKETS * 3 + 1, true);
+        let rotated_id = rotated.id;
+        {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            updates.push(std::thread::spawn(move || {
+                barrier.wait();
+                merge_rotated_keyset_cache(&cache, &rotated);
+            }));
+        }
+        for update in updates {
+            update.join().expect("cache update thread should join");
+        }
+
+        let current = cache.load();
+        assert_eq!(current.len(), BINARY_MARKETS * 2 + 4);
+        assert!(
+            current
+                .get(&rotated_id)
+                .expect("rotated keyset must be published")
+                .active
+        );
+        assert!(
+            !current
+                .get(&previous_regular_id)
+                .expect("previous regular keyset must remain addressable")
+                .active
+        );
+        for (id, before) in existing {
+            let after = current.get(&id).expect("existing keyset must remain");
+            assert!(
+                Arc::ptr_eq(&before, after),
+                "existing public keyset payload {id} was deep-cloned"
+            );
+        }
+    }
 
     #[derive(Default)]
     struct MintConfig<'a> {
@@ -1340,6 +1525,12 @@ mod tests {
     }
 
     async fn create_mint(config: MintConfig<'_>) -> Mint {
+        create_mint_with_database(config).await.0
+    }
+
+    async fn create_mint_with_database(
+        config: MintConfig<'_>,
+    ) -> (Mint, Arc<cdk_sqlite::mint::MintSqliteDatabase>) {
         let localstore = Arc::new(
             new_with_state(
                 config.active_keysets,
@@ -1378,10 +1569,10 @@ mod tests {
                 .unwrap();
         }
 
-        Mint::new(
+        let mint = Mint::new(
             MintInfo::default(),
             signatory,
-            localstore,
+            localstore.clone(),
             HashMap::new(),
             1000,
             1000,
@@ -1389,7 +1580,8 @@ mod tests {
             crate::nuts::nut_ctf::MAX_OUTCOMES,
         )
         .await
-        .unwrap()
+        .unwrap();
+        (mint, localstore)
     }
 
     #[tokio::test]
@@ -1452,6 +1644,106 @@ mod tests {
                 assert!(keyset.active);
             }
         }
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn wait_for_mint_rotation_returns(mint: &Mint, expected: usize) {
+        use std::sync::atomic::Ordering;
+
+        loop {
+            let notified = mint.rotation_test_hooks.returned_rotation_notify.notified();
+            if mint
+                .rotation_test_hooks
+                .returned_rotation_count
+                .load(Ordering::SeqCst)
+                >= expected
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mint_rotations_publish_latest_signatory_commit() {
+        use std::sync::atomic::Ordering;
+
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (0, vec![1]));
+        let (mint, key_database) = create_mint_with_database(MintConfig::<'_> {
+            supported_units,
+            ..Default::default()
+        })
+        .await;
+        mint.rotation_test_hooks
+            .pause_first_publication
+            .store(true, Ordering::SeqCst);
+
+        let first = {
+            let mint = mint.clone();
+            tokio::spawn(async move {
+                mint.rotate_keyset(CurrencyUnit::Sat, vec![1], 1, true, None)
+                    .await
+            })
+        };
+        wait_for_mint_rotation_returns(&mint, 1).await;
+        let second = {
+            let mint = mint.clone();
+            tokio::spawn(async move {
+                mint.rotate_keyset(CurrencyUnit::Sat, vec![1], 2, true, None)
+                    .await
+            })
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_for_mint_rotation_returns(&mint, 2),
+        )
+        .await;
+        mint.rotation_test_hooks
+            .first_publication_release
+            .notify_waiters();
+
+        let first = first
+            .await
+            .expect("first Mint rotation task should join")
+            .expect("first Mint rotation should succeed");
+        let second = second
+            .await
+            .expect("second Mint rotation task should join")
+            .expect("second Mint rotation should succeed");
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            key_database
+                .get_active_keyset_id(&CurrencyUnit::Sat)
+                .await
+                .expect("database active keyset should load"),
+            Some(second.id)
+        );
+
+        let signatory_keysets = mint
+            .signatory
+            .keysets()
+            .await
+            .expect("signatory keysets should load");
+        assert!(signatory_keysets
+            .keysets
+            .iter()
+            .any(|keyset| keyset.id == second.id && keyset.active));
+        assert!(signatory_keysets
+            .keysets
+            .iter()
+            .any(|keyset| keyset.id == first.id && !keyset.active));
+
+        let mint_keysets = mint.keysets();
+        assert!(mint_keysets
+            .keysets
+            .iter()
+            .any(|keyset| keyset.id == second.id && keyset.active));
+        assert!(mint_keysets
+            .keysets
+            .iter()
+            .any(|keyset| keyset.id == first.id && !keyset.active));
     }
 
     #[tokio::test]

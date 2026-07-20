@@ -454,6 +454,27 @@ pub enum Error {
     #[cfg(feature = "conditional-tokens")]
     #[error("Unsupported CTF collateral unit")]
     UnsupportedCollateralUnit,
+    /// Invalid or unauthenticated conditional-keyset catalogue cursor (13049)
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Invalid conditional keyset catalogue cursor")]
+    InvalidConditionalKeysetCatalogueCursor,
+    /// Conditional-keyset catalogue page limit is outside the advertised bounds (13050)
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Conditional keyset catalogue page limit {requested} exceeds maximum {max}")]
+    ConditionalKeysetCataloguePageLimitExceeded {
+        /// Requested page size.
+        requested: u64,
+        /// Maximum supported page size.
+        max: u64,
+    },
+    /// A conditional-keyset catalogue response did not advance its cursor.
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Conditional keyset catalogue made no progress")]
+    ConditionalKeysetCatalogueNoProgress,
+    /// A conditional-keyset catalogue response violated its capability contract.
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Invalid conditional keyset catalogue response: {0}")]
+    InvalidConditionalKeysetCatalogueResponse(String),
     /// Hash to curve failed (13045)
     #[cfg(feature = "conditional-tokens")]
     #[error("Hash to curve failed")]
@@ -1129,6 +1150,16 @@ impl From<Error> for ErrorResponse {
                 detail: err.to_string(),
             },
             #[cfg(feature = "conditional-tokens")]
+            Error::InvalidConditionalKeysetCatalogueCursor => ErrorResponse {
+                code: ErrorCode::InvalidConditionalKeysetCatalogueCursor,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "conditional-tokens")]
+            Error::ConditionalKeysetCataloguePageLimitExceeded { .. } => ErrorResponse {
+                code: ErrorCode::ConditionalKeysetCataloguePageLimitExceeded,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "conditional-tokens")]
             Error::HashToCurveFailed => ErrorResponse {
                 code: ErrorCode::HashToCurveFailed,
                 detail: err.to_string(),
@@ -1156,6 +1187,12 @@ impl From<Error> for ErrorResponse {
             #[cfg(feature = "conditional-tokens")]
             Error::PayoutCalculationOverflow => ErrorResponse {
                 code: ErrorCode::PayoutCalculationOverflow,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "conditional-tokens")]
+            Error::ConditionalKeysetCatalogueNoProgress
+            | Error::InvalidConditionalKeysetCatalogueResponse(_) => ErrorResponse {
+                code: ErrorCode::Unknown(50000),
                 detail: err.to_string(),
             },
 
@@ -1331,6 +1368,17 @@ impl From<ErrorResponse> for Error {
             ErrorCode::PubkeyRequired => Self::PubkeyRequired,
             #[cfg(feature = "conditional-tokens")]
             ErrorCode::UnsupportedCollateralUnit => Self::UnsupportedCollateralUnit,
+            #[cfg(feature = "conditional-tokens")]
+            ErrorCode::InvalidConditionalKeysetCatalogueCursor => {
+                Self::InvalidConditionalKeysetCatalogueCursor
+            }
+            #[cfg(feature = "conditional-tokens")]
+            ErrorCode::ConditionalKeysetCataloguePageLimitExceeded => {
+                Self::ConditionalKeysetCataloguePageLimitExceeded {
+                    requested: 0,
+                    max: 0,
+                }
+            }
             // 30xxx - Clear auth errors
             ErrorCode::ClearAuthRequired => Self::ClearAuthRequired,
             ErrorCode::ClearAuthFailed => Self::ClearAuthFailed,
@@ -1456,6 +1504,12 @@ pub enum ErrorCode {
     /// Unsupported CTF collateral unit (13048)
     #[cfg(feature = "conditional-tokens")]
     UnsupportedCollateralUnit,
+    /// Invalid or unauthenticated conditional-keyset catalogue cursor (13049)
+    #[cfg(feature = "conditional-tokens")]
+    InvalidConditionalKeysetCatalogueCursor,
+    /// Conditional-keyset catalogue page limit is outside advertised bounds (13050)
+    #[cfg(feature = "conditional-tokens")]
+    ConditionalKeysetCataloguePageLimitExceeded,
     /// Hash to curve failed (13045)
     #[cfg(feature = "conditional-tokens")]
     HashToCurveFailed,
@@ -1580,6 +1634,10 @@ impl ErrorCode {
             13047 => Self::RegistrationFeeChangeOutputs,
             #[cfg(feature = "conditional-tokens")]
             13048 => Self::UnsupportedCollateralUnit,
+            #[cfg(feature = "conditional-tokens")]
+            13049 => Self::InvalidConditionalKeysetCatalogueCursor,
+            #[cfg(feature = "conditional-tokens")]
+            13050 => Self::ConditionalKeysetCataloguePageLimitExceeded,
             // 20xxx - Quote/Payment errors
             20001 => Self::QuoteNotPaid,
             20002 => Self::TokensAlreadyIssued,
@@ -1675,6 +1733,10 @@ impl ErrorCode {
             Self::RegistrationFeeChangeOutputs => 13047,
             #[cfg(feature = "conditional-tokens")]
             Self::UnsupportedCollateralUnit => 13048,
+            #[cfg(feature = "conditional-tokens")]
+            Self::InvalidConditionalKeysetCatalogueCursor => 13049,
+            #[cfg(feature = "conditional-tokens")]
+            Self::ConditionalKeysetCataloguePageLimitExceeded => 13050,
             // 20xxx - Quote/Payment errors
             Self::QuoteNotPaid => 20001,
             Self::TokensAlreadyIssued => 20002,

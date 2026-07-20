@@ -50,6 +50,7 @@ parking_lot = "0.12.5"
 paste = "1.0.15"
 jsonwebtoken.workspace = true
 tonic = { workspace = true, optional = true }
+zeroize = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "test-util", "sync"] }

@@ -2,6 +2,8 @@
 //!
 //! It is named db_signatory because it uses a database to maintain state.
 use std::collections::HashMap;
+#[cfg(all(test, feature = "conditional-tokens"))]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
@@ -14,11 +16,30 @@ use tokio::sync::RwLock;
 use tracing::instrument;
 
 use crate::common::{
-    check_unit_string_collision, create_new_keyset, derivation_path_from_unit, init_keysets,
+    check_unit_string_collision_for_units, create_new_keyset, derivation_path_from_unit,
+    init_keysets,
 };
 #[cfg(feature = "conditional-tokens")]
 use crate::signatory::PreparedConditionalKeySet;
-use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
+use crate::signatory::{
+    validate_keyset_info_binding, RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets,
+};
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+struct ReloadPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+#[derive(Default)]
+struct DbSignatoryTestHooks {
+    reload_pause: tokio::sync::Mutex<Option<ReloadPause>>,
+    pause_first_rotation_after_commit: AtomicBool,
+    rotation_commit_count: AtomicUsize,
+    rotation_commit_notify: tokio::sync::Notify,
+    rotation_release: tokio::sync::Notify,
+}
 
 /// In-memory Signatory
 ///
@@ -35,6 +56,11 @@ pub struct DbSignatory {
     custom_paths: HashMap<CurrencyUnit, DerivationPath>,
     xpriv: Xpriv,
     xpub: PublicKey,
+    keyset_mutation_lock: tokio::sync::Mutex<()>,
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    conditional_derivation_count: Arc<AtomicUsize>,
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    test_hooks: DbSignatoryTestHooks,
 }
 
 impl DbSignatory {
@@ -65,6 +91,11 @@ impl DbSignatory {
             xpub: xpriv.to_keypair(&secp_ctx).public_key().into(),
             secp_ctx,
             xpriv,
+            keyset_mutation_lock: tokio::sync::Mutex::new(()),
+            #[cfg(all(test, feature = "conditional-tokens"))]
+            conditional_derivation_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(all(test, feature = "conditional-tokens"))]
+            test_hooks: DbSignatoryTestHooks::default(),
         };
         keys.reload_keys_from_db().await?;
 
@@ -87,53 +118,141 @@ impl DbSignatory {
     ///   "at most one active per outcome_collection_id"), so conditional keysets do NOT
     ///   collapse the per-unit primary keyset.
     async fn reload_keys_from_db(&self) -> Result<(), Error> {
-        let mut keysets = self.keysets.write().await;
-        let mut active_keysets = self.active_keysets.write().await;
-        keysets.clear();
-        active_keysets.clear();
-
+        let _mutation_guard = self.keyset_mutation_lock.lock().await;
         let db_active_keysets = self.localstore.get_active_keysets().await?;
-
-        for mut info in self.localstore.get_keyset_infos().await? {
-            let id = info.id;
-            let keyset = self.generate_keyset(&info);
-            info.active = db_active_keysets.get(&info.unit) == Some(&info.id);
-            if info.active {
-                active_keysets.insert(info.unit.clone(), id);
-            }
-            keysets.insert(id, (info, keyset));
-        }
+        let regular_infos = self.localstore.get_keyset_infos().await?;
 
         #[cfg(feature = "conditional-tokens")]
-        {
-            for info in self
-                .localstore
-                .get_all_conditional_mint_keyset_infos()
-                .await?
-            {
-                let id = info.id;
-                let keyset = self.generate_keyset(&info);
-                // Conditional keysets are NOT registered in active_keysets — that map
-                // still has "one primary per unit" semantics so that wallets binding
-                // via /v1/keys find the real collateral keyset, not a CTF keyset.
-                keysets.insert(id, (info, keyset));
-            }
-        }
+        let conditional_infos = self
+            .localstore
+            .get_all_conditional_mint_keyset_infos()
+            .await?;
+
+        #[cfg(all(test, feature = "conditional-tokens"))]
+        self.pause_reload_after_database_read().await;
+
+        let secp_ctx = self.secp_ctx.clone();
+        let xpriv = self.xpriv;
+        let (replacement_keysets, replacement_active_keysets) =
+            tokio::task::spawn_blocking(move || {
+                let mut keysets = HashMap::new();
+                let mut active_keysets = HashMap::new();
+                for mut info in regular_infos {
+                    let id = info.id;
+                    info.active = db_active_keysets.get(&info.unit) == Some(&id);
+                    let keyset = MintKeySet::generate_from_xpriv(
+                        &secp_ctx,
+                        xpriv,
+                        &info.amounts,
+                        info.unit.clone(),
+                        info.derivation_path.clone(),
+                        info.input_fee_ppk,
+                        info.final_expiry,
+                        info.id.get_version(),
+                    );
+                    let public = (&info, &keyset).into();
+                    validate_keyset_info_binding(&info, &public)?;
+                    if info.active {
+                        active_keysets.insert(info.unit.clone(), id);
+                    }
+                    keysets.insert(id, (info, keyset));
+                }
+
+                #[cfg(feature = "conditional-tokens")]
+                for info in conditional_infos {
+                    let keyset = MintKeySet::generate_from_xpriv(
+                        &secp_ctx,
+                        xpriv,
+                        &info.amounts,
+                        info.unit.clone(),
+                        info.derivation_path.clone(),
+                        info.input_fee_ppk,
+                        info.final_expiry,
+                        info.id.get_version(),
+                    );
+                    let public = (&info, &keyset).into();
+                    validate_keyset_info_binding(&info, &public)?;
+                    // Conditional keysets are NOT registered in active_keysets — that map
+                    // still has "one primary per unit" semantics so that wallets binding
+                    // via /v1/keys find the real collateral keyset, not a CTF keyset.
+                    let id = info.id;
+                    keysets.insert(id, (info, keyset));
+                }
+
+                Ok::<_, Error>((keysets, active_keysets))
+            })
+            .await
+            .map_err(|error| Error::Custom(format!("keyset reload task failed: {error}")))??;
+
+        // Keep signing reads on the old complete maps throughout database I/O
+        // and key derivation. Both replacements are published under short
+        // write locks, so readers never observe a cleared or partial map.
+        let mut keysets = self.keysets.write().await;
+        let mut active_keysets = self.active_keysets.write().await;
+        *keysets = replacement_keysets;
+        *active_keysets = replacement_active_keysets;
 
         Ok(())
     }
 
-    fn generate_keyset(&self, keyset_info: &MintKeySetInfo) -> MintKeySet {
-        MintKeySet::generate_from_xpriv(
-            &self.secp_ctx,
-            self.xpriv,
-            &keyset_info.amounts,
-            keyset_info.unit.clone(),
-            keyset_info.derivation_path.clone(),
-            keyset_info.input_fee_ppk,
-            keyset_info.final_expiry,
-            keyset_info.id.get_version(),
-        )
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    async fn pause_next_reload(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.test_hooks.reload_pause.lock().await = Some(ReloadPause {
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    async fn pause_reload_after_database_read(&self) {
+        if let Some(pause) = self.test_hooks.reload_pause.lock().await.take() {
+            let _ = pause.reached.send(());
+            let _ = pause.release.await;
+        }
+    }
+
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    fn pause_first_rotation_after_commit(&self) {
+        self.test_hooks
+            .pause_first_rotation_after_commit
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    async fn after_rotation_commit(&self) {
+        let commit_number = self
+            .test_hooks
+            .rotation_commit_count
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        self.test_hooks.rotation_commit_notify.notify_waiters();
+        if commit_number == 1
+            && self
+                .test_hooks
+                .pause_first_rotation_after_commit
+                .load(Ordering::SeqCst)
+        {
+            self.test_hooks.rotation_release.notified().await;
+        }
+    }
+
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    async fn wait_for_rotation_commits(&self, expected: usize) {
+        loop {
+            let notified = self.test_hooks.rotation_commit_notify.notified();
+            if self.test_hooks.rotation_commit_count.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -211,9 +330,9 @@ impl Signatory for DbSignatory {
     /// Generate new keyset
     #[tracing::instrument(skip(self))]
     async fn rotate_keyset(&self, args: RotateKeyArguments) -> Result<SignatoryKeySet, Error> {
-        let (path_index, amounts) = if let Some(current_keyset_id) =
-            self.localstore.get_active_keyset_id(&args.unit).await?
-        {
+        let _mutation_guard = self.keyset_mutation_lock.lock().await;
+        let current_keyset_id = self.localstore.get_active_keyset_id(&args.unit).await?;
+        let (path_index, amounts) = if let Some(current_keyset_id) = current_keyset_id {
             let keyset_info = self
                 .localstore
                 .get_keyset_info(&current_keyset_id)
@@ -255,18 +374,39 @@ impl Signatory for DbSignatory {
             args.keyset_id_type,
         );
 
-        let keysets = self.keysets().await?;
-        check_unit_string_collision(keysets.keysets, &info)?;
+        {
+            let keysets = self.keysets.read().await;
+            check_unit_string_collision_for_units(
+                keysets.values().map(|(info, _)| info.unit.clone()),
+                &info,
+            )?;
+        }
 
         let id = info.id;
+        let unit = args.unit;
         let mut tx = self.localstore.begin_transaction().await?;
         tx.add_keyset_info(info.clone()).await?;
-        tx.set_active_keyset(args.unit, id).await?;
+        tx.set_active_keyset(unit.clone(), id).await?;
         tx.commit().await?;
 
-        self.reload_keys_from_db().await?;
+        #[cfg(all(test, feature = "conditional-tokens"))]
+        self.after_rotation_commit().await;
 
-        Ok((&(info, keyset)).into())
+        // Publish only the changed regular keysets. Conditional keysets can
+        // number in the thousands and are unrelated to this unit rotation.
+        let public = (&(info.clone(), keyset.clone())).into();
+        let mut keysets = self.keysets.write().await;
+        if let Some(previous_id) = current_keyset_id {
+            if previous_id != id {
+                if let Some((previous_info, _)) = keysets.get_mut(&previous_id) {
+                    previous_info.active = false;
+                }
+            }
+        }
+        keysets.insert(id, (info, keyset));
+        self.active_keysets.write().await.insert(unit, id);
+
+        Ok(public)
     }
 
     #[cfg(feature = "conditional-tokens")]
@@ -305,6 +445,114 @@ impl Signatory for DbSignatory {
     }
 
     #[cfg(feature = "conditional-tokens")]
+    #[tracing::instrument(skip_all, fields(keyset_count = keysets.len()))]
+    async fn install_conditional_keysets(
+        &self,
+        keysets: Vec<MintKeySetInfo>,
+    ) -> Result<Vec<SignatoryKeySet>, Error> {
+        let _mutation_guard = self.keyset_mutation_lock.lock().await;
+        let mut missing_by_id = HashMap::<Id, MintKeySetInfo>::new();
+        {
+            let in_memory = self.keysets.read().await;
+            for info in &keysets {
+                match in_memory.get(&info.id) {
+                    Some((existing, _)) if existing != info => {
+                        return Err(Error::Custom(format!(
+                            "Conflicting conditional keyset metadata for id {}",
+                            info.id
+                        )));
+                    }
+                    Some(_) => {}
+                    None => match missing_by_id.get(&info.id) {
+                        Some(existing) if existing != info => {
+                            return Err(Error::Custom(format!(
+                                "Conflicting conditional keyset metadata for id {}",
+                                info.id
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            missing_by_id.insert(info.id, info.clone());
+                        }
+                    },
+                }
+            }
+        }
+
+        let missing = missing_by_id.into_values().collect::<Vec<_>>();
+        let secp_ctx = self.secp_ctx.clone();
+        let xpriv = self.xpriv;
+        #[cfg(test)]
+        self.conditional_derivation_count
+            .fetch_add(missing.len(), Ordering::SeqCst);
+        let prepared = if missing.is_empty() {
+            Vec::new()
+        } else {
+            tokio::task::spawn_blocking(move || {
+                missing
+                    .into_iter()
+                    .map(|info| {
+                        let private = MintKeySet::generate_from_xpriv(
+                            &secp_ctx,
+                            xpriv,
+                            &info.amounts,
+                            info.unit.clone(),
+                            info.derivation_path.clone(),
+                            info.input_fee_ppk,
+                            info.final_expiry,
+                            info.id.get_version(),
+                        );
+                        let public = (&info, &private).into();
+                        validate_keyset_info_binding(&info, &public)?;
+                        Ok((info.id, info, private))
+                    })
+                    .collect::<Result<Vec<(Id, MintKeySetInfo, MintKeySet)>, Error>>()
+            })
+            .await
+            .map_err(|error| {
+                Error::Custom(format!("conditional key derivation task failed: {error}"))
+            })??
+        };
+
+        {
+            let mut in_memory = self.keysets.write().await;
+            for (id, info, _) in &prepared {
+                if in_memory
+                    .get(id)
+                    .is_some_and(|(existing, _)| existing != info)
+                {
+                    return Err(Error::Custom(format!(
+                        "Conflicting conditional keyset metadata for id {id}"
+                    )));
+                }
+            }
+            for (id, info, private) in prepared {
+                in_memory.entry(id).or_insert((info, private));
+            }
+        }
+
+        let in_memory = self.keysets.read().await;
+        keysets
+            .into_iter()
+            .map(|requested| {
+                let (installed, private) = in_memory.get(&requested.id).ok_or_else(|| {
+                    Error::Custom(format!(
+                        "Conditional keyset {} was not installed",
+                        requested.id
+                    ))
+                })?;
+                if installed != &requested {
+                    return Err(Error::Custom(format!(
+                        "Conflicting conditional keyset metadata for id {}",
+                        requested.id
+                    )));
+                }
+                Ok((installed, private).into())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
     async fn reload_keysets_from_storage(&self) -> Result<(), Error> {
         self.reload_keys_from_db().await
     }
@@ -312,14 +560,545 @@ impl Signatory for DbSignatory {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::collections::HashSet;
+    #[cfg(feature = "conditional-tokens")]
+    use std::sync::Arc;
 
     use bitcoin::key::Secp256k1;
     use bitcoin::Network;
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::database::mint::{ConditionsDatabase, KeysDatabase};
     use cdk_common::util::hex;
     use cdk_common::{Amount, MintKeySet, PublicKey};
 
     use super::*;
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn incremental_install_handles_representative_two_thousand_keyset_batch() {
+        const KEYSET_COUNT: usize = 2_000;
+
+        let database = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("mint database should open"),
+        );
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (0, vec![1]));
+        let signatory = Arc::new(
+            DbSignatory::new(database, &[0x42; 64], supported_units, HashMap::new())
+                .await
+                .expect("signatory should initialize"),
+        );
+
+        let mut infos = Vec::with_capacity(KEYSET_COUNT);
+        for index in 0..KEYSET_COUNT {
+            let prepared = signatory
+                .prepare_conditional_keyset(
+                    CurrencyUnit::Sat,
+                    &"11".repeat(32),
+                    &format!("OUTCOME-{index}"),
+                    &format!("{index:064x}"),
+                    vec![1],
+                    0,
+                    None,
+                )
+                .await
+                .expect("conditional keyset should prepare");
+            infos.push(prepared.info);
+        }
+        let existing_count = signatory
+            .keysets()
+            .await
+            .expect("existing keysets should read")
+            .keysets
+            .len();
+
+        let started = std::time::Instant::now();
+        let installing = {
+            let signatory = signatory.clone();
+            tokio::spawn(async move { signatory.install_conditional_keysets(infos).await })
+        };
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), signatory.keysets())
+            .await
+            .expect("public keyset reads should not wait on batch derivation")
+            .expect("public keysets should remain readable");
+        let installed = installing
+            .await
+            .expect("install task should join")
+            .expect("prepared keysets should install");
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "incrementally installed {KEYSET_COUNT} conditional keysets in {} ms",
+            elapsed.as_millis()
+        );
+        assert_eq!(installed.len(), KEYSET_COUNT);
+        assert!(observed.keysets.len() >= existing_count);
+        assert_eq!(
+            signatory
+                .keysets()
+                .await
+                .expect("installed keysets should read")
+                .keysets
+                .len(),
+            KEYSET_COUNT + existing_count,
+            "existing and newly installed conditional keysets should remain available"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "representative incremental install exceeded its local test budget: {elapsed:?}"
+        );
+
+        let before_rotation = signatory
+            .keysets()
+            .await
+            .expect("keysets before rotation should read");
+        let rotation_started = std::time::Instant::now();
+        signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version01,
+                final_expiry: None,
+            })
+            .await
+            .expect("regular keyset should rotate incrementally");
+        let after_rotation = signatory
+            .keysets()
+            .await
+            .expect("keysets after rotation should read");
+        assert_eq!(
+            after_rotation.keysets.len(),
+            before_rotation.keysets.len() + 1
+        );
+        assert_eq!(
+            after_rotation
+                .keysets
+                .iter()
+                .filter(|keyset| keyset.condition_id.is_some())
+                .count(),
+            KEYSET_COUNT,
+            "regular rotation must preserve every installed conditional keyset"
+        );
+        assert!(
+            rotation_started.elapsed() < std::time::Duration::from_secs(1),
+            "regular rotation should not rederive the representative conditional catalogue"
+        );
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_reload_keeps_existing_keysets_available_until_atomic_replacement() {
+        let database = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("mint database should open"),
+        );
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (0, vec![1]));
+        let signatory = Arc::new(
+            DbSignatory::new(
+                database.clone(),
+                &[0x44; 64],
+                supported_units,
+                HashMap::new(),
+            )
+            .await
+            .expect("signatory should initialize"),
+        );
+        let old_id = signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version01,
+                final_expiry: None,
+            })
+            .await
+            .expect("initial SAT keyset should rotate")
+            .id;
+        let derivation_path = derivation_path_from_unit(CurrencyUnit::Sat, 2)
+            .expect("second SAT derivation path should exist");
+        let (_, replacement_info) = create_new_keyset(
+            &signatory.secp_ctx,
+            signatory.xpriv,
+            derivation_path,
+            Some(2),
+            CurrencyUnit::Sat,
+            &[1],
+            0,
+            None,
+            cdk_common::nut02::KeySetVersion::Version01,
+        );
+        let replacement_id = replacement_info.id;
+        let mut tx = database
+            .begin_transaction()
+            .await
+            .expect("keyset transaction should start");
+        tx.add_keyset_info(replacement_info)
+            .await
+            .expect("replacement keyset should persist");
+        tx.set_active_keyset(CurrencyUnit::Sat, replacement_id)
+            .await
+            .expect("replacement keyset should become authoritative");
+        tx.commit().await.expect("replacement keyset should commit");
+
+        let (reload_reached, reload_release) = signatory.pause_next_reload().await;
+        let reloading = {
+            let signatory = signatory.clone();
+            tokio::spawn(async move { signatory.reload_keysets_from_storage().await })
+        };
+        reload_reached
+            .await
+            .expect("reload should pause after its database read");
+
+        let blinded_secret = PublicKey::from_hex(
+            "024aebe0f8be04b1ba1d7d6b7fe454c9ae43e0fa22b2fdc88b172f3c5a0d19aaa4",
+        )
+        .expect("public key should parse");
+        let signing = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            signatory.blind_sign(vec![BlindedMessage::new(
+                Amount::from(1_u64),
+                old_id,
+                blinded_secret,
+            )]),
+        )
+        .await;
+        reload_release
+            .send(())
+            .expect("blocked reload should still be waiting");
+        reloading
+            .await
+            .expect("reload task should join")
+            .expect("reload should complete");
+        assert_eq!(
+            signing
+                .expect("blind signing must not wait for database fetch or key derivation")
+                .expect("the previously active keyset must remain signable")
+                .len(),
+            1
+        );
+
+        let active_keysets = signatory.active_keysets.read().await;
+        let keysets = signatory.keysets.read().await;
+        assert_eq!(
+            active_keysets.get(&CurrencyUnit::Sat),
+            Some(&replacement_id)
+        );
+        assert!(keysets
+            .get(&replacement_id)
+            .is_some_and(|(info, _)| info.active));
+        assert!(keysets.get(&old_id).is_some_and(|(info, _)| !info.active));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_regular_rotations_publish_latest_authoritative_commit() {
+        let database = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("mint database should open"),
+        );
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (0, vec![1]));
+        let signatory = Arc::new(
+            DbSignatory::new(
+                database.clone(),
+                &[0x45; 64],
+                supported_units,
+                HashMap::new(),
+            )
+            .await
+            .expect("signatory should initialize"),
+        );
+        signatory.pause_first_rotation_after_commit();
+        let first = {
+            let signatory = signatory.clone();
+            tokio::spawn(async move {
+                signatory
+                    .rotate_keyset(RotateKeyArguments {
+                        unit: CurrencyUnit::Sat,
+                        amounts: vec![1],
+                        input_fee_ppk: 1,
+                        keyset_id_type: cdk_common::nut02::KeySetVersion::Version01,
+                        final_expiry: None,
+                    })
+                    .await
+            })
+        };
+        signatory.wait_for_rotation_commits(1).await;
+        let second = {
+            let signatory = signatory.clone();
+            tokio::spawn(async move {
+                signatory
+                    .rotate_keyset(RotateKeyArguments {
+                        unit: CurrencyUnit::Sat,
+                        amounts: vec![1],
+                        input_fee_ppk: 2,
+                        keyset_id_type: cdk_common::nut02::KeySetVersion::Version01,
+                        final_expiry: None,
+                    })
+                    .await
+            })
+        };
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            signatory.wait_for_rotation_commits(2),
+        )
+        .await;
+        signatory.test_hooks.rotation_release.notify_waiters();
+        let first = first
+            .await
+            .expect("first rotation task should join")
+            .expect("first rotation should succeed");
+        let second = second
+            .await
+            .expect("second rotation task should join")
+            .expect("second rotation should succeed");
+        assert_ne!(first.id, second.id);
+
+        assert_eq!(
+            database
+                .get_active_keyset_id(&CurrencyUnit::Sat)
+                .await
+                .expect("database active keyset should load"),
+            Some(second.id),
+            "database authority must retain the latest committed rotation"
+        );
+        assert_eq!(
+            signatory
+                .active_keysets
+                .read()
+                .await
+                .get(&CurrencyUnit::Sat),
+            Some(&second.id),
+            "in-memory active map must match the latest commit"
+        );
+        let keysets = signatory.keysets.read().await;
+        assert!(keysets.get(&second.id).is_some_and(|(info, _)| info.active));
+        assert!(keysets.get(&first.id).is_some_and(|(info, _)| !info.active));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn reload_rejects_conditional_id_derived_by_a_different_seed_without_map_mutation() {
+        let database = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("mint database should open"),
+        );
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (0, vec![1]));
+        let signatory = DbSignatory::new(
+            database.clone(),
+            &[0x46; 64],
+            supported_units.clone(),
+            HashMap::new(),
+        )
+        .await
+        .expect("signatory should initialize");
+        signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version01,
+                final_expiry: None,
+            })
+            .await
+            .expect("regular keyset should initialize the live map");
+        let before_keysets = signatory.keysets.read().await.clone();
+        let before_active = signatory.active_keysets.read().await.clone();
+
+        let foreign_database = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("foreign database should open"),
+        );
+        let foreign = DbSignatory::new(
+            foreign_database,
+            &[0x47; 64],
+            supported_units,
+            HashMap::new(),
+        )
+        .await
+        .expect("foreign signatory should initialize");
+        let condition_id = "46".repeat(32);
+        let foreign_info = foreign
+            .prepare_conditional_keyset(
+                CurrencyUnit::Sat,
+                &condition_id,
+                "YES",
+                &"47".repeat(32),
+                vec![1],
+                0,
+                None,
+            )
+            .await
+            .expect("foreign conditional keyset should prepare")
+            .info;
+        database
+            .add_condition(cdk_common::mint::StoredCondition {
+                condition_id,
+                threshold: 1,
+                tags_json: "[]".to_string(),
+                announcements_json: "[]".to_string(),
+                collateral: Some(CurrencyUnit::Sat),
+                attestation_status: "pending".to_string(),
+                winning_outcome: None,
+                attested_at: None,
+                created_at: 1_000,
+                condition_type: "enum".to_string(),
+                lo_bound: None,
+                hi_bound: None,
+                precision: None,
+            })
+            .await
+            .expect("condition should persist for corruption test");
+        database
+            .add_conditional_keyset(foreign_info, 1_000)
+            .await
+            .expect("foreign metadata should persist for corruption test");
+
+        signatory
+            .reload_keysets_from_storage()
+            .await
+            .expect_err("reload must reject keys that do not derive to the persisted ID");
+        assert_eq!(*signatory.keysets.read().await, before_keysets);
+        assert_eq!(*signatory.active_keysets.read().await, before_active);
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn install_rejects_corrupt_conditional_binding_without_map_mutation() {
+        let database = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("mint database should open"),
+        );
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (0, vec![1]));
+        let signatory = DbSignatory::new(database, &[0x48; 64], supported_units, HashMap::new())
+            .await
+            .expect("signatory should initialize");
+        let mut corrupt = signatory
+            .prepare_conditional_keyset(
+                CurrencyUnit::Sat,
+                &"48".repeat(32),
+                "YES",
+                &"49".repeat(32),
+                vec![1],
+                0,
+                None,
+            )
+            .await
+            .expect("conditional keyset should prepare")
+            .info;
+        corrupt.outcome_collection_id = Some("50".repeat(32));
+        let before_keysets = signatory.keysets.read().await.clone();
+        let before_active = signatory.active_keysets.read().await.clone();
+
+        signatory
+            .install_conditional_keysets(vec![corrupt])
+            .await
+            .expect_err("install must reject corrupt conditional metadata binding");
+        assert_eq!(*signatory.keysets.read().await, before_keysets);
+        assert_eq!(*signatory.active_keysets.read().await, before_active);
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_and_concurrent_install_derives_each_missing_keyset_once() {
+        const CONCURRENT_RETRIES: usize = 8;
+
+        let database = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("mint database should open"),
+        );
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (0, vec![1]));
+        let signatory = Arc::new(
+            DbSignatory::new(database, &[0x43; 64], supported_units, HashMap::new())
+                .await
+                .expect("signatory should initialize"),
+        );
+        let info = signatory
+            .prepare_conditional_keyset(
+                CurrencyUnit::Sat,
+                &"12".repeat(32),
+                "YES",
+                &"13".repeat(32),
+                vec![1],
+                0,
+                None,
+            )
+            .await
+            .expect("conditional keyset should prepare")
+            .info;
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_RETRIES + 1));
+        let mut retries = Vec::new();
+        for _ in 0..CONCURRENT_RETRIES {
+            let signatory = signatory.clone();
+            let info = info.clone();
+            let barrier = barrier.clone();
+            retries.push(tokio::spawn(async move {
+                barrier.wait().await;
+                signatory.install_conditional_keysets(vec![info]).await
+            }));
+        }
+        barrier.wait().await;
+
+        for retry in retries {
+            let installed = retry
+                .await
+                .expect("concurrent retry should join")
+                .expect("concurrent retry should reconcile");
+            assert_eq!(installed.len(), 1);
+            assert_eq!(installed[0].id, info.id);
+        }
+        assert_eq!(
+            signatory
+                .conditional_derivation_count
+                .load(Ordering::SeqCst),
+            1,
+            "concurrent retries must coalesce the one necessary derivation"
+        );
+
+        let replayed = signatory
+            .install_conditional_keysets(vec![info.clone()])
+            .await
+            .expect("healthy replay should return the existing public keyset");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].id, info.id);
+        assert_eq!(
+            signatory
+                .conditional_derivation_count
+                .load(Ordering::SeqCst),
+            1,
+            "healthy replay must not schedule free key derivation work"
+        );
+
+        let mut conflicting = info;
+        conflicting.input_fee_ppk = 1;
+        let error = signatory
+            .install_conditional_keysets(vec![conflicting])
+            .await
+            .expect_err("immutable metadata conflict must fail before derivation");
+        assert!(error.to_string().contains("Conflicting conditional keyset"));
+        assert_eq!(
+            signatory
+                .conditional_derivation_count
+                .load(Ordering::SeqCst),
+            1,
+            "metadata conflicts must not schedule derivation work"
+        );
+    }
 
     #[test]
     fn mint_mod_generate_keyset_from_seed() {

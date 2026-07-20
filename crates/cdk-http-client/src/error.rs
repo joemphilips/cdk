@@ -19,6 +19,12 @@ pub enum HttpError {
     /// Request timeout
     #[error("Request timeout")]
     Timeout,
+    /// Response body exceeded a caller-defined byte limit.
+    #[error("Response body exceeded {limit} bytes")]
+    ResponseBodyTooLarge {
+        /// Maximum accepted response bytes.
+        limit: usize,
+    },
     /// Serialization error
     #[error("Serialization error: {0}")]
     Serialization(String),

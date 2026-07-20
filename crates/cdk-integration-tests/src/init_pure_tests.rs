@@ -358,6 +358,28 @@ impl MintConnector for DirectMintConnection {
     }
 
     #[cfg(feature = "conditional-tokens")]
+    async fn get_conditional_keysets_page(
+        &self,
+        request: cdk::nuts::nut_ctf::GetConditionalKeysetsRequest,
+    ) -> Result<cdk::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
+        cdk::wallet::validate_conditional_keyset_catalogue_request(
+            &request,
+            cdk::wallet::MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+        )?;
+        let validation_request = request.clone();
+        let mut response = self
+            .mint
+            .get_conditional_keysets_catalogue_page(request)
+            .await?;
+        cdk::wallet::validate_conditional_keyset_catalogue_response(
+            &validation_request,
+            &mut response,
+            cdk::wallet::MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE,
+        )?;
+        Ok(response)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
     async fn post_ctf_convert(
         &self,
         _request: cdk::nuts::nut_ctf::CtfConvertRequest,

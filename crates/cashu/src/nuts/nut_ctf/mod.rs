@@ -410,7 +410,7 @@ pub struct OracleWitness {
 }
 
 /// Conditional keyset info (extends KeySetInfo for conditional keyset discovery)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionalKeySetInfo {
     /// Keyset ID
     pub id: Id,
@@ -436,6 +436,11 @@ pub struct ConditionalKeySetInfo {
 /// GET /v1/conditional_keysets query parameters
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GetConditionalKeysetsRequest {
+    /// Catalogue protocol version requested by a capability-aware client.
+    ///
+    /// Omitted requests use the legacy raw-listing contract.
+    #[serde(default, rename = "catalogue", skip_serializing_if = "Option::is_none")]
+    pub catalogue_version: Option<u8>,
     /// Unix timestamp; only return keysets registered at or after this time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
@@ -445,6 +450,9 @@ pub struct GetConditionalKeysetsRequest {
     /// Filter by active status
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<bool>,
+    /// Opaque mint-authenticated continuation cursor returned by the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// GET /v1/conditional_keysets response
@@ -452,6 +460,26 @@ pub struct GetConditionalKeysetsRequest {
 pub struct ConditionalKeysetsResponse {
     /// Array of conditional keyset info
     pub keysets: Vec<ConditionalKeySetInfo>,
+    /// Opaque mint-authenticated cursor for the next immutable-snapshot page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Whether this response exhausts the immutable catalogue snapshot.
+    ///
+    /// Missing values from legacy mints decode as `false`; recovery clients
+    /// must require the advertised catalogue capability before treating a scan
+    /// as complete.
+    #[serde(default)]
+    pub complete: bool,
+}
+
+/// Mint-info capability for bounded conditional-keyset catalogue scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+pub struct ConditionalKeysetCatalogueSettings {
+    /// Signed-cursor protocol version.
+    pub version: u8,
+    /// Maximum number of keysets returned per page.
+    pub max_page_size: u64,
 }
 
 /// Per-unit condition registration fee settings.
@@ -486,6 +514,9 @@ pub struct NutCtfSettings {
     /// Per-unit condition registration fee settings.
     #[serde(default)]
     pub registration_fees: Vec<RegistrationFeeSetting>,
+    /// Bounded, mint-authenticated conditional-keyset catalogue capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_keyset_catalogue: Option<ConditionalKeysetCatalogueSettings>,
 }
 
 fn default_keyset_creation() -> String {
@@ -500,6 +531,7 @@ impl Default for NutCtfSettings {
             vesting_period: Some(2592000), // 30 days
             default_keyset_creation: default_keyset_creation(),
             registration_fees: Vec::new(),
+            conditional_keyset_catalogue: None,
         }
     }
 }
@@ -972,6 +1004,7 @@ mod tests {
         assert!(settings.vesting_period.is_some());
         assert_eq!(settings.default_keyset_creation, "none");
         assert!(settings.registration_fees.is_empty());
+        assert!(settings.conditional_keyset_catalogue.is_none());
     }
 
     #[test]
@@ -986,11 +1019,34 @@ mod tests {
                 registration_fee_base: 10000,
                 registration_fee_per_keyset: 10000,
             }],
+            conditional_keyset_catalogue: Some(ConditionalKeysetCatalogueSettings {
+                version: 1,
+                max_page_size: 100,
+            }),
         };
         let json = serde_json::to_string(&settings).expect("serialize");
         assert!(!json.contains("vesting_period"));
         let deser: NutCtfSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(settings, deser);
+    }
+
+    #[test]
+    fn legacy_ctf_settings_decode_without_catalogue_capability() {
+        let settings: NutCtfSettings = serde_json::from_str(
+            r#"{"supported":true,"dlc_version":"0","default_keyset_creation":"none"}"#,
+        )
+        .expect("legacy settings should decode");
+
+        assert!(settings.conditional_keyset_catalogue.is_none());
+    }
+
+    #[test]
+    fn legacy_conditional_keyset_response_is_conservatively_incomplete() {
+        let response: ConditionalKeysetsResponse =
+            serde_json::from_str(r#"{"keysets":[]}"#).expect("legacy response should decode");
+
+        assert!(!response.complete);
+        assert!(response.next_cursor.is_none());
     }
 
     #[test]

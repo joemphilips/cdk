@@ -16,7 +16,13 @@ wallet = ["dep:futures", "cdk-common/wallet", "cdk-common/http", "dep:rustls"]
 nostr = ["wallet", "dep:nostr-sdk", "cdk-common/nostr"]
 npubcash = ["wallet", "nostr", "dep:cdk-npubcash"]
 mint = ["dep:futures", "cdk-common/mint", "cdk-common/http", "cdk-signatory"]
-conditional-tokens = ["cdk-common/conditional-tokens", "cdk-signatory/conditional-tokens"]
+conditional-tokens = [
+    "cdk-common/conditional-tokens",
+    "cdk-signatory/conditional-tokens",
+    "dep:base64",
+    "dep:sha2",
+    "dep:subtle",
+]
 test-utils = ["cdk-common/test-utils", "conditional-tokens"]
 bip353 = ["dep:hickory-resolver", "cdk-common/bip353"]
 # We do not commit to a MSRV with swagger enabled
@@ -57,7 +63,9 @@ futures = { workspace = true, optional = true, features = ["alloc"] }
 url.workspace = true
 utoipa = { workspace = true, optional = true }
 uuid.workspace = true
-jsonwebtoken.workspace = true
+base64 = { version = "0.22", optional = true }
+sha2 = { version = "0.10.8", optional = true }
+subtle = { version = "2.6", optional = true }
 nostr-sdk = { workspace = true, optional = true }
 cdk-npubcash = { workspace = true, optional = true }
 cdk-prometheus = {workspace = true, optional = true}

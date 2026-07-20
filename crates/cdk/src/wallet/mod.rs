@@ -85,6 +85,13 @@ pub use cdk_common::wallet::{ReceiveOptions, SendMemo, SendOptions};
 pub use keysets::KeysetFilter;
 pub use melt::{MeltConfirmOptions, MeltOutcome, PendingMelt, PreparedMelt};
 pub use mint_connector::transport::Transport as HttpTransport;
+#[cfg(feature = "conditional-tokens")]
+pub use mint_connector::{
+    validate_conditional_keyset_catalogue_request, validate_conditional_keyset_catalogue_response,
+    CONDITIONAL_KEYSET_CATALOGUE_VERSION, MAX_CONDITIONAL_KEYSET_CATALOGUE_CURSOR_LENGTH,
+    MAX_CONDITIONAL_KEYSET_CATALOGUE_PAGE_SIZE, MAX_CONDITIONAL_KEYSET_CATALOGUE_RESPONSE_BYTES,
+    MAX_CONDITIONAL_KEYSET_OUTCOME_COLLECTION_LENGTH, MAX_CONDITIONAL_KEYSET_UNIT_LENGTH,
+};
 pub use mint_connector::{
     AuthHttpClient, HttpClient, LnurlPayInvoiceResponse, LnurlPayResponse, MintConnector,
 };

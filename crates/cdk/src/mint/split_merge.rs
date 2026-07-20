@@ -162,6 +162,9 @@ impl Mint {
         Ok(CtfConvertResponse { signatures })
     }
 
+    // The paired canonical IDs are passed explicitly to avoid reparsing or
+    // silently mixing user-provided and validated identifiers.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_input_entry(
         &self,
         key: &str,
@@ -214,6 +217,9 @@ impl Mint {
         })
     }
 
+    // Keep the input/output validation signatures symmetric; each identifier
+    // and its decoded bytes have distinct validation roles.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_output_entry(
         &self,
         key: &str,
