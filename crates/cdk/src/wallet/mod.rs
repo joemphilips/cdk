@@ -466,7 +466,7 @@ impl Wallet {
         fee_and_amounts: &FeeAndAmounts,
     ) -> Result<Vec<Amount>, Error> {
         let unspent_proofs = self
-            .get_proofs_with(Some(vec![State::Unspent]), None)
+            .get_ordinary_proofs_with(Some(vec![State::Unspent]), None)
             .await?;
 
         let amounts_count: HashMap<u64, u64> =
@@ -795,6 +795,46 @@ mod tests {
     use super::*;
     use crate::nuts::{BlindSignature, BlindedMessage, PreMint, PreMintSecrets};
     use crate::secret::Secret;
+    #[cfg(feature = "conditional-tokens")]
+    use crate::wallet::test_utils::{
+        add_conditional_test_proof, create_test_db, create_test_wallet, test_keyset_id,
+        test_mint_url, test_proof_info,
+    };
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn change_refill_inventory_does_not_count_conditional_proofs() {
+        let db = create_test_db().await;
+        let conditional = add_conditional_test_proof(&db).await;
+        let ordinary = test_proof_info(test_keyset_id(), 1, test_mint_url());
+        db.update_proofs(vec![ordinary], vec![])
+            .await
+            .expect("ordinary proof should persist");
+        let wallet = create_test_wallet(db).await;
+        let fee_and_amounts = FeeAndAmounts::from((0, vec![1, 2]));
+
+        let mut needed = wallet
+            .amounts_needed_for_state_target(&fee_and_amounts)
+            .await
+            .expect("refill inventory should load");
+        needed.sort();
+
+        assert_eq!(
+            needed,
+            vec![
+                Amount::from(1),
+                Amount::from(1),
+                Amount::from(2),
+                Amount::from(2),
+                Amount::from(2),
+            ]
+        );
+        assert!(wallet
+            .get_unspent_proofs()
+            .await
+            .expect("inclusive listing should succeed")
+            .contains(&conditional.proof));
+    }
 
     /// Test that restore signature matching works correctly when response is in order
     #[test]

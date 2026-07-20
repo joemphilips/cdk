@@ -13,6 +13,40 @@ use crate::nuts::{
 use crate::{ensure_cdk, Amount, Error, Wallet};
 
 impl Wallet {
+    /// Load proofs eligible for automatic ordinary wallet selection.
+    ///
+    /// Conditional proofs remain available through the explicit proof-listing
+    /// APIs, but are excluded from implicit send/melt/refill inventory paths.
+    #[cfg(feature = "conditional-tokens")]
+    pub(crate) async fn get_ordinary_proofs_with(
+        &self,
+        state: Option<Vec<State>>,
+        spending_conditions: Option<Vec<SpendingConditions>>,
+    ) -> Result<Proofs, Error> {
+        Ok(self
+            .localstore
+            .get_ordinary_proofs(
+                self.mint_url.clone(),
+                self.unit.clone(),
+                state,
+                spending_conditions,
+            )
+            .await?
+            .into_iter()
+            .map(|proof| proof.proof)
+            .collect())
+    }
+
+    /// Load proofs eligible for automatic ordinary wallet selection.
+    #[cfg(not(feature = "conditional-tokens"))]
+    pub(crate) async fn get_ordinary_proofs_with(
+        &self,
+        state: Option<Vec<State>>,
+        spending_conditions: Option<Vec<SpendingConditions>>,
+    ) -> Result<Proofs, Error> {
+        self.get_proofs_with(state, spending_conditions).await
+    }
+
     /// Get unspent proofs for mint
     #[instrument(skip(self))]
     pub async fn get_unspent_proofs(&self) -> Result<Proofs, Error> {
@@ -539,10 +573,19 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    #[cfg(feature = "conditional-tokens")]
+    use std::sync::Arc;
 
     use cdk_common::secret::Secret;
     use cdk_common::{Amount, Id, Proof, PublicKey};
 
+    #[cfg(feature = "conditional-tokens")]
+    use crate::nuts::State;
+    #[cfg(feature = "conditional-tokens")]
+    use crate::wallet::test_utils::{
+        add_conditional_test_proof, create_test_db, create_test_wallet_with_mock, test_keyset_id,
+        test_mint_url, test_proof_info, MockMintConnector,
+    };
     use crate::Wallet;
 
     fn id() -> Id {
@@ -559,6 +602,35 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn ordinary_inventory_excludes_conditional_proofs_but_listing_includes_them() {
+        let db = create_test_db().await;
+        let conditional = add_conditional_test_proof(&db).await;
+        let ordinary = test_proof_info(test_keyset_id(), 2, test_mint_url());
+        db.update_proofs(vec![ordinary.clone()], vec![])
+            .await
+            .expect("ordinary proof should persist");
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        let wallet = create_test_wallet_with_mock(db, mock_client).await;
+
+        let listed = wallet
+            .get_unspent_proofs()
+            .await
+            .expect("inclusive proof listing should succeed");
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&ordinary.proof));
+        assert!(listed.contains(&conditional.proof));
+
+        let ordinary_only = wallet
+            .get_ordinary_proofs_with(Some(vec![State::Unspent]), None)
+            .await
+            .expect("ordinary inventory should load");
+        assert_eq!(ordinary_only, vec![ordinary.proof]);
     }
 
     #[test]

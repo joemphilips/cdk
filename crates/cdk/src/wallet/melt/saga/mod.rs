@@ -294,7 +294,10 @@ impl<'a> MeltSaga<'a, Initial> {
             .collect();
         let keyset_fees_and_amounts = self.wallet.get_keyset_fees_and_amounts().await?;
 
-        let available_proofs = self.wallet.get_unspent_proofs().await?;
+        let available_proofs = self
+            .wallet
+            .get_ordinary_proofs_with(Some(vec![State::Unspent]), None)
+            .await?;
 
         let exact_input_proofs = Wallet::select_proofs(
             inputs_needed_amount,
@@ -1172,11 +1175,88 @@ mod tests {
     use super::{finalize_melt_common, MeltSaga};
     use crate::nuts::{BlindSignature, PreMintSecrets};
     use crate::wallet::saga::new_compensations;
+    #[cfg(feature = "conditional-tokens")]
+    use crate::wallet::test_utils::add_conditional_test_proof;
     use crate::wallet::test_utils::{
         create_test_db, create_test_wallet_with_mock, test_keyset_id, test_melt_quote,
         test_mint_url, test_proof_info, MockMintConnector,
     };
     use crate::{Amount, Error};
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn automatic_melt_never_selects_conditional_proofs() {
+        let db = create_test_db().await;
+        let conditional = add_conditional_test_proof(&db).await;
+        let ordinary = test_proof_info(test_keyset_id(), 2000, test_mint_url());
+        let ordinary_y = ordinary.y;
+        db.update_proofs(vec![ordinary], vec![])
+            .await
+            .expect("ordinary proof should persist");
+
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote)
+            .await
+            .expect("melt quote should persist");
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let prepared = MeltSaga::new(&wallet)
+            .prepare(&quote_id, HashMap::new())
+            .await
+            .expect("ordinary proof should cover the melt and its input fee");
+        assert!(prepared.state_data.proofs.is_empty());
+        assert_eq!(
+            prepared.state_data.proofs_to_swap[0]
+                .y()
+                .expect("test proof Y should derive"),
+            ordinary_y
+        );
+        assert_eq!(prepared.state_data.proofs_to_swap.len(), 1);
+
+        let conditional_stored = db
+            .get_proofs_by_ys(vec![conditional.y])
+            .await
+            .expect("conditional proof should remain stored");
+        assert_eq!(conditional_stored[0].state, State::Unspent);
+        assert_eq!(conditional_stored[0].used_by_operation, None);
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn explicit_melt_proofs_can_still_use_a_conditional_proof() {
+        let db = create_test_db().await;
+        let conditional = add_conditional_test_proof(&db).await;
+        let mut quote = test_melt_quote();
+        quote.amount = Amount::from(1);
+        quote.fee_reserve = Amount::ZERO;
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote)
+            .await
+            .expect("melt quote should persist");
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let prepared = MeltSaga::new(&wallet)
+            .prepare_with_proofs(&quote_id, vec![conditional.proof.clone()], HashMap::new())
+            .await
+            .expect("explicit proof selection should preserve conditional proof usability");
+        assert_eq!(prepared.state_data.proofs, vec![conditional.proof]);
+        let stored = db
+            .get_proofs_by_ys(vec![conditional.y])
+            .await
+            .expect("conditional proof should remain stored");
+        assert_eq!(stored[0].state, State::Reserved);
+        assert_eq!(
+            stored[0].used_by_operation,
+            Some(prepared.state_data.operation_id)
+        );
+    }
 
     #[tokio::test]
     async fn test_prepare_melt_reserves_exact_input_proofs_for_operation() {

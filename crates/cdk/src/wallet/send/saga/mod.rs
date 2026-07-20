@@ -142,7 +142,7 @@ impl<'a> SendSaga<'a, Initial> {
 
         let mut available_proofs = self
             .wallet
-            .get_proofs_with(
+            .get_ordinary_proofs_with(
                 Some(vec![State::Unspent]),
                 opts.conditions.clone().map(|c| vec![c]),
             )
@@ -158,17 +158,8 @@ impl<'a> SendSaga<'a, Initial> {
                 force_swap = true;
                 available_proofs = self
                     .wallet
-                    .localstore
-                    .get_proofs(
-                        Some(self.wallet.mint_url.clone()),
-                        Some(self.wallet.unit.clone()),
-                        Some(vec![State::Unspent]),
-                        Some(vec![]),
-                    )
-                    .await?
-                    .into_iter()
-                    .map(|p| p.proof)
-                    .collect();
+                    .get_ordinary_proofs_with(Some(vec![State::Unspent]), Some(vec![]))
+                    .await?;
             }
         }
 
@@ -770,11 +761,55 @@ mod tests {
 
     use super::SendSaga;
     use crate::wallet::send::SendOptions;
+    #[cfg(feature = "conditional-tokens")]
+    use crate::wallet::test_utils::add_conditional_test_proof;
     use crate::wallet::test_utils::{
         create_test_db, create_test_wallet_with_mock, test_keyset_id, test_mint_url,
         test_proof_info, MockMintConnector,
     };
     use crate::Amount;
+    #[cfg(feature = "conditional-tokens")]
+    use crate::Error;
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn automatic_send_never_selects_conditional_proofs() {
+        let db = create_test_db().await;
+        let conditional = add_conditional_test_proof(&db).await;
+        let ordinary = test_proof_info(test_keyset_id(), 100, test_mint_url());
+        let ordinary_y = ordinary.y;
+        db.update_proofs(vec![ordinary], vec![])
+            .await
+            .expect("ordinary proof should persist");
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let result = SendSaga::new(&wallet)
+            .prepare(Amount::from(101), SendOptions::default())
+            .await;
+        assert!(matches!(result, Err(Error::InsufficientFunds)));
+
+        let prepared = SendSaga::new(&wallet)
+            .prepare(Amount::from(100), SendOptions::default())
+            .await
+            .expect("ordinary proof should remain selectable");
+        let selected_ys = prepared
+            .proofs_to_send()
+            .iter()
+            .chain(prepared.proofs_to_swap())
+            .map(|proof| proof.y().expect("test proof Y should derive"))
+            .collect::<Vec<_>>();
+        assert_eq!(selected_ys, vec![ordinary_y]);
+
+        let conditional_stored = db
+            .get_proofs_by_ys(vec![conditional.y])
+            .await
+            .expect("conditional proof should remain stored");
+        assert_eq!(conditional_stored[0].state, State::Unspent);
+        assert_eq!(conditional_stored[0].used_by_operation, None);
+    }
 
     #[tokio::test]
     async fn test_prepare_send_reserves_proofs_for_operation() {

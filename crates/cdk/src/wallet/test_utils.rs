@@ -338,6 +338,23 @@ pub fn test_proof_info(
     cdk_common::wallet::ProofInfo::new(proof, mint_url, State::Unspent, CurrencyUnit::Sat).unwrap()
 }
 
+/// Persist one valid conditional proof for automatic-selection tests.
+#[cfg(feature = "conditional-tokens")]
+pub async fn add_conditional_test_proof(
+    db: &Arc<dyn WalletDatabase<cdk_common::database::Error> + Send + Sync>,
+) -> cdk_common::wallet::ProofInfo {
+    let admission =
+        cdk_common::database::wallet::test::conditional_restore_test_admission(100, 300);
+    db.add_mint(admission.mint_url.clone(), None)
+        .await
+        .expect("test mint should persist");
+    let proof = admission.proofs[0].clone();
+    db.commit_conditional_restore(admission)
+        .await
+        .expect("conditional test proof should persist");
+    proof
+}
+
 /// Create a test melt quote
 pub fn test_melt_quote() -> MeltQuote {
     MeltQuote {
