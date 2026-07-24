@@ -132,4 +132,50 @@ pub trait MintConnector: Debug {
 
     /// Set auth wallet on client
     async fn set_auth_wallet(&self, wallet: Option<AuthWallet>);
+
+    /// Get all conditions [NUT-CTF]
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditions(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        status: &[String],
+    ) -> Result<crate::nuts::nut_ctf::GetConditionsResponse, Error>;
+
+    /// Get a specific condition [NUT-CTF]
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_condition(
+        &self,
+        condition_id: &str,
+    ) -> Result<crate::nuts::nut_ctf::ConditionInfo, Error>;
+
+    /// Register a condition [NUT-CTF]
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_register_condition(
+        &self,
+        request: crate::nuts::nut_ctf::RegisterConditionRequest,
+    ) -> Result<crate::nuts::nut_ctf::RegisterConditionResponse, Error>;
+
+    /// Get conditional keysets [NUT-CTF]
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditional_keysets(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        active: Option<bool>,
+    ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error>;
+
+    /// CTF convert [NUT-CTF-split-merge]
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_ctf_convert(
+        &self,
+        request: crate::nuts::nut_ctf::CtfConvertRequest,
+    ) -> Result<crate::nuts::nut_ctf::CtfConvertResponse, Error>;
+
+    /// Redeem outcome [NUT-CTF]
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_redeem_outcome(
+        &self,
+        request: crate::nuts::nut_ctf::RedeemOutcomeRequest,
+    ) -> Result<crate::nuts::nut_ctf::RedeemOutcomeResponse, Error>;
 }

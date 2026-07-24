@@ -27,12 +27,8 @@ use cdk::nuts::nut00::KnownMethod;
 ))]
 use cdk::nuts::nut17::SupportedMethods;
 use cdk::nuts::nut19::{CachedEndpoint, Method as NUT19Method, Path as NUT19Path};
-#[cfg(any(
-    feature = "cln",
-    feature = "lnbits",
-    feature = "lnd",
-    feature = "ldk-node"
-))]
+#[cfg(feature = "conditional-tokens")]
+use cdk::nuts::nut_ctf::RegistrationFeeSetting;
 use cdk::nuts::CurrencyUnit;
 use cdk::nuts::{
     AuthRequired, ContactInfo, Method, MintVersion, PaymentMethod, ProtectedEndpoint, RoutePath,
@@ -40,12 +36,19 @@ use cdk::nuts::{
 use cdk_axum::cache::HttpCache;
 use cdk_common::common::QuoteTTL;
 use cdk_common::database::DynMintDatabase;
+use cdk_common::Amount;
 // internal crate modules
 #[cfg(feature = "prometheus")]
 use cdk_common::payment::MetricsMintPayment;
 use cdk_common::payment::MintPayment;
+use cdk_exchange_rate::sources::{BitstampRateSource, CoinbaseRateSource, KrakenRateSource};
+use cdk_exchange_rate::{
+    AggregatingRateOracle, AggregatorConfig, DynRateQuoteStore, InMemoryRateQuoteStore,
+    MsatSatConverter, PaymentErrorAdapter, RateConvertingPayment, RateConvertingPaymentConfig,
+    RateQuoteControlHandle, RateSource, SharedMintPayment,
+};
 #[cfg(feature = "postgres")]
-use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig};
+use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig, PostgresRateQuoteStore};
 #[cfg(feature = "sqlite")]
 use cdk_sqlite::mint::MintSqliteAuthDatabase;
 #[cfg(feature = "sqlite")]
@@ -135,11 +138,11 @@ pub fn setup_tracing(
     let tungstenite = "tungstenite=warn";
     let tokio_postgres = "tokio_postgres=warn";
 
-    let env_filter = EnvFilter::new(format!(
+    let default_filters = format!(
         "{default_filter},{hyper_filter},{h2_filter},{tower_filter},{tower_http},{rustls},{tungstenite},{tokio_postgres}"
-    ));
+    );
 
-    use config::LoggingOutput;
+    use config::{LoggingFormat, LoggingOutput};
     match logging_config.output {
         LoggingOutput::Stderr => {
             // Console output only (stderr)
@@ -152,13 +155,23 @@ pub fn setup_tracing(
 
             let stderr = std::io::stderr.with_max_level(console_level);
 
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(default_filters.clone())),
+                )
                 .with_ansi(false)
-                .with_writer(stderr)
-                .init();
+                .with_writer(stderr);
+            match &logging_config.format {
+                LoggingFormat::Text => subscriber.init(),
+                LoggingFormat::Json => subscriber.json().init(),
+            }
 
-            tracing::info!("Logging initialized: console only ({}+)", console_level);
+            tracing::info!(
+                "Logging initialized: console only ({}+, {:?})",
+                console_level,
+                logging_config.format
+            );
             Ok(None)
         }
         LoggingOutput::File => {
@@ -180,16 +193,23 @@ pub fn setup_tracing(
 
             let file_writer = non_blocking_appender.with_max_level(file_level);
 
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(default_filters.clone())),
+                )
                 .with_ansi(false)
-                .with_writer(file_writer)
-                .init();
+                .with_writer(file_writer);
+            match &logging_config.format {
+                LoggingFormat::Text => subscriber.init(),
+                LoggingFormat::Json => subscriber.json().init(),
+            }
 
             tracing::info!(
-                "Logging initialized: file only at {}/cdk-mintd.log ({}+)",
+                "Logging initialized: file only at {}/cdk-mintd.log ({}+, {:?})",
                 logs_dir.display(),
-                file_level
+                file_level,
+                logging_config.format
             );
             Ok(Some(guard))
         }
@@ -220,17 +240,24 @@ pub fn setup_tracing(
             let stderr = std::io::stderr.with_max_level(console_level);
             let file_writer = non_blocking_appender.with_max_level(file_level);
 
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(default_filters)),
+                )
                 .with_ansi(false)
-                .with_writer(stderr.and(file_writer))
-                .init();
+                .with_writer(stderr.and(file_writer));
+            match &logging_config.format {
+                LoggingFormat::Text => subscriber.init(),
+                LoggingFormat::Json => subscriber.json().init(),
+            }
 
             tracing::info!(
-                "Logging initialized: console ({}+) and file at {}/cdk-mintd.log ({}+)",
+                "Logging initialized: console ({}+) and file at {}/cdk-mintd.log ({}+, {:?})",
                 console_level,
                 logs_dir.display(),
-                file_level
+                file_level,
+                logging_config.format
             );
             Ok(Some(guard))
         }
@@ -261,7 +288,7 @@ pub fn load_settings(work_dir: &Path, config_path: Option<PathBuf>) -> Result<co
     };
 
     let mut settings = if config_file_arg.exists() {
-        config::Settings::new(Some(config_file_arg))
+        config::Settings::new(Some(config_file_arg))?
     } else {
         tracing::info!("Config file does not exist. Attempting to read env vars");
         config::Settings::default()
@@ -371,12 +398,12 @@ async fn configure_mint_builder(
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     work_dir: &Path,
     kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
-) -> Result<MintBuilder> {
+) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
     // Configure basic mint information
     let mint_builder = configure_basic_info(settings, mint_builder);
 
     // Configure lightning backend
-    let mint_builder =
+    let (mint_builder, rate_quote_control) =
         configure_lightning_backend(settings, mint_builder, runtime, work_dir, kv_store).await?;
 
     // Extract configured payment methods from mint_builder
@@ -394,7 +421,10 @@ async fn configure_mint_builder(
     let mint_builder =
         mint_builder.with_limits(settings.limits.max_inputs, settings.limits.max_outputs);
 
-    Ok(mint_builder)
+    #[cfg(feature = "conditional-tokens")]
+    let mint_builder = mint_builder.with_ctf_limits(settings.limits.max_outcomes_per_condition);
+
+    Ok((mint_builder, rate_quote_control))
 }
 
 /// Configures basic mint information (name, contact info, descriptions, etc.)
@@ -464,6 +494,25 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
         }
     }
 
+    #[cfg(feature = "conditional-tokens")]
+    if let Some(policy) = &settings.mint_info.ctf_default_keyset_creation {
+        if !policy.is_empty() {
+            builder = builder.with_ctf_default_keyset_creation(policy.to_string());
+        }
+    }
+    #[cfg(feature = "conditional-tokens")]
+    if let Some(fees) = &settings.mint_info.ctf_registration_fees {
+        let fees = fees
+            .iter()
+            .map(|fee| RegistrationFeeSetting {
+                unit: fee.unit.to_string(),
+                registration_fee_base: fee.base,
+                registration_fee_per_keyset: fee.per_keyset,
+            })
+            .collect();
+        builder = builder.with_ctf_registration_fees(fees);
+    }
+
     builder = builder.with_keyset_v2(settings.info.use_keyset_v2);
 
     builder
@@ -475,7 +524,7 @@ async fn configure_lightning_backend(
     _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     work_dir: &Path,
     _kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
-) -> Result<MintBuilder> {
+) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
     let mint_melt_limits = MintMeltLimits {
         mint_min: settings.ln.min_mint,
         mint_max: settings.ln.max_mint,
@@ -484,6 +533,8 @@ async fn configure_lightning_backend(
     };
 
     tracing::debug!("Ln backend: {:?}", settings.ln.ln_backend);
+
+    let mut rate_quote_control = None;
 
     match settings.ln.ln_backend {
         #[cfg(feature = "cln")]
@@ -498,14 +549,17 @@ async fn configure_lightning_backend(
             #[cfg(feature = "prometheus")]
             let cln = MetricsMintPayment::new(cln);
 
-            mint_builder = configure_backend_for_unit(
+            let backend = Arc::new(cln);
+            let configured = configure_backend_and_rate_quoter_for_unit(
                 settings,
                 mint_builder,
                 CurrencyUnit::Sat,
                 mint_melt_limits,
-                Arc::new(cln),
+                backend,
             )
             .await?;
+            mint_builder = configured.0;
+            rate_quote_control = rate_quote_control.or(configured.1);
         }
         #[cfg(feature = "lnbits")]
         LnBackend::LNbits => {
@@ -516,14 +570,17 @@ async fn configure_lightning_backend(
             #[cfg(feature = "prometheus")]
             let lnbits = MetricsMintPayment::new(lnbits);
 
-            mint_builder = configure_backend_for_unit(
+            let backend = Arc::new(lnbits);
+            let configured = configure_backend_and_rate_quoter_for_unit(
                 settings,
                 mint_builder,
                 CurrencyUnit::Sat,
                 mint_melt_limits,
-                Arc::new(lnbits),
+                backend,
             )
             .await?;
+            mint_builder = configured.0;
+            rate_quote_control = rate_quote_control.or(configured.1);
         }
         #[cfg(feature = "lnd")]
         LnBackend::Lnd => {
@@ -534,14 +591,17 @@ async fn configure_lightning_backend(
             #[cfg(feature = "prometheus")]
             let lnd = MetricsMintPayment::new(lnd);
 
-            mint_builder = configure_backend_for_unit(
+            let backend = Arc::new(lnd);
+            let configured = configure_backend_and_rate_quoter_for_unit(
                 settings,
                 mint_builder,
                 CurrencyUnit::Sat,
                 mint_melt_limits,
-                Arc::new(lnd),
+                backend,
             )
             .await?;
+            mint_builder = configured.0;
+            rate_quote_control = rate_quote_control.or(configured.1);
         }
         #[cfg(feature = "fakewallet")]
         LnBackend::FakeWallet => {
@@ -555,14 +615,17 @@ async fn configure_lightning_backend(
                 #[cfg(feature = "prometheus")]
                 let fake = MetricsMintPayment::new(fake);
 
-                mint_builder = configure_backend_for_unit(
+                let backend = Arc::new(fake);
+                let configured = configure_backend_and_rate_quoter_for_unit(
                     settings,
                     mint_builder,
                     unit.clone(),
                     mint_melt_limits,
-                    Arc::new(fake),
+                    backend,
                 )
                 .await?;
+                mint_builder = configured.0;
+                rate_quote_control = rate_quote_control.or(configured.1);
             }
 
             for rotation_cfg in &fake_wallet.keyset_rotations {
@@ -605,14 +668,17 @@ async fn configure_lightning_backend(
                 #[cfg(feature = "prometheus")]
                 let processor = MetricsMintPayment::new(processor);
 
-                mint_builder = configure_backend_for_unit(
+                let backend = Arc::new(processor);
+                let configured = configure_backend_and_rate_quoter_for_unit(
                     settings,
                     mint_builder,
                     unit.clone(),
                     mint_melt_limits,
-                    Arc::new(processor),
+                    backend,
                 )
                 .await?;
+                mint_builder = configured.0;
+                rate_quote_control = rate_quote_control.or(configured.1);
             }
         }
         #[cfg(feature = "ldk-node")]
@@ -624,14 +690,17 @@ async fn configure_lightning_backend(
                 .setup(settings, CurrencyUnit::Sat, _runtime, work_dir, None)
                 .await?;
 
-            mint_builder = configure_backend_for_unit(
+            let backend = Arc::new(ldk_node);
+            let configured = configure_backend_and_rate_quoter_for_unit(
                 settings,
                 mint_builder,
                 CurrencyUnit::Sat,
                 mint_melt_limits,
-                Arc::new(ldk_node),
+                backend,
             )
             .await?;
+            mint_builder = configured.0;
+            rate_quote_control = rate_quote_control.or(configured.1);
         }
         LnBackend::None => {
             tracing::error!(
@@ -642,7 +711,243 @@ async fn configure_lightning_backend(
         }
     };
 
-    Ok(mint_builder)
+    Ok((mint_builder, rate_quote_control))
+}
+
+async fn configure_backend_and_rate_quoter_for_unit(
+    settings: &config::Settings,
+    mint_builder: MintBuilder,
+    unit: CurrencyUnit,
+    mint_melt_limits: MintMeltLimits,
+    backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
+) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
+    let mut mint_builder = configure_backend_for_unit(
+        settings,
+        mint_builder,
+        unit.clone(),
+        mint_melt_limits,
+        backend.clone(),
+    )
+    .await?;
+
+    if unit != CurrencyUnit::Sat {
+        return Ok((mint_builder, None));
+    }
+
+    let msat_processor = MsatSatConverter::new(SharedMintPayment::new(backend.clone()));
+    // The underlying Lightning backend is sat-denominated, while the msat
+    // facade exposes the same economic limits in millisatoshis: 1 sat = 1000 msat.
+    let msat_mint_melt_limits = MintMeltLimits {
+        mint_min: Amount::from(mint_melt_limits.mint_min.to_u64().saturating_mul(1000)),
+        mint_max: Amount::from(mint_melt_limits.mint_max.to_u64().saturating_mul(1000)),
+        melt_min: Amount::from(mint_melt_limits.melt_min.to_u64().saturating_mul(1000)),
+        melt_max: Amount::from(mint_melt_limits.melt_max.to_u64().saturating_mul(1000)),
+    };
+    mint_builder = configure_backend_for_unit(
+        settings,
+        mint_builder,
+        CurrencyUnit::Msat,
+        msat_mint_melt_limits,
+        Arc::new(msat_processor),
+    )
+    .await?;
+
+    configure_rate_quoter_for_sat_backend(settings, mint_builder, mint_melt_limits, backend).await
+}
+
+async fn configure_rate_quoter_for_sat_backend(
+    settings: &config::Settings,
+    mut mint_builder: MintBuilder,
+    mint_melt_limits: MintMeltLimits,
+    sat_backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
+) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
+    let Some(rate_quoter) = settings.rate_quoter.clone() else {
+        return Ok((mint_builder, None));
+    };
+
+    let units = rate_quoter_units(&rate_quoter);
+    if units.is_empty() {
+        tracing::warn!("rate_quoter configured without units; no fiat processors registered");
+        return Ok((mint_builder, None));
+    }
+
+    // The rate snapshot is part of the quoted economic terms; quotes priced
+    // off it must expire well before the snapshot can go materially stale.
+    if !(60..=120).contains(&rate_quoter.ttl_secs) {
+        bail!(
+            "rate_quoter.ttl_secs must be between 60 and 120 seconds, got {}",
+            rate_quoter.ttl_secs
+        );
+    }
+    if rate_quoter.min_survived > rate_quoter.min_fetched {
+        bail!(
+            "rate_quoter.min_survived ({}) cannot exceed rate_quoter.min_fetched ({})",
+            rate_quoter.min_survived,
+            rate_quoter.min_fetched
+        );
+    }
+
+    validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)?;
+
+    let sources = rate_quoter_sources(&rate_quoter.sources)?;
+    let oracle = Arc::new(AggregatingRateOracle::with_config(
+        sources,
+        AggregatorConfig {
+            min_sources: rate_quoter.min_fetched,
+            min_survived: rate_quoter.min_survived,
+            max_clock_offset_secs: rate_quoter.staleness_secs,
+            ..AggregatorConfig::default()
+        },
+    ));
+    let store = rate_quote_store(settings, &rate_quoter).await?;
+
+    // Pause/cap/outstanding state persists in the quote store; operator
+    // values set over the management RPC take precedence over config, so
+    // config caps only seed units with no persisted control record.
+    let control =
+        RateQuoteControlHandle::with_store_and_buffer_bps(store.clone(), rate_quoter.buffer_bps);
+    let persisted_units = control.load_persisted().await?;
+    validate_persisted_rate_quoter_caps_require_buffer(&rate_quoter, &units, &control).await?;
+    for (unit, cap) in &rate_quoter.per_unit_caps {
+        if !persisted_units.contains(unit) {
+            control.set_unit_issuance_cap(unit.clone(), *cap).await?;
+        }
+    }
+
+    for fiat_unit in units {
+        let config = RateConvertingPaymentConfig::new(
+            fiat_unit.clone(),
+            rate_quoter.buffer_bps,
+            rate_quoter.ttl_secs,
+        );
+        let inner = SharedMintPayment::new(sat_backend.clone());
+        let processor = RateConvertingPayment::with_control(
+            inner,
+            oracle.clone(),
+            store.clone(),
+            config,
+            control.clone(),
+        );
+        let processor = PaymentErrorAdapter::new(processor);
+        mint_builder = configure_backend_for_unit(
+            settings,
+            mint_builder,
+            fiat_unit,
+            mint_melt_limits,
+            Arc::new(processor),
+        )
+        .await?;
+    }
+
+    Ok((mint_builder, Some(control)))
+}
+
+fn rate_quoter_units(rate_quoter: &config::RateQuoter) -> Vec<CurrencyUnit> {
+    let mut units = rate_quoter.units.clone();
+    for unit in rate_quoter.per_unit_caps.keys() {
+        if !units.contains(unit) {
+            units.push(unit.clone());
+        }
+    }
+    units
+}
+
+fn rate_quoter_sources(source_configs: &[String]) -> Result<Vec<Box<dyn RateSource>>> {
+    let mut sources: Vec<Box<dyn RateSource>> = Vec::new();
+    let configured_sources = if source_configs.is_empty() {
+        vec![
+            "coinbase".to_string(),
+            "kraken".to_string(),
+            "bitstamp".to_string(),
+        ]
+    } else {
+        source_configs.to_vec()
+    };
+
+    for source in configured_sources {
+        let lowered = source.to_ascii_lowercase();
+        if lowered.contains("coinbase") {
+            sources.push(Box::new(CoinbaseRateSource::new()));
+        } else if lowered.contains("kraken") {
+            sources.push(Box::new(KrakenRateSource::new()));
+        } else if lowered.contains("bitstamp") {
+            sources.push(Box::new(BitstampRateSource::new()));
+        } else {
+            bail!("Unsupported rate_quoter source: {source}");
+        }
+    }
+
+    Ok(sources)
+}
+
+fn validate_configured_rate_quoter_caps_require_buffer(
+    rate_quoter: &config::RateQuoter,
+    units: &[CurrencyUnit],
+) -> Result<()> {
+    if rate_quoter.buffer_bps != 0 {
+        return Ok(());
+    }
+
+    for unit in units {
+        let configured_cap = rate_quoter
+            .per_unit_caps
+            .get(unit)
+            .copied()
+            .unwrap_or_default();
+        if configured_cap != 0 {
+            bail!(
+                "rate_quoter.buffer_bps must be nonzero when unit {unit} has a nonzero issuance cap"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn validate_persisted_rate_quoter_caps_require_buffer(
+    rate_quoter: &config::RateQuoter,
+    units: &[CurrencyUnit],
+    control: &RateQuoteControlHandle,
+) -> Result<()> {
+    if rate_quoter.buffer_bps != 0 {
+        return Ok(());
+    }
+
+    for unit in units {
+        let persisted_cap = control.unit_issuance_cap(unit).await;
+        if persisted_cap != 0 {
+            bail!(
+                "rate_quoter.buffer_bps must be nonzero when unit {unit} has a nonzero issuance cap"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn rate_quote_store(
+    settings: &config::Settings,
+    rate_quoter: &config::RateQuoter,
+) -> Result<DynRateQuoteStore> {
+    match settings.database.engine {
+        #[cfg(feature = "postgres")]
+        DatabaseEngine::Postgres => {
+            let postgres = settings
+                .database
+                .postgres
+                .as_ref()
+                .ok_or_else(|| anyhow!("Postgres rate_quoter requires database.postgres"))?;
+            Ok(Arc::new(PostgresRateQuoteStore::new(&postgres.url).await?))
+        }
+        #[cfg(not(feature = "postgres"))]
+        DatabaseEngine::Postgres => {
+            bail!("Postgres rate_quoter requires the postgres feature")
+        }
+        _ if rate_quoter.allow_in_memory_store => Ok(Arc::new(InMemoryRateQuoteStore::new())),
+        _ => bail!(
+            "rate_quoter with fiat units requires a durable Postgres rate quote store; set rate_quoter.allow_in_memory_store only for ephemeral development or tests"
+        ),
+    }
 }
 
 /// Helper function to configure a mint builder with a lightning backend for a specific currency unit
@@ -937,14 +1242,19 @@ async fn build_mint(
     }
 }
 
+struct ServiceStartupExtras {
+    routers: Vec<Router>,
+    auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
+    rate_quote_control: Option<RateQuoteControlHandle>,
+}
+
 async fn start_services_with_shutdown(
     mint: Arc<cdk::mint::Mint>,
     settings: &config::Settings,
     _work_dir: &Path,
     mint_builder_info: cdk::nuts::MintInfo,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
-    routers: Vec<Router>,
-    auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
+    extras: ServiceStartupExtras,
 ) -> Result<()> {
     let listen_addr = settings.info.listen_host.clone();
     let listen_port = settings.info.listen_port;
@@ -965,11 +1275,29 @@ async fn start_services_with_shutdown(
                 let addr = rpc_settings.address.unwrap_or("127.0.0.1".to_string());
                 let port = rpc_settings.port.unwrap_or(8086);
                 let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(&addr, port, mint.clone())?;
+                if let Some(control) = extras.rate_quote_control.clone() {
+                    mint_rpc = mint_rpc.with_rate_quote_control(control);
+                }
 
                 let tls_dir = rpc_settings.tls_dir_path.unwrap_or(_work_dir.join("tls"));
 
                 let tls_dir = if tls_dir.exists() {
                     Some(tls_dir)
+                } else if extras.rate_quote_control.is_some() {
+                    // Fail closed: the management RPC controls fiat pause and
+                    // issuance-cap state. Running it unencrypted while fiat
+                    // rate-quoted units are enabled would let anyone who can
+                    // reach the port alter live fiat issuance controls. A
+                    // startup failure is preferable to fiat issuance on an
+                    // unsecured management plane.
+                    bail!(
+                        "management RPC TLS directory does not exist: {}. Refusing to start: \
+                         fiat rate-quoted units are enabled and their pause/cap controls must \
+                         not ride an unencrypted management RPC. Provision TLS certificates \
+                         (mint_management_rpc.tls_dir_path), disable the management RPC, or \
+                         disable the rate_quoter",
+                        tls_dir.display()
+                    );
                 } else {
                     tracing::warn!(
                         "TLS directory does not exist: {}. Starting RPC server in INSECURE mode without TLS encryption",
@@ -1057,7 +1385,7 @@ async fn start_services_with_shutdown(
     tracing::info!("Payment methods: {:?}", custom_methods);
 
     // Configure auth for custom payment methods if auth is enabled
-    if let (Some(ref auth_settings), Some(auth_db)) = (&settings.auth, &auth_localstore) {
+    if let (Some(ref auth_settings), Some(auth_db)) = (&settings.auth, &extras.auth_localstore) {
         if auth_settings.auth_enabled {
             use std::collections::HashMap;
 
@@ -1223,7 +1551,7 @@ async fn start_services_with_shutdown(
         )
         .layer(TraceLayer::new_for_http());
 
-    for router in routers {
+    for router in extras.routers {
         mint_service = mint_service.merge(router);
     }
 
@@ -1430,7 +1758,7 @@ pub async fn run_mintd_with_shutdown(
         }
     };
 
-    let mint_builder =
+    let (mint_builder, rate_quote_control) =
         configure_mint_builder(settings, maybe_mint_builder, runtime, work_dir, Some(kv)).await?;
     let (mint_builder, auth_localstore) =
         setup_authentication(settings, work_dir, mint_builder, db_password).await?;
@@ -1449,14 +1777,20 @@ pub async fn run_mintd_with_shutdown(
         work_dir,
         config_mint_info,
         shutdown_signal,
-        routers,
-        auth_localstore,
+        ServiceStartupExtras {
+            routers,
+            auth_localstore,
+            rate_quote_control,
+        },
     )
     .await
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use cdk::nuts::{CurrencyUnit, MintMethodSettings, PaymentMethod};
 
     use super::*;
@@ -1524,5 +1858,90 @@ mod tests {
         let methods = extract_supported_payment_methods(&mint_info);
 
         assert_eq!(methods, vec!["bolt11", "bolt12", "paypal"]);
+    }
+
+    fn rate_quoter_with_usd_cap(buffer_bps: u64, cap: u64) -> config::RateQuoter {
+        config::RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            buffer_bps,
+            per_unit_caps: HashMap::from([(CurrencyUnit::Usd, cap)]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_rejects_nonzero_cap_with_omitted_buffer() {
+        let rate_quoter = config::RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            per_unit_caps: HashMap::from([(CurrencyUnit::Usd, 100)]),
+            ..Default::default()
+        };
+        let units = rate_quoter_units(&rate_quoter);
+
+        let error = validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
+            .expect_err("omitted buffer defaults to zero and must reject nonzero caps");
+        assert!(error.to_string().contains("buffer_bps must be nonzero"));
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_rejects_nonzero_cap_with_zero_buffer() {
+        let rate_quoter = rate_quoter_with_usd_cap(0, 100);
+        let units = rate_quoter_units(&rate_quoter);
+
+        let error = validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
+            .expect_err("explicit zero buffer must reject nonzero caps");
+        assert!(error.to_string().contains("buffer_bps must be nonzero"));
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_allows_nonzero_cap_with_nonzero_buffer() {
+        let rate_quoter = rate_quoter_with_usd_cap(100, 100);
+        let units = rate_quoter_units(&rate_quoter);
+
+        validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
+            .expect("nonzero buffer allows nonzero caps");
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_rejects_persisted_nonzero_cap_with_zero_buffer() {
+        let store: DynRateQuoteStore = Arc::new(InMemoryRateQuoteStore::new());
+        let seed_control = RateQuoteControlHandle::with_store_and_buffer_bps(store.clone(), 100);
+        seed_control
+            .set_unit_issuance_cap(CurrencyUnit::Usd, 100)
+            .await
+            .expect("seed persisted cap");
+
+        let rate_quoter = config::RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            buffer_bps: 0,
+            ..Default::default()
+        };
+        let control = RateQuoteControlHandle::with_store_and_buffer_bps(store, 0);
+        control.load_persisted().await.expect("load persisted cap");
+        let units = rate_quoter_units(&rate_quoter);
+
+        let error =
+            validate_persisted_rate_quoter_caps_require_buffer(&rate_quoter, &units, &control)
+                .await
+                .expect_err("persisted nonzero cap with zero buffer must reject startup");
+        assert!(error.to_string().contains("buffer_bps must be nonzero"));
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_rejects_volatile_store_without_opt_in() {
+        let settings = config::Settings::default();
+        let rate_quoter = config::RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            allow_in_memory_store: false,
+            ..Default::default()
+        };
+
+        let error = match rate_quote_store(&settings, &rate_quoter).await {
+            Ok(_) => panic!("sqlite must not silently fall back to volatile rate quote store"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("durable Postgres rate quote store"));
     }
 }

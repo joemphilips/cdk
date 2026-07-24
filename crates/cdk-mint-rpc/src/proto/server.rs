@@ -11,6 +11,7 @@ use cdk::types::QuoteTTL;
 use cdk::Amount;
 use cdk_common::grpc::create_version_check_interceptor;
 use cdk_common::payment::WaitPaymentResponse;
+use cdk_exchange_rate::{RateQuoteControlHandle, RateQuoteStoreError};
 use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -21,11 +22,19 @@ use tonic::{Request, Response, Status};
 use crate::cdk_mint_server::{CdkMint, CdkMintServer};
 use crate::{
     ContactInfo, GetInfoRequest, GetInfoResponse, GetQuoteTtlRequest, GetQuoteTtlResponse,
-    RotateNextKeysetRequest, RotateNextKeysetResponse, UpdateContactRequest,
-    UpdateDescriptionRequest, UpdateIconUrlRequest, UpdateMotdRequest, UpdateNameRequest,
-    UpdateNut04QuoteRequest, UpdateNut04Request, UpdateNut05Request, UpdateQuoteTtlRequest,
-    UpdateResponse, UpdateUrlRequest,
+    RotateNextKeysetRequest, RotateNextKeysetResponse, SetUnitIssuanceCapRequest,
+    SetUnitIssuanceCapResponse, SetUnitQuoteStateRequest, SetUnitQuoteStateResponse,
+    UpdateContactRequest, UpdateDescriptionRequest, UpdateIconUrlRequest, UpdateMotdRequest,
+    UpdateNameRequest, UpdateNut04QuoteRequest, UpdateNut04Request, UpdateNut05Request,
+    UpdateQuoteTtlRequest, UpdateResponse, UpdateUrlRequest,
 };
+
+fn set_unit_issuance_cap_status(error: RateQuoteStoreError) -> Status {
+    match error {
+        RateQuoteStoreError::InvalidControl(message) => Status::failed_precondition(message),
+        error => Status::internal(format!("could not persist unit issuance cap: {error}")),
+    }
+}
 
 /// Error
 #[derive(Debug, Error)]
@@ -47,6 +56,7 @@ pub enum Error {
 pub struct MintRPCServer {
     socket_addr: SocketAddr,
     mint: Arc<Mint>,
+    rate_quote_control: Option<RateQuoteControlHandle>,
     shutdown: Arc<Notify>,
     handle: Option<Arc<JoinHandle<Result<(), Error>>>>,
 }
@@ -62,9 +72,16 @@ impl MintRPCServer {
         Ok(Self {
             socket_addr: format!("{addr}:{port}").parse()?,
             mint,
+            rate_quote_control: None,
             shutdown: Arc::new(Notify::new()),
             handle: None,
         })
+    }
+
+    /// Attach the rate-quote pause/cap control handle used by fiat processors.
+    pub fn with_rate_quote_control(mut self, control: RateQuoteControlHandle) -> Self {
+        self.rate_quote_control = Some(control);
+        self
     }
 
     /// Starts the RPC server
@@ -788,5 +805,60 @@ impl CdkMint for MintRPCServer {
             amounts: keyset_info.amounts,
             input_fee_ppk: keyset_info.input_fee_ppk,
         }))
+    }
+
+    /// Set pause state for rate-quoted mint and melt issuance by unit.
+    async fn set_unit_quote_state(
+        &self,
+        request: Request<SetUnitQuoteStateRequest>,
+    ) -> Result<Response<SetUnitQuoteStateResponse>, Status> {
+        let request = request.into_inner();
+        let unit = CurrencyUnit::from_str(&request.unit)
+            .map_err(|_| Status::invalid_argument("Invalid unit".to_string()))?;
+        let control = self.rate_quote_control.as_ref().ok_or_else(|| {
+            Status::failed_precondition("rate quote control is not configured".to_string())
+        })?;
+        control
+            .set_unit_quote_state(unit, request.mint_paused, request.melt_paused)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("could not persist unit quote state: {error}"))
+            })?;
+        Ok(Response::new(SetUnitQuoteStateResponse {}))
+    }
+
+    /// Set the pending-unpaid quote issuance cap for a rate-quoted unit.
+    async fn set_unit_issuance_cap(
+        &self,
+        request: Request<SetUnitIssuanceCapRequest>,
+    ) -> Result<Response<SetUnitIssuanceCapResponse>, Status> {
+        let request = request.into_inner();
+        let unit = CurrencyUnit::from_str(&request.unit)
+            .map_err(|_| Status::invalid_argument("Invalid unit".to_string()))?;
+        let control = self.rate_quote_control.as_ref().ok_or_else(|| {
+            Status::failed_precondition("rate quote control is not configured".to_string())
+        })?;
+        control
+            .set_unit_issuance_cap(unit, request.cap)
+            .await
+            .map_err(set_unit_issuance_cap_status)?;
+        Ok(Response::new(SetUnitIssuanceCapResponse {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::Code;
+
+    use super::*;
+
+    #[test]
+    fn set_unit_issuance_cap_validation_error_is_failed_precondition() {
+        let status = set_unit_issuance_cap_status(RateQuoteStoreError::InvalidControl(
+            "rate quote buffer_bps must be nonzero before setting a nonzero issuance cap"
+                .to_string(),
+        ));
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
     }
 }

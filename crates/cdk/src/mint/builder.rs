@@ -1,6 +1,8 @@
 //! Mint Builder
 
 use std::collections::HashMap;
+#[cfg(feature = "conditional-tokens")]
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bitcoin::bip32::DerivationPath;
@@ -19,6 +21,8 @@ use super::Nuts;
 use crate::amount::Amount;
 use crate::cdk_database;
 use crate::mint::Mint;
+#[cfg(feature = "conditional-tokens")]
+use crate::nuts::nut_ctf::{NutCtfSettings, RegistrationFeeSetting, MAX_OUTCOMES};
 use crate::nuts::{
     ContactInfo, CurrencyUnit, MeltMethodSettings, MintInfo, MintMethodSettings, MintVersion,
     MppMethodSettings, PaymentMethod, ProtectedEndpoint,
@@ -71,6 +75,8 @@ pub struct MintBuilder {
     keyset_rotations: Vec<KeysetRotation>,
     max_inputs: usize,
     max_outputs: usize,
+    #[cfg(feature = "conditional-tokens")]
+    max_outcomes_per_condition: usize,
     max_batch_size: Option<u64>,
 }
 
@@ -111,6 +117,8 @@ impl MintBuilder {
             keyset_rotations: Vec::new(),
             max_inputs: 1000,
             max_outputs: 1000,
+            #[cfg(feature = "conditional-tokens")]
+            max_outcomes_per_condition: MAX_OUTCOMES,
             max_batch_size: None,
         }
     }
@@ -300,6 +308,53 @@ impl MintBuilder {
     pub fn with_limits(mut self, max_inputs: usize, max_outputs: usize) -> Self {
         self.max_inputs = max_inputs;
         self.max_outputs = max_outputs;
+        self
+    }
+
+    /// Set conditional-token registration limits.
+    #[cfg(feature = "conditional-tokens")]
+    pub fn with_ctf_limits(mut self, max_outcomes_per_condition: usize) -> Self {
+        self.max_outcomes_per_condition = max_outcomes_per_condition;
+        self
+    }
+
+    /// Set the default conditional-token keyset creation policy advertised in mint info.
+    #[cfg(feature = "conditional-tokens")]
+    pub fn with_ctf_default_keyset_creation(mut self, policy: String) -> Self {
+        let mut settings = self
+            .mint_info
+            .nuts
+            .nut_ctf
+            .take()
+            .unwrap_or_else(NutCtfSettings::default);
+        settings.default_keyset_creation = policy;
+        self.mint_info.nuts.nut_ctf = Some(settings);
+        self
+    }
+
+    /// Set the conditional-token registration fee policies advertised in mint info.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provided fee settings contain duplicate units.
+    #[cfg(feature = "conditional-tokens")]
+    pub fn with_ctf_registration_fees(mut self, fees: Vec<RegistrationFeeSetting>) -> Self {
+        let mut seen_units = HashSet::new();
+        for fee in &fees {
+            assert!(
+                seen_units.insert(fee.unit.clone()),
+                "duplicate CTF registration fee unit: {}",
+                fee.unit
+            );
+        }
+        let mut settings = self
+            .mint_info
+            .nuts
+            .nut_ctf
+            .take()
+            .unwrap_or_else(NutCtfSettings::default);
+        settings.registration_fees = fees;
+        self.mint_info.nuts.nut_ctf = Some(settings);
         self
     }
 
@@ -618,6 +673,8 @@ impl MintBuilder {
                 self.payment_processors,
                 self.max_inputs,
                 self.max_outputs,
+                #[cfg(feature = "conditional-tokens")]
+                self.max_outcomes_per_condition,
             )
             .await;
         }
@@ -628,6 +685,8 @@ impl MintBuilder {
             self.payment_processors,
             self.max_inputs,
             self.max_outputs,
+            #[cfg(feature = "conditional-tokens")]
+            self.max_outcomes_per_condition,
         )
         .await
     }

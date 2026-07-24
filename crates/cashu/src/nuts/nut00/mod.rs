@@ -31,6 +31,8 @@ use crate::nuts::nut01::SecretKey;
 use crate::nuts::nut11::{serde_p2pk_witness, P2PKWitness};
 use crate::nuts::nut12::BlindSignatureDleq;
 use crate::nuts::nut14::{serde_htlc_witness, HTLCWitness};
+#[cfg(feature = "conditional-tokens")]
+use crate::nuts::nut_ctf::{serde_oracle_witness, OracleWitness};
 use crate::nuts::{Id, ProofDleq};
 use crate::secret::Secret;
 use crate::Amount;
@@ -315,6 +317,10 @@ pub enum Witness {
     /// P2PK Witness
     #[serde(with = "serde_p2pk_witness")]
     P2PKWitness(P2PKWitness),
+    /// Oracle Witness (NUT-CTF conditional tokens)
+    #[cfg(feature = "conditional-tokens")]
+    #[serde(with = "serde_oracle_witness")]
+    OracleWitness(OracleWitness),
 }
 
 impl From<P2PKWitness> for Witness {
@@ -329,6 +335,13 @@ impl From<HTLCWitness> for Witness {
     }
 }
 
+#[cfg(feature = "conditional-tokens")]
+impl From<OracleWitness> for Witness {
+    fn from(witness: OracleWitness) -> Self {
+        Self::OracleWitness(witness)
+    }
+}
+
 impl Witness {
     /// Add signatures to [`Witness`]
     pub fn add_signatures(&mut self, signatures: Vec<String>) {
@@ -338,6 +351,10 @@ impl Witness {
                 Some(sigs) => sigs.extend(signatures),
                 None => htlc_witness.signatures = Some(signatures),
             },
+            #[cfg(feature = "conditional-tokens")]
+            Self::OracleWitness(_) => {
+                // Oracle witnesses don't use signature-style signatures
+            }
         }
     }
 
@@ -346,6 +363,8 @@ impl Witness {
         match self {
             Self::P2PKWitness(witness) => Some(witness.signatures.clone()),
             Self::HTLCWitness(witness) => witness.signatures.clone(),
+            #[cfg(feature = "conditional-tokens")]
+            Self::OracleWitness(_) => None,
         }
     }
 
@@ -354,6 +373,17 @@ impl Witness {
         match self {
             Self::P2PKWitness(_witness) => None,
             Self::HTLCWitness(witness) => Some(witness.preimage.clone()),
+            #[cfg(feature = "conditional-tokens")]
+            Self::OracleWitness(_) => None,
+        }
+    }
+
+    /// Get oracle witness from [`Witness`] (NUT-CTF)
+    #[cfg(feature = "conditional-tokens")]
+    pub fn oracle_witness(&self) -> Option<&OracleWitness> {
+        match self {
+            Self::OracleWitness(w) => Some(w),
+            _ => None,
         }
     }
 }
@@ -641,9 +671,9 @@ impl CurrencyUnit {
         }
     }
 
-    /// Construct a custom unit, normalizing to uppercase and trimming whitespace.
+    /// Construct a custom unit, normalizing and trimming whitespace while preserving case.
     pub fn custom<S: AsRef<str>>(value: S) -> Self {
-        Self::Custom(normalize_custom_unit(value.as_ref()).to_uppercase())
+        Self::Custom(normalize_custom_unit(value.as_ref()))
     }
 
     ///  Big endian encoded integer of the first 4 bytes of the sha256 hash of the unit string.
@@ -676,6 +706,22 @@ impl FromStr for CurrencyUnit {
             "AUTH" => Ok(Self::Auth),
             _ => Ok(Self::Custom(normalize_custom_unit(value))),
         }
+    }
+}
+
+#[cfg(test)]
+mod currency_unit_tests {
+    use super::*;
+
+    #[test]
+    fn parses_msat_and_milli_cent_units() {
+        let msat = CurrencyUnit::from_str("msat").expect("msat should parse");
+        assert_eq!(msat, CurrencyUnit::Msat);
+        assert_eq!(msat.to_string(), "msat");
+
+        let mc = CurrencyUnit::from_str("milli-cent").expect("milli-cent should parse");
+        assert_eq!(mc, CurrencyUnit::Custom("milli-cent".to_string()));
+        assert_eq!(mc.to_string(), "milli-cent");
     }
 }
 
@@ -1388,9 +1434,12 @@ mod tests {
     fn test_currency_unit_custom_normalizes_and_stays_custom() {
         let unit = CurrencyUnit::custom(" usd\n");
 
-        assert_eq!(unit, CurrencyUnit::Custom("USD".to_string()));
+        assert_eq!(unit, CurrencyUnit::Custom("usd".to_string()));
         assert_ne!(unit, CurrencyUnit::default());
         assert_eq!(unit.to_string(), "usd");
+
+        let milli_cent = CurrencyUnit::custom(" milli-cent\n");
+        assert_eq!(milli_cent, CurrencyUnit::Custom("milli-cent".to_string()));
     }
 
     #[test]

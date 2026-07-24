@@ -13,8 +13,10 @@ readme = "README.md"
 [features]
 redis = ["dep:redis"]
 swagger = ["cdk/swagger", "dep:utoipa"]
+conditional-tokens = ["cdk/conditional-tokens"]
 prometheus = ["dep:cdk-prometheus"]
 info-page = ["dep:maud"]
+auth = []
 
 [dependencies]
 anyhow.workspace = true

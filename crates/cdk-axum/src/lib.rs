@@ -233,6 +233,15 @@ pub async fn create_mint_router_with_custom_cache(
         .route("/info", get(get_mint_info))
         .route("/restore", post(post_restore));
 
+    // NUT-CTF conditional token routes
+    #[cfg(feature = "conditional-tokens")]
+    let v1_router = v1_router
+        .route("/conditions", get(get_conditions).post(post_conditions))
+        .route("/conditions/{condition_id}", get(get_condition))
+        .route("/conditional_keysets", get(get_conditional_keysets))
+        .route("/redeem_outcome", post(post_redeem_outcome))
+        .route("/ctf/convert", post(post_ctf_convert));
+
     let mut mint_router = Router::new().nest("/v1", v1_router);
 
     #[cfg(feature = "info-page")]

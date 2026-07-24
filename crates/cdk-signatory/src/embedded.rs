@@ -2,10 +2,14 @@
 //! run the Signatory in another thread, isolated form the main CDK, communicating through messages
 use std::sync::Arc;
 
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::CurrencyUnit;
 use cdk_common::{BlindSignature, BlindedMessage, Error, Proof};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+#[cfg(feature = "conditional-tokens")]
+use crate::signatory::PreparedConditionalKeySet;
 use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
 
 enum Request {
@@ -23,6 +27,21 @@ enum Request {
             oneshot::Sender<Result<SignatoryKeySet, Error>>,
         ),
     ),
+    #[cfg(feature = "conditional-tokens")]
+    PrepareConditionalKeyset(
+        (
+            CurrencyUnit,
+            String,
+            String,
+            String,
+            Vec<u64>,
+            u64,
+            Option<u64>,
+            oneshot::Sender<Result<PreparedConditionalKeySet, Error>>,
+        ),
+    ),
+    #[cfg(feature = "conditional-tokens")]
+    ReloadKeysetsFromStorage(oneshot::Sender<Result<(), Error>>),
 }
 
 /// Creates a service-like to wrap an implementation of the Signatory
@@ -88,6 +107,39 @@ impl Service {
                         tracing::error!("Error sending response: {:?}", err);
                     }
                 }
+                #[cfg(feature = "conditional-tokens")]
+                Request::PrepareConditionalKeyset((
+                    unit,
+                    condition_id,
+                    outcome_collection,
+                    outcome_collection_id,
+                    amounts,
+                    input_fee_ppk,
+                    final_expiry,
+                    response,
+                )) => {
+                    let output = handler
+                        .prepare_conditional_keyset(
+                            unit,
+                            &condition_id,
+                            &outcome_collection,
+                            &outcome_collection_id,
+                            amounts,
+                            input_fee_ppk,
+                            final_expiry,
+                        )
+                        .await;
+                    if let Err(err) = response.send(output) {
+                        tracing::error!("Error sending response: {:?}", err);
+                    }
+                }
+                #[cfg(feature = "conditional-tokens")]
+                Request::ReloadKeysetsFromStorage(response) => {
+                    let output = handler.reload_keysets_from_storage().await;
+                    if let Err(err) = response.send(output) {
+                        tracing::error!("Error sending response: {:?}", err);
+                    }
+                }
             }
         }
     }
@@ -140,6 +192,47 @@ impl Signatory for Service {
         let (tx, rx) = oneshot::channel();
         self.pipeline
             .send(Request::RotateKeyset((args, tx)))
+            .await
+            .map_err(|e| Error::SendError(e.to_string()))?;
+
+        rx.await.map_err(|e| Error::RecvError(e.to_string()))?
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tracing::instrument(skip(self))]
+    async fn prepare_conditional_keyset(
+        &self,
+        unit: CurrencyUnit,
+        condition_id: &str,
+        outcome_collection: &str,
+        outcome_collection_id: &str,
+        amounts: Vec<u64>,
+        input_fee_ppk: u64,
+        final_expiry: Option<u64>,
+    ) -> Result<PreparedConditionalKeySet, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.pipeline
+            .send(Request::PrepareConditionalKeyset((
+                unit,
+                condition_id.to_string(),
+                outcome_collection.to_string(),
+                outcome_collection_id.to_string(),
+                amounts,
+                input_fee_ppk,
+                final_expiry,
+                tx,
+            )))
+            .await
+            .map_err(|e| Error::SendError(e.to_string()))?;
+
+        rx.await.map_err(|e| Error::RecvError(e.to_string()))?
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn reload_keysets_from_storage(&self) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.pipeline
+            .send(Request::ReloadKeysetsFromStorage(tx))
             .await
             .map_err(|e| Error::SendError(e.to_string()))?;
 

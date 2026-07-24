@@ -320,6 +320,58 @@ impl MintConnector for DirectMintConnection {
 
         *auth_wallet = wallet;
     }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditions(
+        &self,
+        _since: Option<u64>,
+        _limit: Option<u64>,
+        _status: &[String],
+    ) -> Result<cdk::nuts::nut_ctf::GetConditionsResponse, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_condition(
+        &self,
+        _condition_id: &str,
+    ) -> Result<cdk::nuts::nut_ctf::ConditionInfo, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_register_condition(
+        &self,
+        _request: cdk::nuts::nut_ctf::RegisterConditionRequest,
+    ) -> Result<cdk::nuts::nut_ctf::RegisterConditionResponse, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditional_keysets(
+        &self,
+        _since: Option<u64>,
+        _limit: Option<u64>,
+        _active: Option<bool>,
+    ) -> Result<cdk::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_ctf_convert(
+        &self,
+        _request: cdk::nuts::nut_ctf::CtfConvertRequest,
+    ) -> Result<cdk::nuts::nut_ctf::CtfConvertResponse, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_redeem_outcome(
+        &self,
+        _request: cdk::nuts::nut_ctf::RedeemOutcomeRequest,
+    ) -> Result<cdk::nuts::nut_ctf::RedeemOutcomeResponse, Error> {
+        unimplemented!()
+    }
 }
 
 pub fn setup_tracing() {

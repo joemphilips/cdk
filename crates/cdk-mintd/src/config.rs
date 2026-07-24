@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bitcoin::hashes::{sha256, Hash};
@@ -29,7 +30,29 @@ impl std::str::FromStr for LoggingOutput {
             "file" => Ok(LoggingOutput::File),
             "both" => Ok(LoggingOutput::Both),
             _ => Err(format!(
-                "Unknown logging output: {s}. Valid options: stdout, file, both"
+                "Unknown logging output: {s}. Valid options: stderr, file, both"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LoggingFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl std::str::FromStr for LoggingFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "text" => Ok(LoggingFormat::Text),
+            "json" => Ok(LoggingFormat::Json),
+            _ => Err(format!(
+                "Unknown logging format: {s}. Valid options: text, json"
             )),
         }
     }
@@ -37,10 +60,13 @@ impl std::str::FromStr for LoggingOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LoggingConfig {
-    /// Where to output logs: stdout, file, or both
+    /// Where to output logs: stderr, file, or both
     #[serde(default)]
     pub output: LoggingOutput,
-    /// Log level for console output (when stdout or both)
+    /// Log formatter: text or json
+    #[serde(default)]
+    pub format: LoggingFormat,
+    /// Log level for console output (when stderr or both)
     pub console_level: Option<String>,
     /// Log level for file output (when file or both)
     pub file_level: Option<String>,
@@ -642,6 +668,75 @@ fn default_blind() -> AuthType {
     AuthType::Blind
 }
 
+/// Optional fiat rate-quote processor configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RateQuoter {
+    /// Fiat units exposed through the rate-converting decorator.
+    #[serde(default)]
+    pub units: Vec<CurrencyUnit>,
+    /// Mint-favoring buffer in basis points.
+    #[serde(default)]
+    pub buffer_bps: u64,
+    /// Per-unit quote TTL, independent of the global mint TTL.
+    #[serde(default = "default_rate_quoter_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Oracle source identifiers or URLs. Supported values include coinbase,
+    /// kraken, and bitstamp URLs.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Maximum acceptable source staleness in seconds.
+    #[serde(default = "default_rate_quoter_staleness_secs")]
+    pub staleness_secs: u64,
+    /// Minimum number of sources that must be fetched fresh for a snapshot
+    /// (`quorum` is accepted as a legacy alias).
+    #[serde(default = "default_rate_quoter_min_fetched", alias = "quorum")]
+    pub min_fetched: usize,
+    /// Minimum number of sources that must survive deviation trimming.
+    #[serde(default = "default_rate_quoter_min_survived")]
+    pub min_survived: usize,
+    /// Per-unit issuance caps over outstanding plus pending quotes. A cap of
+    /// 0 (or an unconfigured unit) refuses all new mint quotes (fail-closed);
+    /// it never means unlimited.
+    #[serde(default)]
+    pub per_unit_caps: HashMap<CurrencyUnit, u64>,
+    /// Allow volatile in-memory rate-quote control storage. This is suitable
+    /// only for ephemeral development and tests.
+    #[serde(default)]
+    pub allow_in_memory_store: bool,
+}
+
+impl Default for RateQuoter {
+    fn default() -> Self {
+        Self {
+            units: Vec::new(),
+            buffer_bps: 0,
+            ttl_secs: default_rate_quoter_ttl_secs(),
+            sources: Vec::new(),
+            staleness_secs: default_rate_quoter_staleness_secs(),
+            min_fetched: default_rate_quoter_min_fetched(),
+            min_survived: default_rate_quoter_min_survived(),
+            per_unit_caps: HashMap::new(),
+            allow_in_memory_store: false,
+        }
+    }
+}
+
+fn default_rate_quoter_ttl_secs() -> u64 {
+    cdk_exchange_rate::DEFAULT_RATE_QUOTE_TTL_SECS
+}
+
+fn default_rate_quoter_staleness_secs() -> u64 {
+    30
+}
+
+fn default_rate_quoter_min_fetched() -> usize {
+    3
+}
+
+fn default_rate_quoter_min_survived() -> usize {
+    2
+}
+
 /// CDK settings, derived from `config.toml`
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -667,6 +762,7 @@ pub struct Settings {
     #[cfg(feature = "management-rpc")]
     pub mint_management_rpc: Option<MintManagementRpc>,
     pub auth: Option<Auth>,
+    pub rate_quoter: Option<RateQuoter>,
     #[cfg(feature = "prometheus")]
     pub prometheus: Option<Prometheus>,
 }
@@ -688,6 +784,9 @@ pub struct Limits {
     /// Maximum number of outputs allowed per transaction (mint/swap/melt)
     #[serde(default = "default_max_outputs")]
     pub max_outputs: usize,
+    /// Maximum number of outcomes allowed per conditional-token condition
+    #[serde(default = "default_max_outcomes_per_condition")]
+    pub max_outcomes_per_condition: usize,
 }
 
 impl Default for Limits {
@@ -695,6 +794,7 @@ impl Default for Limits {
         Self {
             max_inputs: 1000,
             max_outputs: 1000,
+            max_outcomes_per_condition: default_max_outcomes_per_condition(),
         }
     }
 }
@@ -705,6 +805,10 @@ fn default_max_inputs() -> usize {
 
 fn default_max_outputs() -> usize {
     1000
+}
+
+fn default_max_outcomes_per_condition() -> usize {
+    255
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -727,6 +831,26 @@ pub struct MintInfo {
     pub contact_email: Option<String>,
     /// URL to the terms of service
     pub tos_url: Option<String>,
+    /// NUT-CTF default keyset creation policy: none, one-vs-rest, or all.
+    #[cfg(feature = "conditional-tokens")]
+    pub ctf_default_keyset_creation: Option<String>,
+    /// NUT-CTF per-unit registration fee policy.
+    #[cfg(feature = "conditional-tokens")]
+    pub ctf_registration_fees: Option<Vec<CtfRegistrationFeeConfig>>,
+}
+
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CtfRegistrationFeeConfig {
+    /// Collateral unit this registration fee applies to.
+    pub unit: String,
+    /// Flat registration fee per new condition.
+    #[serde(rename = "registration_fee_base")]
+    pub base: u64,
+    /// Additional registration fee per created keyset.
+    #[serde(rename = "registration_fee_per_keyset")]
+    pub per_keyset: u64,
 }
 
 #[cfg(feature = "management-rpc")]
@@ -741,23 +865,12 @@ pub struct MintManagementRpc {
 }
 
 impl Settings {
-    #[must_use]
-    pub fn new<P>(config_file_name: Option<P>) -> Self
+    pub fn new<P>(config_file_name: Option<P>) -> Result<Self, ConfigError>
     where
         P: Into<PathBuf>,
     {
         let default_settings = Self::default();
-        // attempt to construct settings with file
-        let from_file = Self::new_from_default(&default_settings, config_file_name);
-        match from_file {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!(
-                    "Error reading config file, falling back to defaults. Error: {e:?}"
-                );
-                default_settings
-            }
-        }
+        Self::new_from_default(&default_settings, config_file_name)
     }
 
     fn new_from_default<P>(
@@ -793,6 +906,137 @@ impl Settings {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn test_rate_quoter_config_parse() {
+        use std::{env, fs};
+
+        let temp_dir = env::temp_dir().join("cdk_test_rate_quoter_config");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let config_path = temp_dir.join("config.toml");
+        let config_content = r#"
+[rate_quoter]
+units = ["usd"]
+buffer_bps = 75
+ttl_secs = 90
+sources = ["coinbase", "https://api.kraken.com", "https://www.bitstamp.net"]
+staleness_secs = 45
+min_fetched = 4
+min_survived = 3
+per_unit_caps = { usd = 1000 }
+"#;
+        fs::write(&config_path, config_content).expect("write config");
+
+        let settings = Settings::new(Some(&config_path)).expect("settings should load");
+        let rate_quoter = settings.rate_quoter.expect("rate quoter config");
+
+        assert_eq!(rate_quoter.units, vec![CurrencyUnit::Usd]);
+        assert_eq!(rate_quoter.buffer_bps, 75);
+        assert_eq!(rate_quoter.ttl_secs, 90);
+        assert_eq!(rate_quoter.sources.len(), 3);
+        assert_eq!(rate_quoter.staleness_secs, 45);
+        assert_eq!(rate_quoter.min_fetched, 4);
+        assert_eq!(rate_quoter.min_survived, 3);
+        assert!(!rate_quoter.allow_in_memory_store);
+        assert_eq!(
+            rate_quoter.per_unit_caps.get(&CurrencyUnit::Usd),
+            Some(&1000)
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_rate_quoter_split_quorum_defaults() {
+        // Split quorum: at least 3 sources fetched AND at least 2 surviving
+        // trimming are independent knobs with independent defaults.
+        let rate_quoter = RateQuoter::default();
+        assert_eq!(rate_quoter.min_fetched, 3);
+        assert_eq!(rate_quoter.min_survived, 2);
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn test_ctf_registration_fee_config_requires_base() {
+        let config_content = r#"
+[[mint_info.ctf_registration_fees]]
+unit = "msat"
+registration_fee_per_keyset = 10000
+"#;
+
+        let config = Config::builder()
+            .add_source(
+                Config::try_from(&Settings::default()).expect("default config should build"),
+            )
+            .add_source(config::File::from_str(
+                config_content,
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config source should build");
+
+        let result = config.try_deserialize::<Settings>();
+
+        assert!(
+            result.is_err(),
+            "missing registration_fee_base must fail config deserialization"
+        );
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn test_ctf_registration_fee_config_requires_per_keyset() {
+        let config_content = r#"
+[[mint_info.ctf_registration_fees]]
+unit = "msat"
+registration_fee_base = 10000
+"#;
+
+        let config = Config::builder()
+            .add_source(
+                Config::try_from(&Settings::default()).expect("default config should build"),
+            )
+            .add_source(config::File::from_str(
+                config_content,
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config source should build");
+
+        let result = config.try_deserialize::<Settings>();
+
+        assert!(
+            result.is_err(),
+            "missing registration_fee_per_keyset must fail config deserialization"
+        );
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn test_partial_ctf_registration_fee_config_fails_load_settings() {
+        use std::{env, fs};
+
+        let temp_dir = env::temp_dir().join(format!(
+            "cdk_test_partial_ctf_registration_fee_config_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let config_path = temp_dir.join("config.toml");
+        let config_content = r#"
+[[mint_info.ctf_registration_fees]]
+unit = "msat"
+registration_fee_per_keyset = 10000
+"#;
+        fs::write(&config_path, config_content).expect("write config");
+
+        let result = crate::load_settings(&temp_dir, Some(config_path));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        assert!(
+            result.is_err(),
+            "load_settings must propagate partial CTF registration fee config errors"
+        );
+    }
 
     #[test]
     fn test_info_debug_impl() {
@@ -918,7 +1162,7 @@ max_melt = 500000
         env::set_var(crate::env_vars::ENV_LND_RESERVE_FEE_MIN, "4");
 
         // Load settings and apply environment variables (same as production code)
-        let mut settings = Settings::new(Some(&config_path));
+        let mut settings = Settings::new(Some(&config_path)).expect("settings should load");
         settings.from_env().expect("Failed to apply env vars");
 
         // Verify that settings were populated from env vars
@@ -975,7 +1219,7 @@ max_melt = 500000
         env::set_var(crate::env_vars::ENV_CLN_RESERVE_FEE_MIN, "4");
 
         // Load settings and apply environment variables (same as production code)
-        let mut settings = Settings::new(Some(&config_path));
+        let mut settings = Settings::new(Some(&config_path)).expect("settings should load");
         settings.from_env().expect("Failed to apply env vars");
 
         // Verify that settings were populated from env vars
@@ -1033,7 +1277,7 @@ max_melt = 500000
         env::set_var(crate::env_vars::ENV_LNBITS_RESERVE_FEE_MIN, "5");
 
         // Load settings and apply environment variables (same as production code)
-        let mut settings = Settings::new(Some(&config_path));
+        let mut settings = Settings::new(Some(&config_path)).expect("settings should load");
         settings.from_env().expect("Failed to apply env vars");
 
         // Verify that settings were populated from env vars
@@ -1087,7 +1331,7 @@ max_melt = 500000
         env::set_var(crate::env_vars::ENV_FAKE_WALLET_MAX_DELAY, "5");
 
         // Load settings and apply environment variables (same as production code)
-        let mut settings = Settings::new(Some(&config_path));
+        let mut settings = Settings::new(Some(&config_path)).expect("settings should load");
         settings.from_env().expect("Failed to apply env vars");
 
         // Verify that settings were populated from env vars
@@ -1141,7 +1385,7 @@ max_melt = 500000
         env::set_var(crate::env_vars::ENV_GRPC_PROCESSOR_PORT, "50051");
 
         // Load settings and apply environment variables (same as production code)
-        let mut settings = Settings::new(Some(&config_path));
+        let mut settings = Settings::new(Some(&config_path)).expect("settings should load");
         settings.from_env().expect("Failed to apply env vars");
 
         // Verify that settings were populated from env vars
@@ -1199,7 +1443,7 @@ max_melt = 500000
         );
 
         // Load settings and apply environment variables (same as production code)
-        let mut settings = Settings::new(Some(&config_path));
+        let mut settings = Settings::new(Some(&config_path)).expect("settings should load");
         settings.from_env().expect("Failed to apply env vars");
 
         // Verify that settings were populated from env vars
