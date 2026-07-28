@@ -1,3 +1,4 @@
+use std::fmt;
 use std::str::FromStr;
 
 use bitcoin::secp256k1::XOnlyPublicKey;
@@ -39,6 +40,11 @@ impl PoolPolicy {
         };
         if policy.rate_d == 0 {
             return Err(Error::InvalidPoolPolicy("rate_d must be positive"));
+        }
+        if greatest_common_divisor(policy.rate_n, policy.rate_d) != 1 {
+            return Err(Error::InvalidPoolPolicy(
+                "rate_n/rate_d must be a reduced fraction",
+            ));
         }
         if policy.min_receive == 0 {
             return Err(Error::InvalidPoolPolicy("min_receive must be positive"));
@@ -94,7 +100,7 @@ pub enum PayToUnlockMode {
 }
 
 /// A validated CTF `PAY_TO_UNLOCK` condition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PayToUnlockCondition {
     /// Unique nonce for this proof.
     pub nonce: CanonicalHash,
@@ -110,15 +116,22 @@ pub struct PayToUnlockCondition {
     pub mode: PayToUnlockMode,
 }
 
+impl fmt::Debug for PayToUnlockCondition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PayToUnlockCondition")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PayToUnlockCondition {
     /// Strictly decode and validate one CTF `PAY_TO_UNLOCK` proof secret.
     pub fn parse(secret: &Secret) -> Result<Self, Error> {
         let (kind, data): (String, StrictSecretData) = serde_json::from_slice(secret.as_bytes())
-            .map_err(|error| Error::InvalidCondition(error.to_string()))?;
+            .map_err(|_| Error::InvalidCondition("condition wire is malformed"))?;
         if kind != "PAY_TO_UNLOCK" {
-            return Err(Error::InvalidCondition(
-                "kind must be PAY_TO_UNLOCK".to_string(),
-            ));
+            return Err(Error::InvalidCondition("kind must be PAY_TO_UNLOCK"));
         }
 
         let nonce = CanonicalHash::parse(&data.nonce, "nonce")?;
@@ -175,7 +188,7 @@ impl ConditionTags {
         let mut parsed = PartialConditionTags::default();
         for tag in tags {
             let Some(name) = tag.first() else {
-                return Err(Error::UnknownTag(String::new()));
+                return Err(Error::UnknownTag);
             };
             match name.as_str() {
                 OFFER_KEYSET => set_tag(&mut parsed.offer_keyset, &tag)?,
@@ -185,7 +198,7 @@ impl ConditionTags {
                 RATE_D => set_tag(&mut parsed.rate_d, &tag)?,
                 MIN_RECEIVE => set_tag(&mut parsed.min_receive, &tag)?,
                 MAX_DEBIT => set_tag(&mut parsed.max_debit, &tag)?,
-                _ => return Err(Error::UnknownTag(name.clone())),
+                _ => return Err(Error::UnknownTag),
             }
         }
 
@@ -229,15 +242,23 @@ struct PartialConditionTags {
 
 fn set_tag(destination: &mut Option<String>, tag: &[String]) -> Result<(), Error> {
     if tag.len() != 2 {
-        return Err(Error::InvalidCondition(format!(
-            "tag {} must contain exactly one value",
-            tag.first().map_or("", String::as_str)
-        )));
+        return Err(Error::InvalidCondition(
+            "each tag must contain exactly one value",
+        ));
     }
     if destination.replace(tag[1].clone()).is_some() {
-        return Err(Error::DuplicateTag(tag[0].clone()));
+        return Err(Error::DuplicateTag);
     }
     Ok(())
+}
+
+fn greatest_common_divisor(mut lhs: u128, mut rhs: u128) -> u128 {
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+    lhs
 }
 
 fn parse_keyset_id(value: &str) -> Result<Id, Error> {

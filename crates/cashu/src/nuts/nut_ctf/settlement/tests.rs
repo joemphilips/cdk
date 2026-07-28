@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::*;
 use crate::nuts::nut00::{BlindedMessage, Proof};
@@ -98,7 +98,7 @@ fn condition_parser_enforces_closed_tags_and_minimal_numbers() {
     );
     assert_eq!(
         PayToUnlockCondition::parse(&unknown),
-        Err(Error::UnknownTag("allow_change".to_string()))
+        Err(Error::UnknownTag)
     );
 
     let missing = Secret::new(
@@ -138,7 +138,25 @@ fn condition_parser_enforces_closed_tags_and_minimal_numbers() {
     );
     assert_eq!(
         PayToUnlockCondition::parse(&duplicate),
-        Err(Error::DuplicateTag("expiry".to_string()))
+        Err(Error::DuplicateTag)
+    );
+
+    let unreduced = condition(
+        "07",
+        &"77".repeat(32),
+        KEYSET_A,
+        &[
+            ("rate_n", "10"),
+            ("rate_d", "6"),
+            ("min_receive", "1"),
+            ("max_debit", "100"),
+        ],
+    );
+    assert_eq!(
+        PayToUnlockCondition::parse(&unreduced),
+        Err(Error::InvalidPoolPolicy(
+            "rate_n/rate_d must be a reduced fraction"
+        ))
     );
 }
 
@@ -286,6 +304,33 @@ fn strict_request_rejects_unknown_and_partial_pool_fields() {
             "pool_manifest and pool_selection must appear together"
         ))
     );
+}
+
+#[test]
+fn strict_request_rejects_explicit_null_optional_fields() {
+    let mut request =
+        serde_json::to_value(valid_standard_request()).expect("serializable settlement");
+    request["parent_collection_id"] = Value::Null;
+    assert!(matches!(
+        CtfSettlementRequest::decode(
+            &serde_json::to_vec(&request).expect("serializable request"),
+            limits()
+        ),
+        Err(Error::Json(_))
+    ));
+
+    for field in ["pool_manifest", "pool_selection"] {
+        let mut request =
+            serde_json::to_value(valid_standard_request()).expect("serializable settlement");
+        request["participants"][0][field] = Value::Null;
+        assert!(matches!(
+            CtfSettlementRequest::decode(
+                &serde_json::to_vec(&request).expect("serializable request"),
+                limits()
+            ),
+            Err(Error::Json(_))
+        ));
+    }
 }
 
 #[test]
@@ -438,6 +483,16 @@ fn nut06_multi_party_is_complete_and_round_trips() {
             .max_pool_entries,
         256
     );
+}
+
+#[test]
+fn nut06_rejects_limits_that_cannot_hold_one_valid_multi_request() {
+    for limits in [(2, 1, 2, 2), (2, 2, 1, 2), (2, 2, 2, 1)] {
+        assert!(
+            NutCtfSettlementSettings::new(limits.0, limits.1, limits.2, 1024, 60, limits.3)
+                .is_err()
+        );
+    }
 }
 
 #[test]
