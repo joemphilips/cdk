@@ -1374,7 +1374,7 @@ name = "cdk-exchange-rate"
 version = "0.17.0"
 dependencies = [
  "async-trait",
- "axum 0.8.8",
+ "axum",
  "bip39",
  "cdk",
  "cdk-axum",
