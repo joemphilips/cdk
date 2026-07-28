@@ -1009,12 +1009,9 @@ where
         if !query_parts.is_empty() {
             url.set_query(Some(&query_parts.join("&")));
         }
-        #[cfg(feature = "auth")]
         let auth_token = self
             .get_auth_token(Method::Get, RoutePath::Conditions)
             .await?;
-        #[cfg(not(feature = "auth"))]
-        let auth_token = None;
         self.transport.http_get(url, auth_token).await
     }
 
@@ -1028,12 +1025,9 @@ where
         let url = self
             .mint_url
             .join_paths(&["v1", "conditions", condition_id])?;
-        #[cfg(feature = "auth")]
         let auth_token = self
             .get_auth_token(Method::Get, RoutePath::Condition)
             .await?;
-        #[cfg(not(feature = "auth"))]
-        let auth_token = None;
         self.transport.http_get(url, auth_token).await
     }
 
@@ -1045,12 +1039,9 @@ where
         request: crate::nuts::nut_ctf::RegisterConditionRequest,
     ) -> Result<crate::nuts::nut_ctf::RegisterConditionResponse, Error> {
         let url = self.mint_url.join_paths(&["v1", "conditions"])?;
-        #[cfg(feature = "auth")]
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::Conditions)
             .await?;
-        #[cfg(not(feature = "auth"))]
-        let auth_token = None;
         self.transport.http_post(url, auth_token, &request).await
     }
 
@@ -1077,12 +1068,9 @@ where
         if !query_parts.is_empty() {
             url.set_query(Some(&query_parts.join("&")));
         }
-        #[cfg(feature = "auth")]
         let auth_token = self
             .get_auth_token(Method::Get, RoutePath::ConditionalKeysets)
             .await?;
-        #[cfg(not(feature = "auth"))]
-        let auth_token = None;
         self.transport.http_get(url, auth_token).await
     }
 
@@ -1094,10 +1082,7 @@ where
         request: crate::nuts::nut_ctf::CtfConvertRequest,
     ) -> Result<crate::nuts::nut_ctf::CtfConvertResponse, Error> {
         let url = self.mint_url.join_paths(&["v1", "ctf", "convert"])?;
-        #[cfg(feature = "auth")]
         let auth_token = self.get_auth_token(Method::Post, RoutePath::Swap).await?;
-        #[cfg(not(feature = "auth"))]
-        let auth_token = None;
         self.transport.http_post(url, auth_token, &request).await
     }
 
@@ -1109,12 +1094,9 @@ where
         request: crate::nuts::nut_ctf::RedeemOutcomeRequest,
     ) -> Result<crate::nuts::nut_ctf::RedeemOutcomeResponse, Error> {
         let url = self.mint_url.join_paths(&["v1", "redeem_outcome"])?;
-        #[cfg(feature = "auth")]
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::RedeemOutcome)
             .await?;
-        #[cfg(not(feature = "auth"))]
-        let auth_token = None;
         self.transport.http_post(url, auth_token, &request).await
     }
 }
