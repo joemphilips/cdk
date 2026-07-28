@@ -29,7 +29,29 @@ impl std::str::FromStr for LoggingOutput {
             "file" => Ok(LoggingOutput::File),
             "both" => Ok(LoggingOutput::Both),
             _ => Err(format!(
-                "Unknown logging output: {s}. Valid options: stdout, file, both"
+                "Unknown logging output: {s}. Valid options: stderr, file, both"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LoggingFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl std::str::FromStr for LoggingFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "text" => Ok(LoggingFormat::Text),
+            "json" => Ok(LoggingFormat::Json),
+            _ => Err(format!(
+                "Unknown logging format: {s}. Valid options: text, json"
             )),
         }
     }
@@ -37,10 +59,13 @@ impl std::str::FromStr for LoggingOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LoggingConfig {
-    /// Where to output logs: stdout, file, or both
+    /// Where to output logs: stderr, file, or both
     #[serde(default)]
     pub output: LoggingOutput,
-    /// Log level for console output (when stdout or both)
+    /// Log formatter: text or json
+    #[serde(default)]
+    pub format: LoggingFormat,
+    /// Log level for console output (when stderr or both)
     pub console_level: Option<String>,
     /// Log level for file output (when file or both)
     pub file_level: Option<String>,
@@ -1115,6 +1140,9 @@ pub struct Limits {
     /// Maximum number of outputs allowed per transaction (mint/swap/melt)
     #[serde(default = "default_max_outputs")]
     pub max_outputs: usize,
+    /// Maximum number of outcomes allowed per conditional-token condition
+    #[serde(default = "default_max_outcomes_per_condition")]
+    pub max_outcomes_per_condition: usize,
 }
 
 impl Default for Limits {
@@ -1122,6 +1150,7 @@ impl Default for Limits {
         Self {
             max_inputs: 1000,
             max_outputs: 1000,
+            max_outcomes_per_condition: default_max_outcomes_per_condition(),
         }
     }
 }
@@ -1132,6 +1161,10 @@ fn default_max_inputs() -> usize {
 
 fn default_max_outputs() -> usize {
     1000
+}
+
+fn default_max_outcomes_per_condition() -> usize {
+    255
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1155,6 +1188,15 @@ pub struct MintInfo {
     pub contact_email: Option<String>,
     /// URL to the terms of service
     pub tos_url: Option<String>,
+    /// NUT-CTF default keyset creation policy: none, one-vs-rest, or all.
+    #[cfg(feature = "conditional-tokens")]
+    pub ctf_default_keyset_creation: Option<String>,
+    /// NUT-CTF flat registration fee per new condition.
+    #[cfg(feature = "conditional-tokens")]
+    pub ctf_registration_fee_base: Option<u64>,
+    /// NUT-CTF registration fee per created keyset.
+    #[cfg(feature = "conditional-tokens")]
+    pub ctf_registration_fee_per_keyset: Option<u64>,
 }
 
 #[cfg(feature = "management-rpc")]

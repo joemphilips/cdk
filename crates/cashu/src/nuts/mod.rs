@@ -32,6 +32,8 @@ pub mod nut27;
 pub mod nut28;
 pub mod nut29;
 pub mod nut30;
+#[cfg(feature = "conditional-tokens")]
+pub mod nut_ctf;
 
 mod auth;
 

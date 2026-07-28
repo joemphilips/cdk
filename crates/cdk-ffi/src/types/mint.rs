@@ -584,6 +584,12 @@ impl TryFrom<Nuts> for cdk::nuts::Nuts {
             nut20: cdk::nuts::nut06::SupportedSettings {
                 supported: n.nut20_supported,
             },
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf: None,
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf_split_merge: None,
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf_numeric: None,
             nut21: n.nut21.map(|s| s.try_into()).transpose()?,
             nut22: n.nut22.map(|s| s.try_into()).transpose()?,
             nut29: n.nut29.into(),
@@ -764,6 +770,12 @@ mod tests {
                 )],
             }),
             nut29: Default::default(),
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf: None,
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf_split_merge: None,
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf_numeric: None,
         }
     }
 
@@ -904,6 +916,12 @@ mod tests {
             nut21: None,
             nut22: None,
             nut29: Default::default(),
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf: None,
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf_split_merge: None,
+            #[cfg(feature = "conditional-tokens")]
+            nut_ctf_numeric: None,
         };
 
         let ffi_nuts: Nuts = cdk_nuts.into();

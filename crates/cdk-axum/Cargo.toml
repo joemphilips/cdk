@@ -13,6 +13,7 @@ readme = "README.md"
 [features]
 redis = ["dep:redis"]
 integration-tests = []
+conditional-tokens = ["cdk/conditional-tokens"]
 prometheus = ["dep:cdk-prometheus"]
 info-page = ["dep:maud"]
 

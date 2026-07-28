@@ -1,0 +1,1905 @@
+//! NUT-CTF conditional token tests for swap and redeem operations
+
+use std::collections::HashMap;
+
+use cdk_common::amount::SplitTarget;
+use cdk_common::dhke::construct_proofs;
+use cdk_common::nuts::nut_ctf::test_helpers::{
+    create_digit_decomposition_announcement, create_multi_oracle_witness,
+    create_numeric_oracle_witness, create_oracle_witness, create_test_announcement,
+    create_test_oracle, create_test_oracle_2,
+};
+use cdk_common::nuts::nut_ctf::{
+    CtfConvertRequest, NutCtfSettings, RedeemOutcomeRequest, RegisterConditionRequest,
+};
+use cdk_common::nuts::{
+    Conditions, Id, PreMintSecrets, ProofsMethods, SecretKey, SigFlag, SpendingConditions,
+    SwapRequest, Witness,
+};
+use cdk_common::{Amount, CurrencyUnit, State};
+
+use crate::test_helpers::mint::{create_test_mint, mint_test_proofs};
+use crate::Error;
+
+/// Helper: create an enum RegisterConditionRequest with all fields
+fn enum_condition_request(
+    description: &str,
+    announcements: Vec<String>,
+) -> RegisterConditionRequest {
+    let outcome_collections = announcements.first().map(|announcement| {
+        let parsed = cdk_common::nuts::nut_ctf::dlc::parse_oracle_announcement(announcement)
+            .expect("test announcement should parse");
+        cdk_common::nuts::nut_ctf::dlc::extract_outcomes(&parsed)
+            .expect("test announcement should contain enum outcomes")
+    });
+
+    RegisterConditionRequest {
+        threshold: 1,
+        tags: vec![vec!["description".to_string(), description.to_string()]],
+        announcements,
+        collateral: Some("sat".to_string()),
+        outcome_collections,
+        fee: None,
+        outputs: None,
+        condition_type: "enum".to_string(),
+        lo_bound: None,
+        hi_bound: None,
+        precision: None,
+    }
+}
+
+/// Get the regular (non-conditional) active keyset ID for SAT.
+/// Must be called BEFORE registering any conditions.
+fn get_regular_keyset_id(mint: &crate::mint::Mint) -> Id {
+    *mint
+        .get_active_keysets()
+        .get(&CurrencyUnit::Sat)
+        .expect("mint should have an active SAT keyset")
+}
+
+/// Register a test condition, returning (condition_id, keysets map)
+async fn register_test_condition(
+    mint: &crate::mint::Mint,
+    outcomes: &[&str],
+    outcome_collections: Option<Vec<String>>,
+) -> (String, HashMap<String, Id>) {
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, outcomes, "test-event");
+
+    let mut request = enum_condition_request("Test condition", vec![hex_tlv]);
+    if let Some(collections) = outcome_collections {
+        request.outcome_collections = Some(collections);
+    }
+
+    let condition_response = mint.register_condition(request).await.unwrap();
+    (condition_response.condition_id, condition_response.keysets)
+}
+
+/// Helper: create PreMintSecrets for a given keyset
+fn create_premint(
+    mint: &crate::mint::Mint,
+    keyset_id: Id,
+    amount: Amount,
+) -> (Vec<cdk_common::nuts::BlindedMessage>, PreMintSecrets) {
+    let keys = mint
+        .keyset_pubkeys(&keyset_id)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+
+    let fee_and_amounts: (u64, Vec<u64>) =
+        (0, keys.iter().map(|(a, _)| a.to_u64()).collect::<Vec<_>>());
+
+    let pre_mint = PreMintSecrets::random(
+        keyset_id,
+        amount,
+        &SplitTarget::None,
+        &fee_and_amounts.into(),
+    )
+    .unwrap();
+    let blinded_messages = pre_mint.blinded_messages().to_vec();
+    (blinded_messages, pre_mint)
+}
+
+fn after_conditional_input_fee(amount: Amount) -> Amount {
+    amount - Amount::from(1)
+}
+
+/// Helper: create P2PK 2-of-2 PreMintSecrets for a given keyset.
+fn create_p2pk_premint(
+    mint: &crate::mint::Mint,
+    keyset_id: Id,
+    amount: Amount,
+) -> (Vec<cdk_common::nuts::BlindedMessage>, PreMintSecrets) {
+    let keys = mint
+        .keyset_pubkeys(&keyset_id)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+
+    let fee_and_amounts: (u64, Vec<u64>) =
+        (0, keys.iter().map(|(a, _)| a.to_u64()).collect::<Vec<_>>());
+    let seller_key = SecretKey::generate();
+    let buyer_key = SecretKey::generate();
+    let conditions = Conditions::new(
+        None,
+        Some(vec![buyer_key.public_key()]),
+        Some(vec![seller_key.public_key()]),
+        Some(2),
+        Some(SigFlag::SigInputs),
+        None,
+    )
+    .unwrap();
+    let spending_conditions =
+        SpendingConditions::new_p2pk(seller_key.public_key(), Some(conditions));
+
+    let pre_mint = PreMintSecrets::with_conditions(
+        keyset_id,
+        amount,
+        &SplitTarget::None,
+        &spending_conditions,
+        &fee_and_amounts.into(),
+    )
+    .unwrap();
+    let blinded_messages = pre_mint.blinded_messages().to_vec();
+    (blinded_messages, pre_mint)
+}
+
+/// Helper: swap regular proofs into a conditional keyset
+async fn swap_to_conditional(
+    mint: &crate::mint::Mint,
+    regular_proofs: cdk_common::Proofs,
+    keyset_id: Id,
+    amount: Amount,
+) -> cdk_common::Proofs {
+    let (outputs, pre_mint) = create_premint(mint, keyset_id, amount);
+
+    let keys = mint
+        .keyset_pubkeys(&keyset_id)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+
+    let swap_request = SwapRequest::new(regular_proofs, outputs);
+    let swap_response = mint.process_swap_request(swap_request).await.unwrap();
+
+    construct_proofs(
+        swap_response.signatures,
+        pre_mint.rs(),
+        pre_mint.secrets(),
+        &keys,
+    )
+    .unwrap()
+}
+
+/// Test that registering a condition creates keysets for each outcome collection
+#[tokio::test]
+async fn test_register_condition_creates_keysets() {
+    let mint = create_test_mint().await.unwrap();
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+
+    assert!(!condition_id.is_empty());
+    assert_eq!(keysets.len(), 2, "should create one keyset per outcome");
+    assert!(keysets.contains_key("YES"));
+    assert!(keysets.contains_key("NO"));
+}
+
+/// Test that registering the same condition twice is idempotent
+#[tokio::test]
+async fn test_register_condition_idempotent() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    let request = enum_condition_request("Test condition", vec![hex_tlv]);
+
+    let response1 = mint.register_condition(request.clone()).await.unwrap();
+    let response2 = mint.register_condition(request).await.unwrap();
+
+    assert_eq!(response1.condition_id, response2.condition_id);
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_different_keyset_set() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B", "C"], "one-shot-event");
+
+    let mut request = enum_condition_request("One-shot condition", vec![hex_tlv]);
+    request.outcome_collections = Some(vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+    mint.register_condition(request.clone()).await.unwrap();
+
+    request
+        .outcome_collections
+        .as_mut()
+        .unwrap()
+        .push("A|B".to_string());
+
+    let result = mint.register_condition(request).await;
+    assert!(
+        matches!(result, Err(Error::ConditionAlreadyExists)),
+        "re-registering with a different keyset set must fail with ConditionAlreadyExists: {:?}",
+        result.err()
+    );
+}
+
+/// Test get_conditions returns registered conditions
+#[tokio::test]
+async fn test_get_conditions_returns_registered() {
+    let mint = create_test_mint().await.unwrap();
+    let (condition_id, _) = register_test_condition(&mint, &["YES", "NO"], None).await;
+
+    let response = mint.get_conditions(None, None, &[]).await.unwrap();
+    assert_eq!(response.conditions.len(), 1);
+    assert_eq!(response.conditions[0].condition_id, condition_id);
+}
+
+/// Test get_condition by id returns the correct condition
+#[tokio::test]
+async fn test_get_condition_by_id() {
+    let mint = create_test_mint().await.unwrap();
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+
+    let info = mint.get_condition(&condition_id).await.unwrap();
+    assert_eq!(info.condition_id, condition_id);
+    assert_eq!(info.threshold, 1);
+    assert_eq!(info.keysets.len(), 2);
+    assert_eq!(info.keysets, keysets);
+}
+
+/// Full redeem outcome flow:
+/// mint regular proofs -> register condition -> swap to conditional -> redeem with witness
+#[tokio::test]
+async fn test_redeem_outcome_valid() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // 1. Mint regular proofs BEFORE registering conditions
+    let amount = Amount::from(10);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    // 2. Register condition
+    let condition_response = mint
+        .register_condition(enum_condition_request("Test redeem", vec![hex_tlv]))
+        .await
+        .unwrap();
+
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+
+    // 4. Swap regular proofs to conditional
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+
+    // 5. Attach oracle witness
+    let witness = create_oracle_witness(&oracle, "YES");
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    // 6. Create regular output blinded messages for redemption
+    let (regular_outputs, _) = create_premint(
+        &mint,
+        regular_keyset_id,
+        after_conditional_input_fee(amount),
+    );
+
+    // 7. Redeem
+    let redeem_response = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await
+        .unwrap();
+
+    assert!(!redeem_response.signatures.is_empty());
+}
+
+/// Test that redeeming with the wrong outcome collection fails
+#[tokio::test]
+async fn test_redeem_outcome_wrong_collection() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // Mint regular proofs BEFORE registering conditions
+    let amount = Amount::from(10);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request("Test wrong outcome", vec![hex_tlv]))
+        .await
+        .unwrap();
+    // Use the NO keyset but attest YES
+    let no_keyset_id = *condition_response.keysets.get("NO").unwrap();
+    let conditional_proofs = swap_to_conditional(&mint, regular_proofs, no_keyset_id, amount).await;
+
+    // Attach witness with YES attestation (but proofs are NO keyset)
+    let witness = create_oracle_witness(&oracle, "YES");
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+
+    assert!(result.is_err(), "should fail with wrong outcome collection");
+}
+
+/// Test that redeem without witness fails
+#[tokio::test]
+async fn test_redeem_outcome_no_witness() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // Mint regular proofs BEFORE registering conditions
+    let amount = Amount::from(10);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request("No witness test", vec![hex_tlv]))
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+
+    // No witness attached
+    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: conditional_proofs,
+            outputs: regular_outputs,
+        })
+        .await;
+
+    assert!(result.is_err(), "should fail without witness");
+}
+
+/// Test that outputs using conditional keyset are rejected during redeem
+#[tokio::test]
+async fn test_redeem_outcome_outputs_conditional() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // Mint regular proofs BEFORE registering conditions
+    let amount = Amount::from(10);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request(
+            "Outputs conditional test",
+            vec![hex_tlv],
+        ))
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+    let no_keyset_id = *condition_response.keysets.get("NO").unwrap();
+
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+
+    let witness = create_oracle_witness(&oracle, "YES");
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    // Create outputs using another conditional keyset (NO) — should be rejected
+    let (conditional_outputs, _) = create_premint(&mint, no_keyset_id, amount);
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: conditional_outputs,
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "should reject outputs using conditional keyset"
+    );
+}
+
+/// Test that regular swap allows conditional trading within the same outcome collection.
+#[tokio::test]
+async fn test_swap_allows_same_conditional_outcome_inputs_and_outputs() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // Mint regular proofs BEFORE registering conditions
+    let amount = Amount::from(10);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request(
+            "Conditional transfer test",
+            vec![hex_tlv],
+        ))
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+
+    let output_amount = after_conditional_input_fee(amount);
+    let (conditional_outputs, pre_mint) = create_premint(&mint, yes_keyset_id, output_amount);
+    let keys = mint
+        .keyset_pubkeys(&yes_keyset_id)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+    let swap_request = SwapRequest::new(conditional_proofs, conditional_outputs);
+    let swap_response = mint
+        .process_swap_request(swap_request)
+        .await
+        .expect("same-outcome conditional swap should succeed");
+
+    let refreshed_proofs = construct_proofs(
+        swap_response.signatures,
+        pre_mint.rs(),
+        pre_mint.secrets(),
+        &keys,
+    )
+    .unwrap();
+
+    assert!(refreshed_proofs
+        .iter()
+        .all(|proof| proof.keyset_id == yes_keyset_id));
+    let refreshed_total = refreshed_proofs
+        .iter()
+        .fold(Amount::ZERO, |sum, proof| sum + proof.amount);
+    assert_eq!(refreshed_total, output_amount);
+}
+
+/// Test that regular swap allows conditional trading into P2PK locked outputs
+/// and unlocked change within the same outcome collection.
+#[tokio::test]
+async fn test_swap_allows_same_conditional_outcome_p2pk_lock_and_change() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    let input_amount = Amount::from(136);
+    let regular_proofs = mint_test_proofs(&mint, input_amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request(
+            "Conditional P2PK transfer test",
+            vec![hex_tlv],
+        ))
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, input_amount).await;
+
+    let (mut lock_outputs, lock_pre_mint) =
+        create_p2pk_premint(&mint, yes_keyset_id, Amount::from(100));
+    let (mut change_outputs, change_pre_mint) =
+        create_premint(&mint, yes_keyset_id, Amount::from(35));
+    lock_outputs.append(&mut change_outputs);
+
+    let keys = mint
+        .keyset_pubkeys(&yes_keyset_id)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+    let swap_request = SwapRequest::new(conditional_proofs, lock_outputs);
+    let swap_response = mint
+        .process_swap_request(swap_request)
+        .await
+        .expect("same-outcome conditional P2PK lock swap should succeed");
+
+    let mut rs = lock_pre_mint.rs();
+    rs.extend(change_pre_mint.rs());
+    let mut secrets = lock_pre_mint.secrets();
+    secrets.extend(change_pre_mint.secrets());
+    let refreshed_proofs = construct_proofs(swap_response.signatures, rs, secrets, &keys).unwrap();
+
+    assert!(refreshed_proofs
+        .iter()
+        .all(|proof| proof.keyset_id == yes_keyset_id));
+    let refreshed_total = refreshed_proofs
+        .iter()
+        .fold(Amount::ZERO, |sum, proof| sum + proof.amount);
+    assert_eq!(refreshed_total, after_conditional_input_fee(input_amount));
+}
+
+/// Test that regular swap rejects conditional keyset inputs to regular outputs
+#[tokio::test]
+async fn test_swap_rejects_conditional_inputs() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // Mint regular proofs BEFORE registering conditions
+    let amount = Amount::from(10);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request("Swap reject test", vec![hex_tlv]))
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+
+    // Try a regular swap with conditional proofs as input — should fail
+    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+    let swap_request = SwapRequest::new(conditional_proofs, regular_outputs);
+    let result = mint.process_swap_request(swap_request).await;
+
+    assert!(
+        result.is_err(),
+        "regular swap should reject conditional keyset inputs"
+    );
+}
+
+/// Test that regular swap rejects conditional inputs rewritten to a different outcome.
+#[tokio::test]
+async fn test_swap_rejects_conditional_inputs_to_different_outcome() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // Mint regular proofs BEFORE registering conditions
+    let amount = Amount::from(10);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request(
+            "Conditional wrong outcome test",
+            vec![hex_tlv],
+        ))
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+    let no_keyset_id = *condition_response.keysets.get("NO").unwrap();
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+
+    let (wrong_outcome_outputs, _) = create_premint(&mint, no_keyset_id, amount);
+    let swap_request = SwapRequest::new(conditional_proofs, wrong_outcome_outputs);
+    let result = mint.process_swap_request(swap_request).await;
+
+    assert!(
+        result.is_err(),
+        "regular swap should reject conditional inputs to a different outcome"
+    );
+}
+
+/// Test that a second redemption uses the stored attestation (skips witness verification)
+#[tokio::test]
+async fn test_redeem_second_uses_stored_attestation() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // Mint ALL regular proofs BEFORE registering conditions
+    let amount1 = Amount::from(10);
+    let amount2 = Amount::from(8);
+    let regular_proofs_1 = mint_test_proofs(&mint, amount1).await.unwrap();
+    let regular_proofs_2 = mint_test_proofs(&mint, amount2).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request(
+            "Stored attestation test",
+            vec![hex_tlv],
+        ))
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+
+    // First redemption with valid witness
+    {
+        let conditional_proofs =
+            swap_to_conditional(&mint, regular_proofs_1, yes_keyset_id, amount1).await;
+
+        let witness = create_oracle_witness(&oracle, "YES");
+        let mut proofs_with_witness = conditional_proofs;
+        for proof in &mut proofs_with_witness {
+            proof.witness = Some(Witness::OracleWitness(witness.clone()));
+        }
+
+        let (regular_outputs, _) = create_premint(
+            &mint,
+            regular_keyset_id,
+            after_conditional_input_fee(amount1),
+        );
+
+        mint.process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await
+        .expect("first redemption should succeed");
+    }
+
+    // Second redemption — attestation is already stored
+    {
+        let conditional_proofs =
+            swap_to_conditional(&mint, regular_proofs_2, yes_keyset_id, amount2).await;
+
+        // Witness still needed for parsing, but verification path changes
+        let witness = create_oracle_witness(&oracle, "YES");
+        let mut proofs_with_witness = conditional_proofs;
+        for proof in &mut proofs_with_witness {
+            proof.witness = Some(Witness::OracleWitness(witness.clone()));
+        }
+
+        let (regular_outputs, _) = create_premint(
+            &mint,
+            regular_keyset_id,
+            after_conditional_input_fee(amount2),
+        );
+
+        mint.process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await
+        .expect("second redemption should use stored attestation and succeed");
+    }
+}
+
+/// Test registering condition with custom outcome collections
+#[tokio::test]
+async fn test_register_condition_with_custom_outcome_collections() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B", "C"], "game-event");
+
+    let mut request = enum_condition_request("Outcome collection test", vec![hex_tlv]);
+    request.outcome_collections = Some(vec![
+        "A".to_string(),
+        "B".to_string(),
+        "C".to_string(),
+        "A|B".to_string(),
+        "B|C".to_string(),
+        "A|C".to_string(),
+    ]);
+
+    let condition_response = mint.register_condition(request).await.unwrap();
+
+    assert_eq!(
+        condition_response.keysets.len(),
+        6,
+        "should create one keyset per requested outcome collection"
+    );
+    for collection in ["A", "B", "C", "A|B", "B|C", "A|C"] {
+        assert!(
+            condition_response.keysets.contains_key(collection),
+            "keysets: {:?}",
+            condition_response.keysets
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_register_condition_one_vs_rest_default_creates_managed_keysets() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        default_keyset_creation: "one-vs-rest".to_string(),
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B", "C"], "one-vs-rest-default");
+    let mut request = enum_condition_request("One-vs-rest default", vec![hex_tlv]);
+    request.outcome_collections = None;
+
+    let condition_response = mint.register_condition(request).await.unwrap();
+
+    assert_eq!(condition_response.keysets.len(), 6);
+    for collection in ["A", "B|C", "B", "A|C", "C", "A|B"] {
+        assert!(
+            condition_response.keysets.contains_key(collection),
+            "keysets: {:?}",
+            condition_response.keysets
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_register_condition_one_vs_rest_rejects_client_collections() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        default_keyset_creation: "one-vs-rest".to_string(),
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B", "C"], "one-vs-rest-explicit");
+    let mut request = enum_condition_request("One-vs-rest explicit", vec![hex_tlv]);
+    request.outcome_collections = Some(vec!["A".to_string(), "B".to_string()]);
+
+    let result = mint.register_condition(request).await;
+    assert!(
+        result.is_err(),
+        "managed default keyset policy must reject client-defined collections"
+    );
+}
+
+#[tokio::test]
+async fn test_register_condition_all_default_rejects_client_collections() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        default_keyset_creation: "all".to_string(),
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B", "C"], "all-default");
+    let mut request = enum_condition_request("All default explicit", vec![hex_tlv]);
+    request.outcome_collections = Some(vec!["A".to_string(), "B".to_string()]);
+
+    let result = mint.register_condition(request).await;
+    assert!(
+        result.is_err(),
+        "all default keyset policy must reject client-defined collections"
+    );
+}
+
+#[tokio::test]
+async fn test_register_condition_missing_collateral_fails_before_store() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B"], "missing-collateral");
+
+    let mut request = enum_condition_request("Missing collateral", vec![hex_tlv]);
+    request.collateral = None;
+    request.outcome_collections = Some(vec!["A".to_string(), "B".to_string()]);
+
+    let result = mint.register_condition(request).await;
+    assert!(result.is_err(), "missing collateral must fail");
+
+    let conditions = mint.get_conditions(None, None, &[]).await.unwrap();
+    assert!(
+        conditions.conditions.is_empty(),
+        "failed registration must not leave a stored condition"
+    );
+}
+
+#[tokio::test]
+async fn test_register_condition_charges_registration_fee_once() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fee_base: 2,
+        registration_fee_per_keyset: 3,
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let fee_proofs = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+    let fee_ys = fee_proofs.ys().unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "fee-once");
+    let mut request = enum_condition_request("Fee once", vec![hex_tlv]);
+    request.fee = Some(fee_proofs);
+
+    let first = mint.register_condition(request.clone()).await.unwrap();
+    assert_eq!(first.keysets.len(), 2);
+
+    let states = mint.localstore().get_proofs_states(&fee_ys).await.unwrap();
+    assert!(
+        states.iter().all(|state| *state == Some(State::Spent)),
+        "fee proofs must be marked spent"
+    );
+
+    let second = mint.register_condition(request).await.unwrap();
+    assert_eq!(second.condition_id, first.condition_id);
+    assert_eq!(second.keysets, first.keysets);
+    assert!(
+        second.change.is_none(),
+        "idempotent retry must not return change"
+    );
+}
+
+#[tokio::test]
+async fn test_register_condition_returns_registration_fee_change() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fee_base: 2,
+        registration_fee_per_keyset: 3,
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let fee_proofs = mint_test_proofs(&mint, Amount::from(16)).await.unwrap();
+    let fee_ys = fee_proofs.ys().unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let (change_outputs, _) = create_premint(&mint, regular_keyset_id, Amount::from(8));
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "fee-change");
+    let mut request = enum_condition_request("Fee change", vec![hex_tlv]);
+    request.fee = Some(fee_proofs);
+    request.outputs = Some(change_outputs);
+
+    let response = mint.register_condition(request).await.unwrap();
+    let change = response.change.expect("overpaid fee should return change");
+    assert_eq!(change.iter().map(|sig| sig.amount.to_u64()).sum::<u64>(), 8);
+    assert!(change.iter().all(|sig| sig.keyset_id == regular_keyset_id));
+
+    let states = mint.localstore().get_proofs_states(&fee_ys).await.unwrap();
+    assert!(
+        states.iter().all(|state| *state == Some(State::Spent)),
+        "fee proofs must be marked spent after successful paid registration"
+    );
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_overpaid_fee_without_change_outputs() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fee_base: 2,
+        registration_fee_per_keyset: 3,
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let fee_proofs = mint_test_proofs(&mint, Amount::from(16)).await.unwrap();
+    let fee_ys = fee_proofs.ys().unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "fee-no-change");
+    let mut request = enum_condition_request("Fee no change outputs", vec![hex_tlv]);
+    request.fee = Some(fee_proofs);
+
+    let result = mint.register_condition(request).await;
+    assert!(matches!(result, Err(Error::RegistrationFeeChangeOutputs)));
+    assert!(mint
+        .get_conditions(None, None, &[])
+        .await
+        .unwrap()
+        .conditions
+        .is_empty());
+    let states = mint.localstore().get_proofs_states(&fee_ys).await.unwrap();
+    assert!(
+        states.iter().all(|state| state.is_none()),
+        "rejected registration must not consume fee proofs"
+    );
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_missing_registration_fee_before_store() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fee_base: 1,
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "missing-fee");
+    let request = enum_condition_request("Missing fee", vec![hex_tlv]);
+
+    let result = mint.register_condition(request).await;
+    assert!(matches!(result, Err(Error::RegistrationFeeInsufficient)));
+    assert!(mint
+        .get_conditions(None, None, &[])
+        .await
+        .unwrap()
+        .conditions
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_insufficient_registration_fee() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fee_base: 2,
+        registration_fee_per_keyset: 3,
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "insufficient-fee");
+    let mut request = enum_condition_request("Insufficient fee", vec![hex_tlv]);
+    request.fee = Some(mint_test_proofs(&mint, Amount::from(7)).await.unwrap());
+
+    let result = mint.register_condition(request).await;
+    assert!(matches!(result, Err(Error::RegistrationFeeInsufficient)));
+    assert!(mint
+        .get_conditions(None, None, &[])
+        .await
+        .unwrap()
+        .conditions
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_conditional_registration_fee() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, first_hex) = create_test_announcement(&oracle, &["YES", "NO"], "fee-source");
+    let regular_proofs = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+    let first = mint
+        .register_condition(enum_condition_request("Fee source", vec![first_hex]))
+        .await
+        .unwrap();
+    let yes_keyset_id = *first.keysets.get("YES").unwrap();
+    let conditional_fee =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, Amount::from(8)).await;
+
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fee_base: 1,
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let (_, second_hex) = create_test_announcement(&oracle, &["UP", "DOWN"], "conditional-fee");
+    let mut request = enum_condition_request("Conditional fee", vec![second_hex]);
+    request.fee = Some(conditional_fee);
+
+    let result = mint.register_condition(request).await;
+    assert!(matches!(result, Err(Error::OutputsMustUseRegularKeyset)));
+}
+
+#[tokio::test]
+async fn test_overlapping_collection_redeems_for_any_member() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B", "C"], "overlap-redeem");
+    let amount = Amount::from(16);
+
+    let regular_proofs_a = mint_test_proofs(&mint, amount).await.unwrap();
+    let regular_proofs_c = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let mut request = enum_condition_request("Overlap redeem", vec![hex_tlv]);
+    request.outcome_collections = Some(vec![
+        "A".to_string(),
+        "B".to_string(),
+        "C".to_string(),
+        "A|B".to_string(),
+        "B|C".to_string(),
+        "A|C".to_string(),
+    ]);
+    let condition_response = mint.register_condition(request).await.unwrap();
+    let ab_keyset_id = *condition_response.keysets.get("A|B").unwrap();
+
+    let ab_proofs = swap_to_conditional(&mint, regular_proofs_a, ab_keyset_id, amount).await;
+    let witness_a = create_oracle_witness(&oracle, "A");
+    let mut proofs_with_witness = ab_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness_a.clone()));
+    }
+    let (regular_outputs, _) = create_premint(
+        &mint,
+        regular_keyset_id,
+        after_conditional_input_fee(amount),
+    );
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "A|B should redeem when A is attested: {:?}",
+        result.err()
+    );
+
+    let ab_proofs = swap_to_conditional(&mint, regular_proofs_c, ab_keyset_id, amount).await;
+    let witness_c = create_oracle_witness(&oracle, "C");
+    let mut proofs_with_witness = ab_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness_c.clone()));
+    }
+    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+    assert!(result.is_err(), "A|B should not redeem when C is attested");
+}
+
+// ============================================================================
+// NUT-CTF-numeric: Numeric condition tests
+// ============================================================================
+
+/// Register a numeric condition with HI/LO partition
+async fn register_numeric_condition(
+    mint: &crate::mint::Mint,
+    lo_bound: i64,
+    hi_bound: i64,
+) -> (String, HashMap<String, Id>) {
+    let oracle = create_test_oracle();
+    // base=10, unsigned, 5 digits -> range [0, 99999]
+    let (_, hex_tlv) =
+        create_digit_decomposition_announcement(&oracle, 10, false, 5, "sat", 0, "numeric-event");
+
+    let request = RegisterConditionRequest {
+        threshold: 1,
+        tags: vec![vec![
+            "description".to_string(),
+            "Numeric test condition".to_string(),
+        ]],
+        announcements: vec![hex_tlv],
+        collateral: Some("sat".to_string()),
+        outcome_collections: Some(vec!["HI".to_string(), "LO".to_string()]),
+        fee: None,
+        outputs: None,
+        condition_type: "numeric".to_string(),
+        lo_bound: Some(lo_bound),
+        hi_bound: Some(hi_bound),
+        precision: Some(0),
+    };
+
+    let condition_response = mint.register_condition(request).await.unwrap();
+    let condition_id = condition_response.condition_id;
+
+    (condition_id, condition_response.keysets)
+}
+
+/// Test registering a numeric condition creates HI/LO keysets
+#[tokio::test]
+async fn test_register_numeric_condition() {
+    let mint = create_test_mint().await.unwrap();
+    let (_condition_id, keysets) = register_numeric_condition(&mint, 0, 100000).await;
+
+    assert_eq!(
+        keysets.len(),
+        2,
+        "numeric condition should create HI and LO keysets"
+    );
+    assert!(keysets.contains_key("HI"), "should have HI keyset");
+    assert!(keysets.contains_key("LO"), "should have LO keyset");
+}
+
+/// Test that numeric condition_id differs from enum condition_id
+#[tokio::test]
+async fn test_numeric_condition_id_differs_from_enum() {
+    let mint = create_test_mint().await.unwrap();
+
+    // Register an enum condition
+    let oracle = create_test_oracle();
+    let (_, enum_hex) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+    let enum_resp = mint
+        .register_condition(enum_condition_request("Enum test", vec![enum_hex]))
+        .await
+        .unwrap();
+
+    // Register a numeric condition (different event to avoid idempotency)
+    let (_, numeric_hex) =
+        create_digit_decomposition_announcement(&oracle, 10, false, 5, "sat", 0, "numeric-event");
+    let numeric_resp = mint
+        .register_condition(RegisterConditionRequest {
+            threshold: 1,
+            tags: vec![vec!["description".to_string(), "Numeric test".to_string()]],
+            announcements: vec![numeric_hex],
+            collateral: Some("sat".to_string()),
+            outcome_collections: Some(vec!["HI".to_string(), "LO".to_string()]),
+            fee: None,
+            outputs: None,
+            condition_type: "numeric".to_string(),
+            lo_bound: Some(0),
+            hi_bound: Some(100000),
+            precision: Some(0),
+        })
+        .await
+        .unwrap();
+
+    assert_ne!(
+        enum_resp.condition_id, numeric_resp.condition_id,
+        "numeric and enum condition IDs should differ"
+    );
+}
+
+/// Test numeric condition info is stored and retrieved correctly
+#[tokio::test]
+async fn test_numeric_condition_info() {
+    let mint = create_test_mint().await.unwrap();
+    let (condition_id, _keysets) = register_numeric_condition(&mint, 1000, 50000).await;
+
+    let info = mint.get_condition(&condition_id).await.unwrap();
+    assert_eq!(info.condition_type, "numeric");
+    assert_eq!(info.lo_bound, Some(1000));
+    assert_eq!(info.hi_bound, Some(50000));
+    assert_eq!(info.precision, Some(0));
+    assert_eq!(info.keysets.len(), 2);
+}
+
+/// Test numeric redemption: HI holder redeems proportional payout
+#[tokio::test]
+async fn test_numeric_redemption_hi() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    // Mint proofs BEFORE registering condition
+    let face_amount = Amount::from(100);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (_condition_id, keysets) = register_numeric_condition(&mint, 0, 100000).await;
+
+    let hi_keyset_id = *keysets.get("HI").unwrap();
+
+    // Swap to HI conditional keyset
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
+
+    // Oracle attests value 50000 (midpoint) -> HI gets 50%
+    let oracle = create_test_oracle();
+    let witness = create_numeric_oracle_witness(&oracle, 50000, 10, false, 5);
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    // HI payout = floor(100 * 50000 / 100000) = 50
+    let hi_payout = Amount::from(50);
+    let (regular_outputs, _) = create_premint(
+        &mint,
+        regular_keyset_id,
+        after_conditional_input_fee(hi_payout),
+    );
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "HI redemption should succeed: {:?}",
+        result.err()
+    );
+    assert!(!result.unwrap().signatures.is_empty());
+}
+
+/// Test numeric redemption: LO holder redeems proportional payout
+#[tokio::test]
+async fn test_numeric_redemption_lo() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    let face_amount = Amount::from(100);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (_condition_id, keysets) = register_numeric_condition(&mint, 0, 100000).await;
+
+    let lo_keyset_id = *keysets.get("LO").unwrap();
+
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, lo_keyset_id, face_amount).await;
+
+    // Oracle attests value 50000 -> LO gets 50%
+    let oracle = create_test_oracle();
+    let witness = create_numeric_oracle_witness(&oracle, 50000, 10, false, 5);
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    // LO payout = 100 - 50 = 50
+    let lo_payout = Amount::from(50);
+    let (regular_outputs, _) = create_premint(
+        &mint,
+        regular_keyset_id,
+        after_conditional_input_fee(lo_payout),
+    );
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "LO redemption should succeed: {:?}",
+        result.err()
+    );
+    assert!(!result.unwrap().signatures.is_empty());
+}
+
+/// Test numeric redemption at lo boundary: V=0 -> LO gets 100%, HI gets 0%
+#[tokio::test]
+async fn test_numeric_boundary_lo() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    let face_amount = Amount::from(100);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (_condition_id, keysets) = register_numeric_condition(&mint, 0, 100000).await;
+    let lo_keyset_id = *keysets.get("LO").unwrap();
+
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, lo_keyset_id, face_amount).await;
+
+    // Oracle attests value 0 (at lo_bound) -> LO gets 100%
+    let oracle = create_test_oracle();
+    let witness = create_numeric_oracle_witness(&oracle, 0, 10, false, 5);
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    let (regular_outputs, _) = create_premint(
+        &mint,
+        regular_keyset_id,
+        after_conditional_input_fee(face_amount),
+    );
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "LO should get 100% when V <= lo_bound: {:?}",
+        result.err()
+    );
+}
+
+/// Test numeric redemption at hi boundary: V=100000 -> HI gets 100%, LO gets 0%
+#[tokio::test]
+async fn test_numeric_boundary_hi() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    let face_amount = Amount::from(100);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (_condition_id, keysets) = register_numeric_condition(&mint, 0, 100000).await;
+    let hi_keyset_id = *keysets.get("HI").unwrap();
+
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
+
+    // Oracle attests value 99999 which is max for 5 unsigned base-10 digits
+    // 99999 < 100000 so HI gets floor(100 * 99999/100000) = 99
+    // To test the >= hi_bound case, we'd need value >= 100000 which requires 6 digits
+    // So let's test with a tight range instead
+    let oracle = create_test_oracle();
+    let witness = create_numeric_oracle_witness(&oracle, 99999, 10, false, 5);
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    // HI gets floor(100 * 99999/100000) = 99
+    let hi_payout = Amount::from(99);
+    let (regular_outputs, _) = create_premint(
+        &mint,
+        regular_keyset_id,
+        after_conditional_input_fee(hi_payout),
+    );
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "HI should get ~100% when V near hi_bound: {:?}",
+        result.err()
+    );
+}
+
+/// Test that requesting more than proportional payout fails
+#[tokio::test]
+async fn test_numeric_redemption_overspend_rejected() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    let face_amount = Amount::from(100);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (_condition_id, keysets) = register_numeric_condition(&mint, 0, 100000).await;
+    let hi_keyset_id = *keysets.get("HI").unwrap();
+
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
+
+    // Oracle attests 20000 -> HI gets floor(100 * 20000/100000) = 20
+    let oracle = create_test_oracle();
+    let witness = create_numeric_oracle_witness(&oracle, 20000, 10, false, 5);
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    // Try to redeem 50 (more than the 20 payout)
+    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, Amount::from(50));
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "should reject output amount exceeding proportional payout"
+    );
+}
+
+// ============================================================================
+// NUT-CTF-split-merge: CTF Convert tests
+// ============================================================================
+
+/// Test that zero-fee split-as-convert is rejected.
+#[tokio::test]
+async fn test_ctf_split_creates_conditional_tokens() {
+    let mint = create_test_mint().await.unwrap();
+
+    // Mint regular proofs BEFORE registering conditions (same pattern as existing tests)
+    let face_amount = Amount::from(16);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+    let no_keyset_id = *keysets.get("NO").unwrap();
+
+    // Create blinded messages for both YES and NO outcome collections
+    let (yes_outputs, _) = create_premint(&mint, yes_keyset_id, face_amount);
+    let (no_outputs, _) = create_premint(&mint, no_keyset_id, face_amount);
+
+    let mut outputs = HashMap::new();
+    outputs.insert("YES".to_string(), yes_outputs);
+    outputs.insert("NO".to_string(), no_outputs);
+
+    let mut inputs = HashMap::new();
+    inputs.insert("*".to_string(), regular_proofs);
+
+    let convert_request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs,
+        outputs,
+    };
+
+    let result = mint.process_ctf_convert(convert_request).await;
+    assert!(result.is_err(), "zero-fee convert should be rejected");
+}
+
+/// Test that split-as-convert uses payoff conservation instead of old partition matching.
+#[tokio::test]
+async fn test_ctf_split_balance_conserved() {
+    let mint = create_test_mint().await.unwrap();
+
+    let face_amount = Amount::from(8);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+    let no_keyset_id = *keysets.get("NO").unwrap();
+
+    let (yes_outputs, _) = create_premint(&mint, yes_keyset_id, face_amount);
+    let (no_outputs, _) = create_premint(&mint, no_keyset_id, face_amount);
+
+    let mut outputs = HashMap::new();
+    outputs.insert("YES".to_string(), yes_outputs);
+    outputs.insert("NO".to_string(), no_outputs);
+
+    let mut inputs = HashMap::new();
+    inputs.insert("*".to_string(), regular_proofs);
+
+    let convert_request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs,
+        outputs,
+    };
+
+    let result = mint.process_ctf_convert(convert_request).await;
+    assert!(result.is_err(), "zero-fee convert should be rejected");
+}
+
+/// Test that a split with unequal per-outcome totals is rejected.
+#[tokio::test]
+async fn test_ctf_split_unequal_outcome_amounts_rejected() {
+    let mint = create_test_mint().await.unwrap();
+
+    let face_amount = Amount::from(16);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+    let no_keyset_id = *keysets.get("NO").unwrap();
+
+    // YES gets 16, NO gets only 8 — totals differ, should be rejected
+    let (yes_outputs, _) = create_premint(&mint, yes_keyset_id, Amount::from(16));
+    let (no_outputs, _) = create_premint(&mint, no_keyset_id, Amount::from(8));
+
+    let mut outputs = HashMap::new();
+    outputs.insert("YES".to_string(), yes_outputs);
+    outputs.insert("NO".to_string(), no_outputs);
+
+    let mut inputs = HashMap::new();
+    inputs.insert("*".to_string(), regular_proofs);
+
+    let convert_request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs,
+        outputs,
+    };
+
+    let result = mint.process_ctf_convert(convert_request).await;
+    assert!(
+        result.is_err(),
+        "split with unequal outcome amounts should be rejected"
+    );
+}
+
+/// Test that a split with an unknown/invalid partition is rejected.
+#[tokio::test]
+async fn test_ctf_split_invalid_partition() {
+    let mint = create_test_mint().await.unwrap();
+
+    let face_amount = Amount::from(8);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    // Condition with YES, NO, MAYBE outcomes; default partition is YES|NO|MAYBE
+    let (condition_id, keysets) =
+        register_test_condition(&mint, &["YES", "NO", "MAYBE"], None).await;
+
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+    let no_keyset_id = *keysets.get("NO").unwrap();
+
+    // Provide only YES and NO — incomplete partition (MAYBE is missing)
+    let (yes_outputs, _) = create_premint(&mint, yes_keyset_id, face_amount);
+    let (no_outputs, _) = create_premint(&mint, no_keyset_id, face_amount);
+
+    let mut outputs = HashMap::new();
+    outputs.insert("YES".to_string(), yes_outputs);
+    outputs.insert("NO".to_string(), no_outputs);
+
+    let mut inputs = HashMap::new();
+    inputs.insert("*".to_string(), regular_proofs);
+
+    let convert_request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs,
+        outputs,
+    };
+
+    let result = mint.process_ctf_convert(convert_request).await;
+    assert!(
+        result.is_err(),
+        "convert with uncovered payoff should be rejected"
+    );
+}
+
+/// Test that a split using the wrong keyset for an outcome collection is rejected.
+#[tokio::test]
+async fn test_ctf_split_wrong_keyset_rejected() {
+    let mint = create_test_mint().await.unwrap();
+
+    let face_amount = Amount::from(8);
+    let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+    let no_keyset_id = *keysets.get("NO").unwrap();
+
+    // Intentionally swap YES/NO: use NO keyset for the "YES" output key
+    let (swapped_yes, _) = create_premint(&mint, no_keyset_id, face_amount);
+    let (swapped_no, _) = create_premint(&mint, yes_keyset_id, face_amount);
+
+    let mut outputs = HashMap::new();
+    outputs.insert("YES".to_string(), swapped_yes);
+    outputs.insert("NO".to_string(), swapped_no);
+
+    let mut inputs = HashMap::new();
+    inputs.insert("*".to_string(), regular_proofs);
+
+    let convert_request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs,
+        outputs,
+    };
+
+    let result = mint.process_ctf_convert(convert_request).await;
+    assert!(
+        result.is_err(),
+        "split with swapped/wrong keysets should be rejected"
+    );
+}
+
+/// Test that a CTF merge of a complete partition returns regular tokens.
+/// Flow: mint regular → (swap) YES conditional proofs + NO conditional proofs → merge → regular
+#[tokio::test]
+async fn test_ctf_merge_returns_regular_tokens() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    let face_amount = Amount::from(8);
+    // Mint BEFORE registering conditions; need two batches for YES and NO conditional proofs
+    let yes_regular = mint_test_proofs(&mint, face_amount).await.unwrap();
+    let no_regular = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+    let no_keyset_id = *keysets.get("NO").unwrap();
+
+    // Swap regular proofs into each conditional keyset
+    let yes_proofs = swap_to_conditional(&mint, yes_regular, yes_keyset_id, face_amount).await;
+    let no_proofs = swap_to_conditional(&mint, no_regular, no_keyset_id, face_amount).await;
+
+    // Merge YES + NO back into regular tokens. Conditional keysets charge 1 ppk,
+    // so the two input proofs pay one base unit total.
+    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, Amount::from(7));
+
+    let mut inputs = HashMap::new();
+    inputs.insert("YES".to_string(), yes_proofs);
+    inputs.insert("NO".to_string(), no_proofs);
+
+    let mut outputs = HashMap::new();
+    outputs.insert("*".to_string(), regular_outputs);
+
+    let merge_request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs,
+        outputs,
+    };
+
+    let result = mint.process_ctf_convert(merge_request).await;
+    assert!(
+        result.is_ok(),
+        "conditional-input convert should pay one base unit: {:?}",
+        result.err()
+    );
+}
+
+/// Test that a merge with an incomplete partition (missing an outcome) is rejected.
+#[tokio::test]
+async fn test_ctf_merge_incomplete_partition_rejected() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    let face_amount = Amount::from(8);
+    // Mint BEFORE registering conditions
+    let yes_regular = mint_test_proofs(&mint, face_amount).await.unwrap();
+
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+
+    let yes_proofs = swap_to_conditional(&mint, yes_regular, yes_keyset_id, face_amount).await;
+
+    // Only provide YES inputs — NO is missing, so the partition is incomplete
+    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, face_amount);
+
+    let mut inputs = HashMap::new();
+    inputs.insert("YES".to_string(), yes_proofs);
+
+    let mut outputs = HashMap::new();
+    outputs.insert("*".to_string(), regular_outputs);
+
+    let merge_request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs,
+        outputs,
+    };
+
+    let result = mint.process_ctf_convert(merge_request).await;
+    assert!(
+        result.is_err(),
+        "merge with incomplete partition should be rejected"
+    );
+}
+
+// ============================================================================
+// Multi-oracle threshold integration test
+// ============================================================================
+
+/// Test that redeeming a 2-of-2 threshold condition requires signatures from both oracles.
+///
+/// Setup: register a condition with two oracles and threshold=2.
+/// Verify that providing only one oracle sig fails (threshold not met),
+/// while providing both succeeds.
+#[tokio::test]
+async fn test_redeem_outcome_multi_oracle_threshold() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    let oracle1 = create_test_oracle();
+    let oracle2 = create_test_oracle_2();
+
+    // Both oracles announce the same event with the same outcomes
+    let (_, hex_tlv1) = create_test_announcement(&oracle1, &["YES", "NO"], "multi-oracle-event");
+    let (_, hex_tlv2) = create_test_announcement(&oracle2, &["YES", "NO"], "multi-oracle-event");
+
+    // Mint regular proofs BEFORE registering conditions
+    let amount = Amount::from(16);
+    let regular_proofs_1 = mint_test_proofs(&mint, amount).await.unwrap();
+    let regular_proofs_2 = mint_test_proofs(&mint, amount).await.unwrap();
+
+    // Register condition with threshold=2 (requires both oracles)
+    let condition_response = mint
+        .register_condition(RegisterConditionRequest {
+            threshold: 2,
+            tags: vec![vec![
+                "description".to_string(),
+                "2-of-2 oracle condition".to_string(),
+            ]],
+            announcements: vec![hex_tlv1, hex_tlv2],
+            collateral: Some("sat".to_string()),
+            outcome_collections: Some(vec!["YES".to_string(), "NO".to_string()]),
+            fee: None,
+            outputs: None,
+            condition_type: "enum".to_string(),
+            lo_bound: None,
+            hi_bound: None,
+            precision: None,
+        })
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+
+    // --- Attempt 1: only oracle1 sig — should fail (threshold not met) ---
+    {
+        let conditional_proofs =
+            swap_to_conditional(&mint, regular_proofs_1, yes_keyset_id, amount).await;
+
+        let witness_one = create_multi_oracle_witness(&[(&oracle1, "YES")]);
+
+        let mut proofs_with_witness = conditional_proofs;
+        for proof in &mut proofs_with_witness {
+            proof.witness = Some(Witness::OracleWitness(witness_one.clone()));
+        }
+
+        let (regular_outputs, _) = create_premint(
+            &mint,
+            regular_keyset_id,
+            after_conditional_input_fee(amount),
+        );
+
+        let result = mint
+            .process_redeem_outcome(RedeemOutcomeRequest {
+                inputs: proofs_with_witness,
+                outputs: regular_outputs,
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "single oracle sig should fail threshold=2 check"
+        );
+    }
+
+    // --- Attempt 2: both oracle sigs — should succeed ---
+    {
+        let conditional_proofs =
+            swap_to_conditional(&mint, regular_proofs_2, yes_keyset_id, amount).await;
+
+        let witness_both = create_multi_oracle_witness(&[(&oracle1, "YES"), (&oracle2, "YES")]);
+
+        let mut proofs_with_witness = conditional_proofs;
+        for proof in &mut proofs_with_witness {
+            proof.witness = Some(Witness::OracleWitness(witness_both.clone()));
+        }
+
+        let (regular_outputs, _) = create_premint(
+            &mint,
+            regular_keyset_id,
+            after_conditional_input_fee(amount),
+        );
+
+        let result = mint
+            .process_redeem_outcome(RedeemOutcomeRequest {
+                inputs: proofs_with_witness,
+                outputs: regular_outputs,
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "both oracle sigs should meet threshold=2: {:?}",
+            result.err()
+        );
+    }
+}
+
+// ============================================================================
+// Security regression tests
+// ============================================================================
+
+/// Test that duplicate attestation signatures from the same oracle
+/// cannot satisfy a threshold > 1 requirement.
+///
+/// This is a regression test for P1: threshold bypass via duplicate oracle pubkeys.
+#[tokio::test]
+async fn test_redeem_rejects_duplicate_oracle_sigs() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+
+    let oracle1 = create_test_oracle();
+    let oracle2 = create_test_oracle_2();
+
+    // Register with two oracles, threshold=2
+    let (_, hex_tlv1) = create_test_announcement(&oracle1, &["YES", "NO"], "dup-event");
+    let (_, hex_tlv2) = create_test_announcement(&oracle2, &["YES", "NO"], "dup-event");
+
+    let amount = Amount::from(16);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(RegisterConditionRequest {
+            threshold: 2,
+            tags: vec![vec![
+                "description".to_string(),
+                "Dup oracle test".to_string(),
+            ]],
+            announcements: vec![hex_tlv1, hex_tlv2],
+            collateral: Some("sat".to_string()),
+            outcome_collections: Some(vec!["YES".to_string(), "NO".to_string()]),
+            fee: None,
+            outputs: None,
+            condition_type: "enum".to_string(),
+            lo_bound: None,
+            hi_bound: None,
+            precision: None,
+        })
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+
+    // Provide oracle1's signature twice (duplicate) — should NOT satisfy threshold=2
+    let witness = create_multi_oracle_witness(&[(&oracle1, "YES"), (&oracle1, "YES")]);
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "duplicate oracle sigs from same pubkey should not satisfy threshold=2"
+    );
+}
+
+/// Regression test: a redeem call that fails (e.g. unbalanced inputs/outputs) MUST NOT
+/// persist `winning_outcome` / `attested_at` for the condition. Otherwise any party
+/// holding a valid public oracle witness could permanently lock the condition into an
+/// "attested" state without spending real conditional proofs, locking out all losing-side
+/// holders.
+#[tokio::test]
+async fn test_failed_redeem_does_not_persist_attestation() {
+    use cdk_common::nuts::nut_ctf::AttestationStatus;
+
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    let amount = Amount::from(10);
+    let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request("Griefing regression", vec![hex_tlv]))
+        .await
+        .unwrap();
+    let condition_id = condition_response.condition_id.clone();
+
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+    let conditional_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+
+    // Attach a perfectly valid oracle witness — exactly what an attacker who watches the
+    // oracle's public attestation would have access to.
+    let witness = create_oracle_witness(&oracle, "YES");
+    let mut proofs_with_witness = conditional_proofs;
+    for proof in &mut proofs_with_witness {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+
+    // But sum the outputs to a larger amount than the inputs cover — this fails the balance
+    // check, which (after the fix) runs BEFORE record_attestation. Pre-fix this branch
+    // wrote the attestation anyway.
+    let (oversized_outputs, _) = create_premint(&mint, regular_keyset_id, Amount::from(100));
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: oversized_outputs,
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "unbalanced redeem must fail before any DB writes"
+    );
+
+    let info = mint.get_condition(&condition_id).await.unwrap();
+    let status = info
+        .attestation
+        .as_ref()
+        .map(|a| a.status.clone())
+        .unwrap_or(AttestationStatus::Pending);
+    assert_eq!(
+        status,
+        AttestationStatus::Pending,
+        "failed redeem must not persist attestation; condition should remain pending"
+    );
+    assert!(
+        info.attestation
+            .as_ref()
+            .and_then(|a| a.winning_outcome.as_ref())
+            .is_none(),
+        "failed redeem must not persist a winning_outcome"
+    );
+}

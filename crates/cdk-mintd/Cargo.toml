@@ -25,6 +25,11 @@ ldk-node = ["dep:cdk-ldk-node"]
 bdk = ["dep:cdk-bdk", "cdk-bdk/bitcoin-rpc", "cdk-bdk/electrum", "cdk-bdk/esplora"]
 grpc-processor = ["dep:cdk-payment-processor", "cdk-signatory/grpc"]
 sqlcipher = ["sqlite", "cdk-sqlite/sqlcipher"]
+conditional-tokens = [
+    "cdk-axum/conditional-tokens",
+    "cdk/conditional-tokens",
+    "cdk-signatory/conditional-tokens",
+]
 redis = ["cdk-axum/redis"]
 prometheus = ["cdk/prometheus", "dep:cdk-prometheus", "cdk-sqlite?/prometheus", "cdk-axum/prometheus"]
 info-page = ["cdk-axum/info-page"]
