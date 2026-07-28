@@ -36,6 +36,8 @@ serde_json = { workspace = true, features = ["raw_value"] }
 paste.workspace = true
 serde.workspace = true
 sha2 = "0.11"
+mime = "0.3.17"
+uuid.workspace = true
 maud = { workspace = true, optional = true }
 redis = { version = "0.31.0", default-features = false, features = [
     "tokio-rustls-comp",

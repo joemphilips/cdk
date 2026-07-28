@@ -63,15 +63,37 @@ impl<'a> CtfConvertAdmission<'a> {
     ///
     /// This does not parse proofs, public keys, signatures, or conditions.
     pub fn preflight(bytes: &'a [u8], limits: CtfSettlementLimits) -> Result<Self, Error> {
+        Self::preflight_convert(bytes, limits, limits.max_request_bytes)
+    }
+
+    /// Classify a convert request with a separate legacy request-size limit.
+    ///
+    /// Multi-party requests use the advertised settlement byte and count
+    /// limits. Legacy requests retain their transport byte limit while sharing
+    /// the cheap input/output count bounds.
+    pub fn preflight_convert(
+        bytes: &'a [u8],
+        limits: CtfSettlementLimits,
+        legacy_max_request_bytes: usize,
+    ) -> Result<Self, Error> {
         limits.validate()?;
-        if bytes.len() > limits.max_request_bytes {
-            return Err(Error::LimitExceeded("request bytes"));
+        if legacy_max_request_bytes == 0 {
+            return Err(Error::InvalidStructure(
+                "legacy request bytes must be positive",
+            ));
         }
+        enforce_request_bytes(
+            bytes,
+            limits.max_request_bytes.max(legacy_max_request_bytes),
+        )?;
         let value: Value = serde_json::from_slice(bytes)?;
         let mode = if value.get("participants").is_some() {
+            enforce_request_bytes(bytes, limits.max_request_bytes)?;
             preflight_multi_party_value(&value, limits)?;
             CtfConvertMode::MultiParty
         } else {
+            enforce_request_bytes(bytes, legacy_max_request_bytes)?;
+            preflight_legacy_value(&value, limits)?;
             CtfConvertMode::SingleParty
         };
         Ok(Self { bytes, mode })
@@ -323,6 +345,48 @@ impl CtfSettlementRequest {
         }
         Ok(())
     }
+}
+
+fn enforce_request_bytes(bytes: &[u8], maximum: usize) -> Result<(), Error> {
+    if bytes.len() > maximum {
+        return Err(Error::LimitExceeded("request bytes"));
+    }
+    Ok(())
+}
+
+fn preflight_legacy_value(value: &Value, limits: CtfSettlementLimits) -> Result<(), Error> {
+    let request = value
+        .as_object()
+        .ok_or(Error::InvalidStructure("request must be an object"))?;
+    let input_count = checked_legacy_count(request, "inputs")?;
+    let output_count = checked_legacy_count(request, "outputs")?;
+    if input_count > limits.max_inputs {
+        return Err(Error::LimitExceeded("inputs"));
+    }
+    if output_count > limits.max_outputs {
+        return Err(Error::LimitExceeded("outputs"));
+    }
+    Ok(())
+}
+
+fn checked_legacy_count(request: &Map<String, Value>, field: &'static str) -> Result<usize, Error> {
+    request
+        .get(field)
+        .and_then(Value::as_object)
+        .ok_or(Error::InvalidStructure(match field {
+            "inputs" => "inputs must be an object",
+            "outputs" => "outputs must be an object",
+            _ => "legacy request field must be an object",
+        }))?
+        .values()
+        .try_fold(0usize, |count, entries| {
+            let entries = entries.as_array().ok_or(Error::InvalidStructure(
+                "legacy input/output map values must be arrays",
+            ))?;
+            count
+                .checked_add(entries.len())
+                .ok_or(Error::LimitExceeded(field))
+        })
 }
 
 fn preflight_multi_party_value(value: &Value, limits: CtfSettlementLimits) -> Result<(), Error> {

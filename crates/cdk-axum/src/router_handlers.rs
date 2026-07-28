@@ -1,9 +1,13 @@
 use anyhow::Result;
+#[cfg(feature = "conditional-tokens")]
+use axum::body::Bytes;
 use axum::extract::ws::WebSocketUpgrade;
 #[cfg(feature = "conditional-tokens")]
 use axum::extract::Query;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
+#[cfg(feature = "conditional-tokens")]
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 #[cfg(feature = "conditional-tokens")]
 use cdk::error::ErrorCode;
@@ -17,8 +21,6 @@ use cdk::nuts::{
 };
 use cdk::util::unix_time;
 use paste::paste;
-#[cfg(feature = "conditional-tokens")]
-use serde_json::value::RawValue;
 use tracing::instrument;
 
 use crate::auth::AuthHeader;
@@ -26,11 +28,14 @@ use crate::ws::main_websocket;
 use crate::MintState;
 
 #[cfg(feature = "conditional-tokens")]
-pub(crate) const MAX_CTF_CONVERT_REQUEST_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CTF_CONVERT_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+#[cfg(feature = "conditional-tokens")]
+const MAX_CTF_MULTI_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "conditional-tokens")]
 const UNADVERTISED_MULTI_PARTY_LIMITS: CtfSettlementLimits = CtfSettlementLimits {
-    max_request_bytes: MAX_CTF_CONVERT_REQUEST_BYTES,
+    max_request_bytes: MAX_CTF_MULTI_REQUEST_BYTES,
     max_participants: 64,
     max_inputs: 4096,
     max_outputs: 8192,
@@ -1257,13 +1262,25 @@ pub(crate) async fn get_conditional_keysets(
 #[cfg(feature = "conditional-tokens")]
 #[instrument(skip_all)]
 pub(crate) async fn post_ctf_convert(
-    auth: AuthHeader,
     State(state): State<MintState>,
-    Json(payload): Json<Box<RawValue>>,
+    headers: HeaderMap,
+    payload: Bytes,
 ) -> Result<Response, Response> {
-    let admission =
-        CtfConvertAdmission::preflight(payload.get().as_bytes(), UNADVERTISED_MULTI_PARTY_LIMITS)
-            .map_err(ctf_settlement_error_response)?;
+    require_json_content_type(&headers)?;
+    let mode = CtfConvertAdmission::preflight_convert(
+        &payload,
+        UNADVERTISED_MULTI_PARTY_LIMITS,
+        MAX_CTF_CONVERT_BODY_BYTES,
+    )
+    .map_err(ctf_settlement_error_response)?
+    .mode();
+    if mode == CtfConvertMode::MultiParty {
+        return Err(multi_party_unavailable_response());
+    }
+
+    let Json(payload) = Json::<cdk::nuts::nut_ctf::CtfConvertRequest>::from_bytes(&payload)
+        .map_err(|error| error.into_response())?;
+    let auth = AuthHeader::from_headers(&headers).map_err(|error| error.into_response())?;
     state
         .mint
         .verify_auth(
@@ -1273,30 +1290,36 @@ pub(crate) async fn post_ctf_convert(
         .await
         .map_err(into_response)?;
 
-    match admission.mode() {
-        CtfConvertMode::SingleParty => {
-            let payload = admission
-                .decode_single_party()
-                .map_err(ctf_settlement_error_response)?;
-            let response = state
-                .mint
-                .process_ctf_convert(payload)
-                .await
-                .map_err(|err| {
-                    tracing::error!("Could not process CTF convert: {}", err);
-                    into_response(err)
-                })?;
-            Ok(Json(response).into_response())
-        }
-        CtfConvertMode::MultiParty => {
-            let request = admission
-                .decode_multi_party()
-                .map_err(ctf_settlement_error_response)?;
-            request
-                .validate(UNADVERTISED_MULTI_PARTY_LIMITS)
-                .map_err(ctf_settlement_error_response)?;
-            Err(multi_party_unavailable_response())
-        }
+    let response = state
+        .mint
+        .process_ctf_convert(payload)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not process CTF convert: {}", err);
+            into_response(err)
+        })?;
+    Ok(Json(response).into_response())
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn require_json_content_type(headers: &HeaderMap) -> Result<(), Response> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<mime::Mime>().ok())
+        .is_some_and(|content_type| {
+            content_type.type_() == "application"
+                && (content_type.subtype() == "json"
+                    || content_type.suffix().is_some_and(|suffix| suffix == "json"))
+        });
+    if is_json {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected request with `Content-Type: application/json`",
+        )
+            .into_response())
     }
 }
 
@@ -1372,23 +1395,36 @@ pub(crate) async fn post_redeem_outcome(
 
 #[cfg(all(test, feature = "conditional-tokens"))]
 mod ctf_convert_admission_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
     use axum::body::{to_bytes, Body};
     use axum::extract::DefaultBodyLimit;
     use axum::http::Request;
     use axum::routing::post;
     use axum::Router;
+    use bip39::Mnemonic;
+    use cdk::amount::SplitTarget;
+    use cdk::cdk_database::MintAuthDatabase;
+    use cdk::dhke::construct_proofs;
+    use cdk::mint::{Mint, MintBuilder, MintMeltLimits};
+    use cdk::nuts::nut00::KnownMethod;
+    use cdk::nuts::{BlindAuthToken, CurrencyUnit, PaymentMethod, PreMintSecrets};
+    use cdk::types::FeeReserve;
+    use cdk_fake_wallet::FakeWallet;
     use tower::ServiceExt;
 
     use super::*;
 
-    async fn accept_json(Json(_): Json<Box<RawValue>>) -> StatusCode {
-        StatusCode::OK
+    async fn accept_json(headers: HeaderMap, _payload: Bytes) -> Result<StatusCode, Response> {
+        require_json_content_type(&headers)?;
+        Ok(StatusCode::OK)
     }
 
     fn admission_router() -> Router {
         Router::new()
             .route("/", post(accept_json))
-            .layer(DefaultBodyLimit::max(MAX_CTF_CONVERT_REQUEST_BYTES))
+            .layer(DefaultBodyLimit::max(MAX_CTF_CONVERT_BODY_BYTES))
     }
 
     async fn decode_error(response: Response) -> ErrorResponse {
@@ -1398,13 +1434,144 @@ mod ctf_convert_admission_tests {
         serde_json::from_slice(&body).expect("error response")
     }
 
+    fn json_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/json".parse().expect("header"),
+        );
+        headers
+    }
+
+    fn auth_headers(token: &BlindAuthToken) -> HeaderMap {
+        let mut headers = json_headers();
+        headers.insert(
+            "Blind-auth",
+            token.to_string().parse().expect("auth header"),
+        );
+        headers
+    }
+
+    async fn auth_protected_state() -> (MintState, Arc<cdk_sqlite::mint::MintSqliteAuthDatabase>) {
+        let mint_db = Arc::new(cdk_sqlite::mint::memory::empty().await.expect("mint db"));
+        let auth_db = Arc::new(
+            cdk_sqlite::mint::MintSqliteAuthDatabase::new(":memory:")
+                .await
+                .expect("auth db"),
+        );
+        let protected_endpoint = ProtectedEndpoint::new(Method::Post, RoutePath::Swap);
+        let mnemonic = Mnemonic::generate(12).expect("mnemonic");
+        let mut builder = MintBuilder::new(mint_db.clone());
+        let payment = FakeWallet::new(
+            FeeReserve {
+                min_fee_reserve: 1.into(),
+                percent_fee_reserve: 0.0,
+            },
+            HashMap::new(),
+            HashSet::new(),
+            0,
+            CurrencyUnit::Sat,
+        );
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Known(KnownMethod::Bolt11),
+                MintMeltLimits::new(1, 10_000),
+                Arc::new(payment),
+            )
+            .await
+            .expect("payment processor");
+        let mint = builder
+            .with_auth(
+                auth_db.clone(),
+                "https://example.com/.well-known/openid-configuration".to_string(),
+                "test-client".to_string(),
+                Vec::new(),
+            )
+            .with_blind_auth(50, vec![protected_endpoint])
+            .build_with_seed(mint_db, &mnemonic.to_seed_normalized(""))
+            .await
+            .expect("mint");
+        (
+            MintState {
+                mint: Arc::new(mint),
+                cache: Arc::new(crate::cache::HttpCache::default()),
+            },
+            auth_db,
+        )
+    }
+
+    async fn blind_auth_token(mint: &Mint) -> BlindAuthToken {
+        let keyset_id = mint
+            .get_active_keysets()
+            .get(&CurrencyUnit::Auth)
+            .copied()
+            .expect("active auth keyset");
+        let keys = mint
+            .keyset_pubkeys(&keyset_id)
+            .expect("auth keys")
+            .keysets
+            .into_iter()
+            .next()
+            .expect("auth keyset")
+            .keys;
+        let premint = PreMintSecrets::random(
+            keyset_id,
+            1.into(),
+            &SplitTarget::Value(1.into()),
+            &(0, vec![1]).into(),
+        )
+        .expect("premint");
+        let signatures = vec![mint
+            .auth_blind_sign(
+                premint
+                    .blinded_messages()
+                    .first()
+                    .expect("blinded auth output"),
+            )
+            .await
+            .expect("blind auth signature")];
+        let proof = construct_proofs(signatures, premint.rs(), premint.secrets(), &keys)
+            .expect("auth proof")
+            .pop()
+            .expect("one auth proof")
+            .try_into()
+            .expect("auth proof shape");
+        BlindAuthToken::new(proof).without_dleq()
+    }
+
+    async fn assert_rejected_without_auth_spend(
+        body: serde_json::Value,
+        expected_status: StatusCode,
+    ) {
+        let (state, auth_db) = auth_protected_state().await;
+        let token = blind_auth_token(&state.mint).await;
+        let proof_y = token.auth_proof.y().expect("proof Y");
+        let response = post_ctf_convert(
+            State(state),
+            auth_headers(&token),
+            Bytes::from(serde_json::to_vec(&body).expect("request")),
+        )
+        .await
+        .expect_err("request must be rejected");
+
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(
+            auth_db
+                .get_proofs_states(&[proof_y])
+                .await
+                .expect("auth state"),
+            vec![None]
+        );
+    }
+
     #[tokio::test]
     async fn route_rejects_oversized_body_before_json_decode() {
         let response = admission_router()
             .oneshot(
                 Request::post("/")
                     .header("content-type", "application/json")
-                    .body(Body::from(vec![b' '; MAX_CTF_CONVERT_REQUEST_BYTES + 1]))
+                    .body(Body::from(vec![b' '; MAX_CTF_CONVERT_BODY_BYTES + 1]))
                     .expect("request"),
             )
             .await
@@ -1427,16 +1594,43 @@ mod ctf_convert_admission_tests {
             assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
 
-        let response = admission_router()
-            .oneshot(
-                Request::post("/")
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
-                    .expect("request"),
-            )
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/problem+json",
+        ] {
+            let response = admission_router()
+                .oneshot(
+                    Request::post("/")
+                        .header("content-type", content_type)
+                        .body(Body::from("{}"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_protocol_cap_counts_outer_whitespace() {
+        let (state, _) = auth_protected_state().await;
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "condition_id": "11".repeat(32),
+            "participants": [
+                {"inputs": [], "outputs": []},
+                {"inputs": [], "outputs": []}
+            ]
+        }))
+        .expect("multi request");
+        let mut padded = vec![b' '; MAX_CTF_MULTI_REQUEST_BYTES + 1 - request.len()];
+        padded.append(&mut request);
+        let response = post_ctf_convert(State(state), json_headers(), Bytes::from(padded))
             .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
+            .expect_err("multi request exceeds protocol cap");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(decode_error(response).await.code, ErrorCode::Unknown(15009));
     }
 
     #[tokio::test]
@@ -1474,5 +1668,33 @@ mod ctf_convert_admission_tests {
             let error = decode_error(ctf_settlement_error_response(failure)).await;
             assert_eq!(error.code, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_does_not_consume_blind_auth() {
+        assert_rejected_without_auth_spend(
+            serde_json::json!({
+                "condition_id": "11".repeat(32),
+                "inputs": {"*": [{"id": "not-a-key"}]},
+                "outputs": {}
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_multi_does_not_consume_blind_auth() {
+        assert_rejected_without_auth_spend(
+            serde_json::json!({
+                "condition_id": "11".repeat(32),
+                "participants": [
+                    {"inputs": [{"id": "not-a-key"}], "outputs": []},
+                    {"inputs": [], "outputs": []}
+                ]
+            }),
+            StatusCode::NOT_IMPLEMENTED,
+        )
+        .await;
     }
 }

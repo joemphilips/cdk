@@ -121,7 +121,7 @@ pub async fn create_mint_router_with_custom_cache(
         .merge(
             Router::new()
                 .route("/ctf/convert", post(post_ctf_convert))
-                .layer(DefaultBodyLimit::max(MAX_CTF_CONVERT_REQUEST_BYTES)),
+                .layer(DefaultBodyLimit::max(MAX_CTF_CONVERT_BODY_BYTES)),
         );
 
     let mut mint_router = Router::new().nest("/v1", v1_router);
