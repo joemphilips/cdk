@@ -7,7 +7,7 @@ pub mod sources;
 pub mod store;
 pub mod types;
 
-pub use msat_converter::MsatSatConverter;
+pub use msat_converter::{sat_msat_backends, MsatSatConverter, SatMsatBackends, SatMsatConverter};
 pub use oracle::{AggregatingRateOracle, AggregatorConfig, BackoffState, RateOracle, RateSource};
 pub use payment::{
     parked_payment_event_count, PaymentErrorAdapter, RateConvertingPayment,
@@ -16,6 +16,6 @@ pub use payment::{
 };
 pub use store::{
     DynRateQuoteStore, InMemoryRateQuoteStore, ParkedPaymentRecord, RateQuoteRecord,
-    RateQuoteSettlement, RateQuoteStore, RateQuoteStoreError, UnitControlRecord,
+    RateQuoteSettlement, RateQuoteSide, RateQuoteStore, RateQuoteStoreError, UnitControlRecord,
 };
 pub use types::{AggregationMeta, RateOracleError, RateSnapshot, SourceReading};
