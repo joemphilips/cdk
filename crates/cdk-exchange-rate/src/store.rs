@@ -305,7 +305,10 @@ struct InMemoryRateQuoteStoreState {
     settled: HashSet<String>,
     unit_controls: HashMap<CurrencyUnit, UnitControlRecord>,
     fail_next_insert: bool,
+    fail_next_get: bool,
     fail_next_settle: bool,
+    fail_parked_insert_on_attempt: Option<usize>,
+    parked_insert_attempts: usize,
 }
 
 impl InMemoryRateQuoteStore {
@@ -317,6 +320,16 @@ impl InMemoryRateQuoteStore {
     /// Cause the next quoted-terms insert to fail.
     pub async fn fail_next_insert(&self) {
         self.inner.lock().await.fail_next_insert = true;
+    }
+
+    /// Cause the next quoted-terms lookup to fail.
+    pub async fn fail_next_get(&self) {
+        self.inner.lock().await.fail_next_get = true;
+    }
+
+    /// Cause a selected parked-evidence upsert attempt to fail.
+    pub async fn fail_parked_insert_on_attempt(&self, attempt: usize) {
+        self.inner.lock().await.fail_parked_insert_on_attempt = Some(attempt);
     }
 
     /// Cause the next atomic settle operation to fail before applying any
@@ -354,17 +367,26 @@ impl RateQuoteStore for InMemoryRateQuoteStore {
         &self,
         payment_lookup_id: &PaymentIdentifier,
     ) -> Result<Option<RateQuoteRecord>, RateQuoteStoreError> {
-        Ok(self
-            .inner
-            .lock()
-            .await
-            .records
-            .get(&payment_lookup_id.to_string())
-            .cloned())
+        let mut inner = self.inner.lock().await;
+        if inner.fail_next_get {
+            inner.fail_next_get = false;
+            return Err(RateQuoteStoreError::Storage(
+                "forced in-memory lookup failure".to_string(),
+            ));
+        }
+        Ok(inner.records.get(&payment_lookup_id.to_string()).cloned())
     }
 
     async fn insert_parked(&self, record: ParkedPaymentRecord) -> Result<(), RateQuoteStoreError> {
-        self.inner.lock().await.parked.push(record);
+        let mut inner = self.inner.lock().await;
+        inner.parked_insert_attempts += 1;
+        if inner.fail_parked_insert_on_attempt == Some(inner.parked_insert_attempts) {
+            inner.fail_parked_insert_on_attempt = None;
+            return Err(RateQuoteStoreError::Storage(
+                "forced in-memory parked upsert failure".to_string(),
+            ));
+        }
+        upsert_parked(&mut inner.parked, record);
         Ok(())
     }
 
@@ -376,7 +398,7 @@ impl RateQuoteStore for InMemoryRateQuoteStore {
         match inner.records.get(&parked.payment_lookup_id.to_string()) {
             Some(record) => Ok(Some(record.clone())),
             None => {
-                inner.parked.push(parked);
+                upsert_parked(&mut inner.parked, parked);
                 Ok(None)
             }
         }
@@ -518,6 +540,17 @@ impl RateQuoteStore for InMemoryRateQuoteStore {
             .or_insert_with(|| UnitControlRecord::new(unit.clone()));
         control.buffer_surplus_sats = control.buffer_surplus_sats.saturating_add(sats);
         Ok(())
+    }
+}
+
+fn upsert_parked(parked: &mut Vec<ParkedPaymentRecord>, record: ParkedPaymentRecord) {
+    if let Some(existing) = parked.iter_mut().find(|existing| {
+        existing.payment_lookup_id == record.payment_lookup_id
+            && existing.bolt11_payment_hash == record.bolt11_payment_hash
+    }) {
+        *existing = record;
+    } else {
+        parked.push(record);
     }
 }
 

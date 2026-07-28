@@ -717,14 +717,6 @@ impl MintPayment for FakeWallet {
                         .ok_or(Error::UnknownInvoiceAmount)?
                 };
 
-                let amount_spent = if checkout_going_status == MeltQuoteState::Paid {
-                    Amount::new(amount_msat, CurrencyUnit::Msat)
-                } else {
-                    Amount::new(0, CurrencyUnit::Msat)
-                };
-
-                payment_states.insert(payment_hash.clone(), (checkout_going_status, amount_spent));
-
                 if let Some(description) = status {
                     if description.check_err {
                         let mut fail = self.failed_payment_check.lock().await;
@@ -741,6 +733,16 @@ impl MintPayment for FakeWallet {
                     &self.exchange_rate_cache,
                 )
                 .await?;
+                let total_spent = Amount::new(total_spent.value() + 1, unit.clone());
+                let checked_total_spent = if checkout_going_status == MeltQuoteState::Paid {
+                    total_spent.clone()
+                } else {
+                    Amount::new(0, unit.clone())
+                };
+                payment_states.insert(
+                    payment_hash.clone(),
+                    (checkout_going_status, checked_total_spent),
+                );
 
                 Ok(MakePaymentResponse {
                     payment_lookup_id: PaymentIdentifier::PaymentHash(
@@ -748,7 +750,7 @@ impl MintPayment for FakeWallet {
                     ),
                     payment_proof: Some("".to_string()),
                     status: payment_status,
-                    total_spent: Amount::new(total_spent.value() + 1, unit.clone()),
+                    total_spent,
                 })
             }
             OutgoingPaymentOptions::Bolt12(bolt12_options) => {
