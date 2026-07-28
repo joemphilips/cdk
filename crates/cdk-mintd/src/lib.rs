@@ -2808,6 +2808,9 @@ async fn run_mintd_with_database_and_shutdown(
         Some(kv),
     )
     .await?;
+    #[cfg(not(feature = "management-rpc"))]
+    let _ = rate_quote_control;
+
     let (mint_builder, auth_localstore) =
         setup_authentication(settings, work_dir, mint_builder, db_password).await?;
 
