@@ -280,7 +280,7 @@ impl RateQuoteStore for PostgresRateQuoteStore {
         unit: &CurrencyUnit,
         settlement: RateQuoteSettlement,
     ) -> Result<bool, RateQuoteStoreError> {
-        let conn = self.conn()?;
+        let conn = self.conn().await?;
 
         query("START TRANSACTION")
             .map_err(storage_error)?

@@ -56,6 +56,7 @@ where
             unit: CurrencyUnit::Msat.to_string(),
             bolt11: inner.bolt11,
             bolt12: inner.bolt12,
+            onchain: None,
             custom: inner.custom,
         })
     }
@@ -90,6 +91,8 @@ where
             fee: sats_to_msats(quote.fee)?,
             state: quote.state,
             extra_json: quote.extra_json,
+            estimated_blocks: None,
+            fee_options: None,
         })
     }
 
@@ -212,8 +215,13 @@ fn convert_incoming_options_to_sat(
             Ok(IncomingPaymentOptions::Bolt12(options))
         }
         IncomingPaymentOptions::Custom(mut options) => {
-            options.amount = msats_to_sats(options.amount)?;
+            if let Some(amount) = options.amount {
+                options.amount = Some(msats_to_sats(amount)?);
+            }
             Ok(IncomingPaymentOptions::Custom(options))
+        }
+        IncomingPaymentOptions::Onchain(_) => {
+            Err(cdk_common::payment::Error::UnsupportedPaymentOption)
         }
     }
 }
@@ -235,10 +243,16 @@ fn convert_outgoing_options_to_sat(
             Ok(OutgoingPaymentOptions::Bolt12(options))
         }
         OutgoingPaymentOptions::Custom(mut options) => {
+            if let Some(amount) = options.amount {
+                options.amount = Some(msats_to_sats(amount)?);
+            }
             if let Some(amount) = options.max_fee_amount {
                 options.max_fee_amount = Some(msats_to_sats(amount)?);
             }
             Ok(OutgoingPaymentOptions::Custom(options))
+        }
+        OutgoingPaymentOptions::Onchain(_) => {
+            Err(cdk_common::payment::Error::UnsupportedPaymentOption)
         }
     }
 }
@@ -286,7 +300,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use cdk_common::nuts::MeltQuoteState;
-    use cdk_common::payment::{Bolt11IncomingPaymentOptions, CustomOutgoingPaymentOptions};
+    use cdk_common::payment::{
+        Bolt11IncomingPaymentOptions, CustomOutgoingPaymentOptions, OnchainIncomingPaymentOptions,
+        OnchainOutgoingPaymentOptions,
+    };
     use cdk_common::QuoteId;
     use futures::stream;
 
@@ -311,6 +328,7 @@ mod tests {
                 unit: CurrencyUnit::Sat.to_string(),
                 bolt11: None,
                 bolt12: None,
+                onchain: Some(Default::default()),
                 custom: Default::default(),
             })
         }
@@ -405,11 +423,65 @@ mod tests {
         OutgoingPaymentOptions::Custom(Box::new(CustomOutgoingPaymentOptions {
             method: "test".to_string(),
             request: "request".to_string(),
+            amount: None,
             max_fee_amount: None,
             timeout_secs: None,
             melt_options: None,
             extra_json: None,
+            quote_id: QuoteId::new(),
         }))
+    }
+
+    #[tokio::test]
+    async fn msat_settings_do_not_advertise_onchain_payments() {
+        let settings = MsatSatConverter::new(MockSatPayment::default())
+            .get_settings()
+            .await
+            .expect("settings should load");
+
+        assert!(settings.onchain.is_none());
+    }
+
+    #[test]
+    fn custom_outgoing_amounts_convert_to_sats() {
+        let options = OutgoingPaymentOptions::Custom(Box::new(CustomOutgoingPaymentOptions {
+            amount: Some(Amount::new(1_001, CurrencyUnit::Msat)),
+            max_fee_amount: Some(Amount::new(2_001, CurrencyUnit::Msat)),
+            ..match custom_outgoing_options() {
+                OutgoingPaymentOptions::Custom(options) => *options,
+                _ => unreachable!("helper always returns custom options"),
+            }
+        }));
+
+        let OutgoingPaymentOptions::Custom(converted) =
+            convert_outgoing_options_to_sat(options).expect("custom amounts should convert")
+        else {
+            panic!("expected custom options");
+        };
+
+        assert_eq!(converted.amount, Some(Amount::new(2, CurrencyUnit::Sat)));
+        assert_eq!(
+            converted.max_fee_amount,
+            Some(Amount::new(3, CurrencyUnit::Sat))
+        );
+    }
+
+    #[test]
+    fn msat_converter_rejects_onchain_options() {
+        let incoming = IncomingPaymentOptions::Onchain(OnchainIncomingPaymentOptions {
+            quote_id: QuoteId::new(),
+        });
+        let outgoing = OutgoingPaymentOptions::Onchain(Box::new(OnchainOutgoingPaymentOptions {
+            address: "bcrt1qexample".to_string(),
+            amount: Amount::new(1_000, CurrencyUnit::Msat),
+            max_fee_amount: None,
+            quote_id: QuoteId::new(),
+            fee_index: None,
+            metadata: None,
+        }));
+
+        assert!(convert_incoming_options_to_sat(incoming).is_err());
+        assert!(convert_outgoing_options_to_sat(outgoing).is_err());
     }
 
     #[tokio::test]
@@ -503,6 +575,8 @@ mod tests {
             fee: Amount::new(1, CurrencyUnit::Sat),
             state: MeltQuoteState::Unpaid,
             extra_json: None,
+            estimated_blocks: None,
+            fee_options: None,
         });
         let converter = MsatSatConverter::new(backend);
 
@@ -512,10 +586,12 @@ mod tests {
                 OutgoingPaymentOptions::Custom(Box::new(CustomOutgoingPaymentOptions {
                     method: "test".to_string(),
                     request: "request".to_string(),
+                    amount: None,
                     max_fee_amount: None,
                     timeout_secs: None,
                     melt_options: None,
                     extra_json: None,
+                    quote_id: QuoteId::new(),
                 })),
             )
             .await
@@ -527,7 +603,7 @@ mod tests {
 
     #[test]
     fn payment_successful_event_converts_sat_amount_to_msat() {
-        let quote_id = QuoteId::new_uuid();
+        let quote_id = QuoteId::new();
         let event = Event::PaymentSuccessful {
             quote_id: quote_id.clone(),
             details: MakePaymentResponse {
@@ -554,7 +630,7 @@ mod tests {
 
     #[test]
     fn payment_failed_event_passes_through_without_amount() {
-        let quote_id = QuoteId::new_uuid();
+        let quote_id = QuoteId::new();
         let event = Event::PaymentFailed {
             quote_id: quote_id.clone(),
             reason: "failed".to_string(),
