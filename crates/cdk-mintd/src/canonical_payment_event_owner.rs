@@ -544,9 +544,8 @@ mod tests {
     use cdk_common::mint::{MeltPaymentRequest, MeltQuote, MintQuote};
     use cdk_common::Amount;
     use cdk_exchange_rate::{
-        AggregationMeta, InMemoryRateQuoteStore, PaymentErrorAdapter, RateConvertingPayment,
-        RateConvertingPaymentConfig, RateOracle, RateOracleError, RateQuoteRecord, RateQuoteSide,
-        RateQuoteStore, RateSnapshot, SharedMintPayment,
+        AggregationMeta, InMemoryRateQuoteStore, RateConvertingPaymentConfig, RateOracle,
+        RateOracleError, RateQuoteRecord, RateQuoteSide, RateQuoteStore, RateSnapshot,
     };
     use futures::stream;
 
@@ -633,7 +632,11 @@ mod tests {
         async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
             Ok(SettingsResponse {
                 unit: self.unit.to_string(),
-                bolt11: None,
+                bolt11: Some(cdk_common::payment::Bolt11Settings {
+                    mpp: false,
+                    amountless: false,
+                    invoice_description: false,
+                }),
                 bolt12: None,
                 onchain: None,
                 custom: Default::default(),
@@ -850,15 +853,13 @@ mod tests {
         store: Arc<InMemoryRateQuoteStore>,
         control: RateQuoteControlHandle,
     ) -> DynMintPayment {
-        let processor = RateConvertingPayment::with_control(
-            SharedMintPayment::new(sat_backend),
+        crate::rate_converting_call_status_processor(
+            sat_backend,
             Arc::new(FixedRateOracle),
             store,
             RateConvertingPaymentConfig::new(CurrencyUnit::Usd, 100, 120),
             control,
-        );
-        let processor: DynMintPayment = Arc::new(PaymentErrorAdapter::new(processor));
-        Arc::new(CallStatusOnlyPayment::new(processor))
+        )
     }
 
     async fn incoming_status_amount(
@@ -897,6 +898,29 @@ mod tests {
         routes.sat.stop().await.expect("SAT facade stop is inert");
         fiat.stop().await.expect("fiat facade stop is inert");
         routes.msat.stop().await.expect("owner stop");
+    }
+
+    async fn assert_usd_bolt11_registered(database: DynMintDatabase, fiat: DynMintPayment) {
+        let limits = cdk::mint::MintMeltLimits::new(1, 10_000);
+        let builder = crate::configure_backend_for_unit(
+            &crate::config::Settings::default(),
+            cdk::mint::MintBuilder::new(database),
+            CurrencyUnit::Usd,
+            limits,
+            fiat,
+        )
+        .await
+        .expect("register fiat processor");
+        assert!(builder
+            .current_mint_info()
+            .nuts
+            .nut04
+            .methods
+            .iter()
+            .any(|method| {
+                method.unit == CurrencyUnit::Usd
+                    && method.method == cdk_common::PaymentMethod::BOLT11
+            }));
     }
 
     async fn assert_invalid_outgoing_does_not_mutate(
@@ -1207,7 +1231,7 @@ mod tests {
             .push(incoming("status", 1_501));
         let database: DynMintDatabase =
             Arc::new(cdk_sqlite::mint::memory::empty().await.expect("database"));
-        let (_, routes) = canonical_sat_msat_backends(Arc::new(payment.clone()), database)
+        let (_, routes) = canonical_sat_msat_backends(Arc::new(payment.clone()), database.clone())
             .await
             .expect("canonical routes");
         let store = Arc::new(InMemoryRateQuoteStore::new());
@@ -1229,6 +1253,7 @@ mod tests {
             incoming_status_amount(&fiat, &status_id).await,
             Amount::new(125, CurrencyUnit::Usd)
         );
+        assert_usd_bolt11_registered(database, fiat.clone()).await;
         exercise_single_lifecycle_owner(&routes, &fiat).await;
         payment.assert_single_lifecycle_owner();
     }

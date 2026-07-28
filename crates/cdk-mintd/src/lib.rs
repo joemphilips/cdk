@@ -46,7 +46,7 @@ use cdk_exchange_rate::sources::{BitstampRateSource, CoinbaseRateSource, KrakenR
 use cdk_exchange_rate::{
     AggregatingRateOracle, AggregatorConfig, DynRateQuoteStore, InMemoryRateQuoteStore,
     MsatSatConverter, PaymentErrorAdapter, RateConvertingPayment, RateConvertingPaymentConfig,
-    RateQuoteControlHandle, RateSource, SharedMintPayment,
+    RateOracle, RateQuoteControlHandle, RateSource, SharedMintPayment,
 };
 #[cfg(feature = "postgres")]
 use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig, PostgresRateQuoteStore};
@@ -1439,16 +1439,13 @@ async fn configure_rate_quoter_for_sat_backend(
             rate_quoter.buffer_bps,
             rate_quoter.ttl_secs,
         );
-        let inner = SharedMintPayment::new(sat_backend.clone());
-        let processor = RateConvertingPayment::with_control(
-            inner,
+        let processor = rate_converting_call_status_processor(
+            sat_backend.clone(),
             oracle.clone(),
             store.clone(),
             config,
             control.clone(),
         );
-        let processor: DynMintPayment = Arc::new(PaymentErrorAdapter::new(processor));
-        let processor: DynMintPayment = Arc::new(CallStatusOnlyPayment::new(processor));
         mint_builder = configure_backend_for_unit(
             settings,
             mint_builder,
@@ -1460,6 +1457,24 @@ async fn configure_rate_quoter_for_sat_backend(
     }
 
     Ok((mint_builder, Some(control)))
+}
+
+fn rate_converting_call_status_processor(
+    sat_backend: DynMintPayment,
+    oracle: Arc<dyn RateOracle>,
+    store: DynRateQuoteStore,
+    config: RateConvertingPaymentConfig,
+    control: RateQuoteControlHandle,
+) -> DynMintPayment {
+    let processor = RateConvertingPayment::with_control(
+        SharedMintPayment::new(sat_backend),
+        oracle,
+        store,
+        config,
+        control,
+    );
+    let processor: DynMintPayment = Arc::new(PaymentErrorAdapter::new(processor));
+    Arc::new(CallStatusOnlyPayment::new(processor))
 }
 
 fn validated_rate_quoter(
