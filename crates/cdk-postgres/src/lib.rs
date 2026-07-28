@@ -19,7 +19,6 @@ use tokio::time::timeout;
 use tokio_postgres::{connect, Client, Error as PgError, NoTls};
 
 mod db;
-mod rate_quote;
 mod value;
 
 #[derive(Debug)]
@@ -398,8 +397,6 @@ pub type MintPgAuthDatabase = SQLMintAuthDatabase<PgConnectionPool>;
 
 /// Wallet DB implementation with PostgreSQL
 pub type WalletPgDatabase = SQLWalletDatabase<PgConnectionPool>;
-
-pub use rate_quote::PostgresRateQuoteStore;
 
 /// Convenience free functions (cannot add inherent impls for a foreign type).
 /// These mirror the Mint patterns and call through to the generic constructors.
