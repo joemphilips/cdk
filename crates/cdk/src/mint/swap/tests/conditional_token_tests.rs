@@ -102,8 +102,17 @@ async fn register_test_condition(
     outcomes: &[&str],
     outcome_collections: Option<Vec<String>>,
 ) -> (String, HashMap<String, Id>) {
+    register_test_condition_with_event(mint, outcomes, outcome_collections, "test-event").await
+}
+
+async fn register_test_condition_with_event(
+    mint: &crate::mint::Mint,
+    outcomes: &[&str],
+    outcome_collections: Option<Vec<String>>,
+    event_id: &str,
+) -> (String, HashMap<String, Id>) {
     let oracle = create_test_oracle();
-    let (_, hex_tlv) = create_test_announcement(&oracle, outcomes, "test-event");
+    let (_, hex_tlv) = create_test_announcement(&oracle, outcomes, event_id);
 
     let mut request = enum_condition_request("Test condition", vec![hex_tlv]);
     if let Some(collections) = outcome_collections {
@@ -2274,6 +2283,56 @@ async fn test_ctf_split_wrong_keyset_rejected() {
         result.is_err(),
         "split with swapped/wrong keysets should be rejected"
     );
+}
+
+/// Test that a keyset registered under another condition cannot satisfy a declared collection.
+#[tokio::test]
+async fn test_ctf_split_wrong_condition_keyset_rejected() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_proofs = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let (_, other_keysets) =
+        register_test_condition_with_event(&mint, &["YES", "NO"], None, "other-event").await;
+
+    let (wrong_yes, _) = create_premint(&mint, *other_keysets.get("YES").unwrap(), Amount::from(8));
+    let (no_outputs, _) = create_premint(&mint, *keysets.get("NO").unwrap(), Amount::from(8));
+    let request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs: HashMap::from([("*".to_string(), regular_proofs)]),
+        outputs: HashMap::from([
+            ("YES".to_string(), wrong_yes),
+            ("NO".to_string(), no_outputs),
+        ]),
+    };
+
+    let result = mint.process_ctf_convert(request).await;
+    assert!(matches!(result, Err(Error::OutputsMustUseRegularKeyset)));
+}
+
+/// Test that a conditional keyset cannot be mislabeled as root collateral.
+#[tokio::test]
+async fn test_ctf_convert_conditional_input_as_collateral_rejected() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_proofs = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+    let yes_proofs =
+        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, Amount::from(8)).await;
+    let (yes_outputs, _) = create_premint(&mint, yes_keyset_id, Amount::from(7));
+    let (no_outputs, _) = create_premint(&mint, *keysets.get("NO").unwrap(), Amount::from(7));
+    let request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs: HashMap::from([("*".to_string(), yes_proofs)]),
+        outputs: HashMap::from([
+            ("YES".to_string(), yes_outputs),
+            ("NO".to_string(), no_outputs),
+        ]),
+    };
+
+    let result = mint.process_ctf_convert(request).await;
+    assert!(matches!(result, Err(Error::OutputsMustUseRegularKeyset)));
 }
 
 /// Test that a CTF merge of a complete partition returns regular tokens.
