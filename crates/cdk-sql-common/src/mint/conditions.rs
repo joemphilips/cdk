@@ -297,7 +297,11 @@ where
         limit: Option<u64>,
         active: Option<bool>,
     ) -> Result<Vec<(MintKeySetInfo, u64)>, Error> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
 
         let mut sql = format!(
             "SELECT {} FROM conditional_keyset WHERE 1=1",
@@ -349,12 +353,20 @@ where
     type Err = Error;
 
     async fn add_condition(&self, condition: StoredCondition) -> Result<(), Self::Err> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
         insert_condition(&*conn, condition).await
     }
 
     async fn delete_condition_registration(&self, condition_id: &str) -> Result<(), Self::Err> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
 
         query(
             r#"
@@ -383,7 +395,11 @@ where
         &self,
         condition_id: &str,
     ) -> Result<Option<StoredCondition>, Self::Err> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
 
         let row = query(
             r#"
@@ -410,7 +426,11 @@ where
         limit: Option<u64>,
         status: &[String],
     ) -> Result<Vec<StoredCondition>, Self::Err> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
 
         // Build SQL dynamically for status IN clause
         let mut sql = String::from(
@@ -468,7 +488,11 @@ where
         winning_outcome: Option<&str>,
         attested_at: Option<u64>,
     ) -> Result<bool, Self::Err> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
 
         let rows_affected = query(
             r#"
@@ -494,7 +518,11 @@ where
         &self,
         condition_id: &str,
     ) -> Result<HashMap<String, Id>, Self::Err> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
 
         let rows = query(
             r#"
@@ -534,7 +562,11 @@ where
         &self,
         keyset_id: &Id,
     ) -> Result<Option<(String, String, String)>, Self::Err> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
 
         let row = query(
             r#"

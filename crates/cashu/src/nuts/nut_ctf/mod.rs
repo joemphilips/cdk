@@ -339,7 +339,6 @@ pub struct CtfConvertResponse {
 
 /// NUT-06 mint info extension for NUT-CTF-split-merge (convert)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct NutCtfSplitMergeSettings {
     /// Whether NUT-CTF-split-merge (CTF convert) is supported
     pub supported: bool,
@@ -353,7 +352,6 @@ impl Default for NutCtfSplitMergeSettings {
 
 /// NUT-06 mint info extension for NUT-CTF-numeric (numeric conditions)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct NutCtfNumericSettings {
     /// Whether NUT-CTF-numeric (numeric conditional tokens) is supported
     pub supported: bool,
@@ -383,7 +381,6 @@ pub struct RedeemOutcomeResponse {
 
 /// Single oracle signature entry in witness
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct OracleSig {
     /// Oracle's 32-byte x-only public key (64-char hex)
     pub oracle_pubkey: String,
@@ -400,7 +397,6 @@ pub struct OracleSig {
 
 /// Oracle witness for conditional token redemption
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct OracleWitness {
     /// Array of oracle attestation entries
     pub oracle_sigs: Vec<OracleSig>,
@@ -453,7 +449,6 @@ pub struct ConditionalKeysetsResponse {
 
 /// NUT-06 mint info extension for NUT-CTF
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct NutCtfSettings {
     /// Whether NUT-CTF is supported
     pub supported: bool,

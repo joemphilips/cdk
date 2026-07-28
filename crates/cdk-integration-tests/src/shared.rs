@@ -305,6 +305,7 @@ pub fn create_fake_wallet_settings(
         #[cfg(feature = "bdk")]
         bdk: None,
         mint_management_rpc: None,
+        rate_quoter: None,
         auth: None,
         prometheus: Some(Default::default()),
         ..Default::default()
@@ -361,6 +362,7 @@ pub fn create_cln_settings(
         #[cfg(feature = "bdk")]
         bdk: None,
         mint_management_rpc: None,
+        rate_quoter: None,
         auth: None,
         prometheus: Some(Default::default()),
         ..Default::default()
@@ -413,6 +415,7 @@ pub fn create_lnd_settings(
         #[cfg(feature = "bdk")]
         bdk: None,
         mint_management_rpc: None,
+        rate_quoter: None,
         auth: None,
         prometheus: Some(Default::default()),
         ..Default::default()

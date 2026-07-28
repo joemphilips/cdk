@@ -18,6 +18,8 @@ wallet = ["cdk-common/wallet", "cdk-sql-common/wallet"]
 [dependencies]
 async-trait.workspace = true
 cdk-common.workspace = true
+bitcoin.workspace = true
+cdk-exchange-rate = { workspace = true }
 cdk-sql-common = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 uuid.workspace = true
