@@ -338,6 +338,7 @@ fn validate_settings(settings: &config::Settings) -> Result<()> {
     validate_listen_config(settings)?;
     validate_signing_config(settings)?;
     validate_lightning_config(settings)?;
+    validate_rate_quoter_settings(settings)?;
     validate_onchain_config(settings)?;
     validate_database_config(settings)?;
     validate_auth_config(settings)?;
@@ -952,8 +953,6 @@ async fn configure_lightning_backend(
     work_dir: &Path,
     _kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
 ) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
-    validate_rate_quoter_sat_backend_count(settings)?;
-
     if settings.ln.is_empty() {
         tracing::info!("No Lightning backend configured");
         return Ok((mint_builder, None));
@@ -1427,17 +1426,20 @@ async fn configure_rate_quoter_for_sat_backend(
     sat_backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
     event_owner: Arc<CanonicalPaymentEventOwner>,
 ) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
-    let Some((rate_quoter, units)) = validated_rate_quoter(settings)? else {
+    let Some(rate_quoter) = validate_rate_quoter_settings(settings)? else {
+        if settings.rate_quoter.is_some() {
+            tracing::warn!("rate_quoter configured without units; no fiat processors registered");
+        }
         return Ok((mint_builder, None));
     };
-    let (oracle, store, control) = rate_quoter_runtime(settings, &rate_quoter, &units).await?;
+    let (oracle, store, control) = rate_quoter_runtime(settings, &rate_quoter).await?;
     event_owner.install_rate_context(store.clone(), control.clone())?;
 
-    for fiat_unit in units {
+    for fiat_unit in rate_quoter.units {
         let config = RateConvertingPaymentConfig::new(
             fiat_unit.clone(),
-            rate_quoter.buffer_bps,
-            rate_quoter.ttl_secs,
+            rate_quoter.config.buffer_bps,
+            rate_quoter.config.ttl_secs,
         );
         let processor = rate_converting_call_status_processor(
             sat_backend.clone(),
@@ -1477,15 +1479,20 @@ fn rate_converting_call_status_processor(
     Arc::new(CallStatusOnlyPayment::new(processor))
 }
 
-fn validated_rate_quoter(
+struct ValidatedRateQuoter {
+    config: config::RateQuoter,
+    units: Vec<CurrencyUnit>,
+    providers: Vec<RateOracleProvider>,
+}
+
+fn validate_rate_quoter_settings(
     settings: &config::Settings,
-) -> Result<Option<(config::RateQuoter, Vec<CurrencyUnit>)>> {
+) -> Result<Option<ValidatedRateQuoter>> {
     let Some(rate_quoter) = settings.rate_quoter.clone() else {
         return Ok(None);
     };
     let units = rate_quoter_units(&rate_quoter);
     if units.is_empty() {
-        tracing::warn!("rate_quoter configured without units; no fiat processors registered");
         return Ok(None);
     }
     // Quotes priced from one snapshot must expire before it can become
@@ -1496,28 +1503,28 @@ fn validated_rate_quoter(
             rate_quoter.ttl_secs
         );
     }
-    if rate_quoter.min_survived > rate_quoter.min_fetched {
-        bail!(
-            "rate_quoter.min_survived ({}) cannot exceed rate_quoter.min_fetched ({})",
-            rate_quoter.min_survived,
-            rate_quoter.min_fetched
-        );
-    }
+    let providers = configured_rate_oracle_providers(&rate_quoter.sources)?;
+    validate_rate_quoter_quorum(&rate_quoter, providers.len())?;
     validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)?;
-    Ok(Some((rate_quoter, units)))
+    validate_rate_quoter_sat_backend_count(settings)?;
+    Ok(Some(ValidatedRateQuoter {
+        config: rate_quoter,
+        units,
+        providers,
+    }))
 }
 
 async fn rate_quoter_runtime(
     settings: &config::Settings,
-    rate_quoter: &config::RateQuoter,
-    units: &[CurrencyUnit],
+    validated: &ValidatedRateQuoter,
 ) -> Result<(
     Arc<AggregatingRateOracle>,
     DynRateQuoteStore,
     RateQuoteControlHandle,
 )> {
+    let rate_quoter = &validated.config;
     let oracle = Arc::new(AggregatingRateOracle::with_config(
-        rate_quoter_sources(&rate_quoter.sources)?,
+        rate_quoter_sources(&validated.providers),
         AggregatorConfig {
             min_sources: rate_quoter.min_fetched,
             min_survived: rate_quoter.min_survived,
@@ -1531,7 +1538,8 @@ async fn rate_quoter_runtime(
     let control =
         RateQuoteControlHandle::with_store_and_buffer_bps(store.clone(), rate_quoter.buffer_bps);
     let persisted_units = control.load_persisted().await?;
-    validate_persisted_rate_quoter_caps_require_buffer(rate_quoter, units, &control).await?;
+    validate_persisted_rate_quoter_caps_require_buffer(rate_quoter, &validated.units, &control)
+        .await?;
     for (unit, cap) in &rate_quoter.per_unit_caps {
         if !persisted_units.contains(unit) {
             control.set_unit_issuance_cap(unit.clone(), *cap).await?;
@@ -1550,32 +1558,107 @@ fn rate_quoter_units(rate_quoter: &config::RateQuoter) -> Vec<CurrencyUnit> {
     units
 }
 
-fn rate_quoter_sources(source_configs: &[String]) -> Result<Vec<Box<dyn RateSource>>> {
-    let mut sources: Vec<Box<dyn RateSource>> = Vec::new();
-    let configured_sources = if source_configs.is_empty() {
-        vec![
-            "coinbase".to_string(),
-            "kraken".to_string(),
-            "bitstamp".to_string(),
-        ]
-    } else {
-        source_configs.to_vec()
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RateOracleProvider {
+    Coinbase,
+    Kraken,
+    Bitstamp,
+}
 
-    for source in configured_sources {
-        let lowered = source.to_ascii_lowercase();
-        if lowered.contains("coinbase") {
-            sources.push(Box::new(CoinbaseRateSource::new()));
-        } else if lowered.contains("kraken") {
-            sources.push(Box::new(KrakenRateSource::new()));
-        } else if lowered.contains("bitstamp") {
-            sources.push(Box::new(BitstampRateSource::new()));
-        } else {
-            bail!("Unsupported rate_quoter source: {source}");
+impl RateOracleProvider {
+    const ALL: [Self; 3] = [Self::Coinbase, Self::Kraken, Self::Bitstamp];
+
+    fn alias(self) -> &'static str {
+        match self {
+            Self::Coinbase => "coinbase",
+            Self::Kraken => "kraken",
+            Self::Bitstamp => "bitstamp",
         }
     }
 
-    Ok(sources)
+    fn source(self) -> Box<dyn RateSource> {
+        match self {
+            Self::Coinbase => Box::new(CoinbaseRateSource::new()),
+            Self::Kraken => Box::new(KrakenRateSource::new()),
+            Self::Bitstamp => Box::new(BitstampRateSource::new()),
+        }
+    }
+}
+
+fn parse_rate_oracle_provider(configured: &str) -> Result<RateOracleProvider> {
+    if configured.trim() != configured {
+        bail!("rate_quoter source must not contain surrounding whitespace: {configured:?}");
+    }
+    if configured.contains("://") {
+        bail!(
+            "rate_quoter source URLs are not supported; endpoints are fixed by the implementation"
+        );
+    }
+
+    let lowered = configured.to_ascii_lowercase();
+    let mentioned = RateOracleProvider::ALL
+        .into_iter()
+        .filter(|provider| lowered.contains(provider.alias()))
+        .collect::<Vec<_>>();
+    if mentioned.len() > 1 {
+        bail!("Ambiguous rate_quoter source identifies multiple providers: {configured}");
+    }
+    RateOracleProvider::ALL
+        .into_iter()
+        .find(|provider| configured.eq_ignore_ascii_case(provider.alias()))
+        .ok_or_else(|| anyhow!("Unsupported rate_quoter source: {configured}"))
+}
+
+fn configured_rate_oracle_providers(source_configs: &[String]) -> Result<Vec<RateOracleProvider>> {
+    let providers = if source_configs.is_empty() {
+        RateOracleProvider::ALL.to_vec()
+    } else {
+        source_configs
+            .iter()
+            .map(|source| parse_rate_oracle_provider(source))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut distinct = HashSet::with_capacity(providers.len());
+    for provider in &providers {
+        if !distinct.insert(*provider) {
+            bail!(
+                "Duplicate rate_quoter provider configured through alias: {}",
+                provider.alias()
+            );
+        }
+    }
+    Ok(providers)
+}
+
+fn validate_rate_quoter_quorum(
+    rate_quoter: &config::RateQuoter,
+    provider_count: usize,
+) -> Result<()> {
+    if rate_quoter.min_survived == 0 || rate_quoter.min_fetched == 0 {
+        bail!("rate_quoter quorum values must both be at least 1");
+    }
+    if rate_quoter.min_survived > rate_quoter.min_fetched {
+        bail!(
+            "rate_quoter.min_survived ({}) cannot exceed rate_quoter.min_fetched ({})",
+            rate_quoter.min_survived,
+            rate_quoter.min_fetched
+        );
+    }
+    if rate_quoter.min_fetched > provider_count {
+        bail!(
+            "rate_quoter.min_fetched ({}) cannot exceed the distinct provider count ({provider_count})",
+            rate_quoter.min_fetched
+        );
+    }
+    Ok(())
+}
+
+fn rate_quoter_sources(providers: &[RateOracleProvider]) -> Vec<Box<dyn RateSource>> {
+    providers
+        .iter()
+        .copied()
+        .map(RateOracleProvider::source)
+        .collect()
 }
 
 fn validate_configured_rate_quoter_caps_require_buffer(
@@ -2516,6 +2599,8 @@ pub async fn run_mintd_with_shutdown(
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     routers: Vec<Router>,
 ) -> Result<()> {
+    validate_settings(settings)?;
+
     let (localstore, keystore, kv) = initial_setup(work_dir, settings, db_password.clone()).await?;
 
     let mint_builder = MintBuilder::new(localstore.clone());
@@ -4480,6 +4565,133 @@ ln_backend = "fakewallet"
         .expect("config with env port override should load");
 
         assert_eq!(settings.info.listen_port, 9090);
+    }
+
+    fn configured_sources(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[cfg(feature = "fakewallet")]
+    fn active_rate_quoter_settings() -> config::Settings {
+        use crate::config::{FakeWallet, Ln, LnBackend};
+
+        config::Settings {
+            info: config::Info {
+                mnemonic: Some(TEST_MNEMONIC.to_string()),
+                ..Default::default()
+            },
+            ln: vec![Ln {
+                ln_backend: LnBackend::FakeWallet,
+                unit: CurrencyUnit::Sat,
+                ..Default::default()
+            }],
+            fake_wallet: Some(FakeWallet::default()),
+            rate_quoter: Some(config::RateQuoter {
+                units: vec![CurrencyUnit::Usd],
+                buffer_bps: 100,
+                per_unit_caps: HashMap::from([(CurrencyUnit::Usd, 100)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn validate_settings_rejects_invalid_active_rate_source() {
+        let mut settings = active_rate_quoter_settings();
+        settings.rate_quoter.as_mut().expect("rate quoter").sources =
+            configured_sources(&["coinbase-pro"]);
+
+        let error = validate_settings(&settings)
+            .expect_err("static provider validation must run before mint startup");
+
+        assert!(error.to_string().contains("Unsupported rate_quoter source"));
+    }
+
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn validate_settings_rejects_invalid_active_rate_quorum() {
+        let mut settings = active_rate_quoter_settings();
+        let rate_quoter = settings.rate_quoter.as_mut().expect("rate quoter");
+        rate_quoter.sources = configured_sources(&["coinbase", "kraken"]);
+        rate_quoter.min_fetched = 3;
+
+        let error = validate_settings(&settings)
+            .expect_err("static quorum validation must run before mint startup");
+
+        assert!(error
+            .to_string()
+            .contains("cannot exceed the distinct provider count"));
+    }
+
+    #[test]
+    fn rate_quoter_canonicalizes_supported_provider_aliases() {
+        let providers = configured_rate_oracle_providers(&configured_sources(&[
+            "Coinbase", "KRAKEN", "bitstamp",
+        ]))
+        .expect("mixed-case aliases");
+
+        assert_eq!(providers, RateOracleProvider::ALL);
+        assert_eq!(
+            configured_rate_oracle_providers(&[]).expect("default providers"),
+            RateOracleProvider::ALL
+        );
+    }
+
+    #[test]
+    fn rate_quoter_rejects_urls_duplicates_ambiguous_and_inexact_sources() {
+        for (sources, expected) in [
+            (
+                configured_sources(&["https://api.coinbase.com"]),
+                "URLs are not supported",
+            ),
+            (
+                configured_sources(&["coinbase", "CoinBase"]),
+                "Duplicate rate_quoter provider",
+            ),
+            (
+                configured_sources(&["coinbase-kraken"]),
+                "Ambiguous rate_quoter source",
+            ),
+            (configured_sources(&[" coinbase"]), "surrounding whitespace"),
+            (
+                configured_sources(&["coinbase-pro"]),
+                "Unsupported rate_quoter source",
+            ),
+        ] {
+            let error = configured_rate_oracle_providers(&sources)
+                .expect_err("invalid provider configuration must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_quoter_quorum_must_fit_distinct_provider_count() {
+        for (min_fetched, min_survived, expected) in [
+            (0, 0, "at least 1"),
+            (3, 0, "at least 1"),
+            (2, 3, "cannot exceed rate_quoter.min_fetched"),
+            (4, 3, "cannot exceed the distinct provider count"),
+        ] {
+            let rate_quoter = config::RateQuoter {
+                min_fetched,
+                min_survived,
+                ..Default::default()
+            };
+            let error =
+                validate_rate_quoter_quorum(&rate_quoter, 3).expect_err("invalid quorum must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
+
+        validate_rate_quoter_quorum(&config::RateQuoter::default(), 3)
+            .expect("default 3/2 quorum over three providers");
     }
 
     fn rate_quoter_with_usd_cap(buffer_bps: u64, cap: u64) -> config::RateQuoter {

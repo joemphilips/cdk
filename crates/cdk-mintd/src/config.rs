@@ -1099,8 +1099,9 @@ pub struct RateQuoter {
     /// Per-unit quote TTL, independent of the global mint TTL.
     #[serde(default = "default_rate_quoter_ttl_secs")]
     pub ttl_secs: u64,
-    /// Oracle source identifiers or URLs. Supported values include coinbase,
-    /// kraken, and bitstamp URLs.
+    /// Oracle provider identifiers. Supported values are `coinbase`, `kraken`,
+    /// and `bitstamp` (case-insensitive); endpoints are fixed by the
+    /// implementation.
     #[serde(default)]
     pub sources: Vec<String>,
     /// Maximum acceptable source staleness in seconds.
@@ -1447,10 +1448,10 @@ mod tests {
 units = ["usd"]
 buffer_bps = 75
 ttl_secs = 90
-sources = ["coinbase", "https://api.kraken.com", "https://www.bitstamp.net"]
+sources = ["Coinbase", "KRAKEN", "bitstamp"]
 staleness_secs = 45
-min_fetched = 4
-min_survived = 3
+min_fetched = 3
+min_survived = 2
 per_unit_caps = { usd = 1000 }
 "#;
         fs::write(&config_path, config_content).expect("write config");
@@ -1463,8 +1464,8 @@ per_unit_caps = { usd = 1000 }
         assert_eq!(rate_quoter.ttl_secs, 90);
         assert_eq!(rate_quoter.sources.len(), 3);
         assert_eq!(rate_quoter.staleness_secs, 45);
-        assert_eq!(rate_quoter.min_fetched, 4);
-        assert_eq!(rate_quoter.min_survived, 3);
+        assert_eq!(rate_quoter.min_fetched, 3);
+        assert_eq!(rate_quoter.min_survived, 2);
         assert!(!rate_quoter.allow_in_memory_store);
         assert_eq!(
             rate_quoter.per_unit_caps.get(&CurrencyUnit::Usd),
