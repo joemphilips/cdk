@@ -1620,8 +1620,8 @@ listen_por = 8085
         std::env::remove_var(crate::env_vars::ENV_ONCHAIN_BACKEND);
     }
 
-    #[cfg(feature = "conditional-tokens")]
     #[test]
+    #[cfg(feature = "conditional-tokens")]
     fn test_ctf_registration_fee_config_requires_base() {
         let config_content = r#"
 [[mint_info.ctf_registration_fees]]

@@ -21,6 +21,8 @@ use crate::nuts::nut30::MeltQuoteOnchainFeeOption;
 use crate::nuts::{CurrencyUnit, MeltQuoteState, PublicKey};
 use crate::{Amount, QuoteId};
 
+pub mod unit_converter;
+
 /// CDK Payment Error
 #[derive(Debug, Error)]
 pub enum Error {

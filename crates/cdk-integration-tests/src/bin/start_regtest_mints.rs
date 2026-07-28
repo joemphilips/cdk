@@ -491,7 +491,6 @@ fn create_ldk_settings(
         lnd: None,
         ldk_node: Some(ldk_config),
         fake_wallet: None,
-        rate_quoter: None,
         onchain: None,
         ..Default::default()
     }

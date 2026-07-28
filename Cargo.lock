@@ -1446,28 +1446,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cdk-exchange-rate"
-version = "0.17.0"
-dependencies = [
- "async-trait",
- "axum",
- "bip39",
- "cdk",
- "cdk-axum",
- "cdk-common",
- "cdk-fake-wallet",
- "cdk-sqlite",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tokio-stream",
- "tracing",
-]
-
-[[package]]
 name = "cdk-fake-wallet"
 version = "0.18.2"
 dependencies = [
@@ -1694,7 +1672,6 @@ dependencies = [
  "bip39",
  "cdk",
  "cdk-common",
- "cdk-exchange-rate",
  "cdk-fake-wallet",
  "cdk-http-client",
  "cdk-sqlite",
@@ -1726,7 +1703,6 @@ dependencies = [
  "cdk-bdk",
  "cdk-cln",
  "cdk-common",
- "cdk-exchange-rate",
  "cdk-fake-wallet",
  "cdk-http-client",
  "cdk-ldk-node",
@@ -1814,7 +1790,6 @@ version = "0.18.2"
 dependencies = [
  "async-trait",
  "cdk-common",
- "cdk-exchange-rate",
  "cdk-sql-common",
  "futures-util",
  "native-tls",

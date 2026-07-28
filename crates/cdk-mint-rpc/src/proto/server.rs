@@ -1496,7 +1496,7 @@ mod tests {
     use cdk_common::nut00::KnownMethod;
     use cdk_common::MintQuoteBolt11Request;
     use cdk_fake_wallet::FakeWallet;
-    use tonic::{Code, Request};
+    use tonic::Request;
 
     use super::*;
     use crate::cdk_mint_server::CdkMint;
