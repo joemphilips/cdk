@@ -216,6 +216,52 @@ where
     assert_eq!(keysets.get("NO"), Some(&ks_no));
 }
 
+/// Test that condition-scoped keyset reads preserve rotated history.
+pub async fn get_conditional_keyset_infos_preserve_rotated_rows<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let condition = test_condition(&"f5".repeat(32));
+    db.add_condition(condition.clone()).await.unwrap();
+
+    let old_id = Id::from_str("001711afb1de20ce").unwrap();
+    let new_id = Id::from_str("001711afb1de20cf").unwrap();
+    let outcome_collection_id = "f6".repeat(32);
+    for (id, active, expiry) in [(new_id, true, 3_000), (old_id, false, 2_000)] {
+        let mut info = test_conditional_keyset_info(
+            id,
+            &condition.condition_id,
+            "YES",
+            &outcome_collection_id,
+        );
+        info.active = active;
+        info.final_expiry = Some(expiry);
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info, 1_000)
+            .await
+            .unwrap();
+    }
+
+    let returned = db
+        .get_conditional_keyset_infos_for_condition(&condition.condition_id)
+        .await
+        .unwrap();
+    assert_eq!(returned.len(), 2);
+    assert_eq!(
+        returned
+            .iter()
+            .map(|keyset| (keyset.id, keyset.final_expiry))
+            .collect::<Vec<_>>(),
+        vec![(old_id, Some(2_000)), (new_id, Some(3_000))]
+    );
+
+    let active = db
+        .get_conditional_keysets_for_condition(&condition.condition_id)
+        .await
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active.get("YES"), Some(&new_id));
+}
+
 /// Test get_condition_for_keyset lookup by keyset_id
 pub async fn get_condition_for_keyset<DB>(db: DB)
 where

@@ -691,11 +691,20 @@ pub trait ConditionsDatabase {
         attested_at: Option<u64>,
     ) -> Result<bool, Self::Err>;
 
-    /// Get conditional keysets for a condition (mapping outcome_collection → keyset id)
+    /// Get active conditional keysets for a condition (mapping outcome_collection → keyset id).
     async fn get_conditional_keysets_for_condition(
         &self,
         condition_id: &str,
     ) -> Result<HashMap<String, Id>, Self::Err>;
+
+    /// Get every conditional keyset registered for one condition.
+    ///
+    /// Unlike the outcome-to-active-keyset map, this preserves rotated
+    /// historical rows needed for lifecycle-bound calculations.
+    async fn get_conditional_keyset_infos_for_condition(
+        &self,
+        condition_id: &str,
+    ) -> Result<Vec<MintKeySetInfo>, Self::Err>;
 
     /// Get all conditional keyset infos (for GET /v1/conditional_keysets)
     async fn get_all_conditional_keyset_infos(

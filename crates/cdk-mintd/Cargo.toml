@@ -28,7 +28,9 @@ sqlcipher = ["sqlite", "cdk-sqlite/sqlcipher"]
 conditional-tokens = [
     "cdk-axum/conditional-tokens",
     "cdk/conditional-tokens",
+    "cdk-postgres?/conditional-tokens",
     "cdk-signatory/conditional-tokens",
+    "cdk-sqlite?/conditional-tokens",
 ]
 redis = ["cdk-axum/redis"]
 prometheus = ["cdk/prometheus", "dep:cdk-prometheus", "cdk-sqlite?/prometheus", "cdk-axum/prometheus"]
