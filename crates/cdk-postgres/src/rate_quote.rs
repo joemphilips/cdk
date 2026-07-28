@@ -7,8 +7,8 @@ use cdk_common::database::Error;
 use cdk_common::nuts::CurrencyUnit;
 use cdk_common::payment::PaymentIdentifier;
 use cdk_exchange_rate::{
-    ParkedPaymentRecord, RateQuoteRecord, RateQuoteSettlement, RateQuoteStore, RateQuoteStoreError,
-    UnitControlRecord,
+    ParkedPaymentRecord, RateQuoteRecord, RateQuoteSettlement, RateQuoteSide, RateQuoteStore,
+    RateQuoteStoreError, UnitControlRecord,
 };
 use cdk_sql_common::pool::Pool;
 use cdk_sql_common::stmt::query;
@@ -18,46 +18,49 @@ use crate::{PgConfig, PgConnectionPool};
 const MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS rate_quote_terms (
     payment_lookup_id TEXT PRIMARY KEY,
+    side TEXT NOT NULL CHECK (side IN ('mint', 'melt')),
     fiat_unit TEXT NOT NULL,
-    fiat_subunits BIGINT NOT NULL,
-    fiat_fee_subunits BIGINT NOT NULL DEFAULT 0,
+    fiat_subunits BIGINT NOT NULL CHECK (fiat_subunits >= 0),
+    fiat_fee_subunits BIGINT NOT NULL DEFAULT 0 CHECK (fiat_fee_subunits >= 0),
     snapshot_json TEXT NOT NULL,
-    sats_invoiced BIGINT NOT NULL,
-    sats_unbuffered BIGINT NOT NULL DEFAULT 0,
-    expiry_unix BIGINT NOT NULL,
-    settled BIGINT NOT NULL DEFAULT 0
+    sats_invoiced BIGINT NOT NULL CHECK (sats_invoiced >= 0),
+    sats_unbuffered BIGINT NOT NULL DEFAULT 0 CHECK (
+        sats_unbuffered >= 0 AND sats_unbuffered <= sats_invoiced
+    ),
+    expiry_unix BIGINT NOT NULL CHECK (expiry_unix >= 0),
+    settled BIGINT NOT NULL DEFAULT 0 CHECK (settled IN (0, 1))
 );
-
-ALTER TABLE rate_quote_terms
-    ADD COLUMN IF NOT EXISTS fiat_fee_subunits BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE rate_quote_terms
-    ADD COLUMN IF NOT EXISTS sats_unbuffered BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE rate_quote_terms
-    ADD COLUMN IF NOT EXISTS settled BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS parked_payments (
     payment_lookup_id TEXT NOT NULL,
     bolt11_payment_hash TEXT NOT NULL,
-    received_sats BIGINT NOT NULL,
-    observed_at BIGINT NOT NULL,
+    received_sats BIGINT NOT NULL CHECK (received_sats >= 0),
+    observed_at BIGINT NOT NULL CHECK (observed_at >= 0),
     resolution_status TEXT NOT NULL,
     PRIMARY KEY (payment_lookup_id, bolt11_payment_hash)
 );
 
 CREATE TABLE IF NOT EXISTS rate_unit_control (
     unit TEXT PRIMARY KEY,
-    mint_paused BIGINT NOT NULL DEFAULT 0,
-    melt_paused BIGINT NOT NULL DEFAULT 0,
-    cap BIGINT NOT NULL DEFAULT 0,
-    outstanding BIGINT NOT NULL DEFAULT 0,
-    buffer_surplus_sats BIGINT NOT NULL DEFAULT 0
+    mint_paused BIGINT NOT NULL DEFAULT 0 CHECK (mint_paused IN (0, 1)),
+    melt_paused BIGINT NOT NULL DEFAULT 0 CHECK (melt_paused IN (0, 1)),
+    cap BIGINT NOT NULL DEFAULT 0 CHECK (cap >= 0),
+    outstanding BIGINT NOT NULL DEFAULT 0 CHECK (outstanding >= 0),
+    buffer_surplus_sats BIGINT NOT NULL DEFAULT 0 CHECK (buffer_surplus_sats >= 0)
 );
 "#;
 
 const SELECT_QUOTE_SQL: &str = r#"
-SELECT payment_lookup_id, fiat_unit, fiat_subunits, fiat_fee_subunits, snapshot_json, sats_invoiced, sats_unbuffered, expiry_unix
+SELECT payment_lookup_id, fiat_unit, fiat_subunits, fiat_fee_subunits, snapshot_json, sats_invoiced, sats_unbuffered, expiry_unix, side
 FROM rate_quote_terms
 WHERE payment_lookup_id = :payment_lookup_id
+"#;
+
+const SELECT_QUOTE_FOR_UPDATE_SQL: &str = r#"
+SELECT payment_lookup_id, fiat_unit, fiat_subunits, fiat_fee_subunits, snapshot_json, sats_invoiced, sats_unbuffered, expiry_unix, side, settled
+FROM rate_quote_terms
+WHERE payment_lookup_id = :payment_lookup_id
+FOR UPDATE
 "#;
 
 const INSERT_PARKED_SQL: &str = r#"
@@ -81,7 +84,12 @@ pub struct PostgresRateQuoteStore {
 impl PostgresRateQuoteStore {
     /// Create the store and apply its companion-table migration.
     pub async fn new(conn_str: &str) -> Result<Self, Error> {
-        let pool = Pool::<PgConnectionPool>::new(PgConfig::from(conn_str));
+        Self::with_config(PgConfig::from(conn_str)).await
+    }
+
+    /// Create the store using the same resolved PostgreSQL policy as the mint database.
+    pub async fn with_config(config: PgConfig) -> Result<Self, Error> {
+        let pool = Pool::<PgConnectionPool>::new(config);
         let store = Self { pool };
         store.migrate().await?;
         Ok(store)
@@ -136,13 +144,14 @@ impl RateQuoteStore for PostgresRateQuoteStore {
         query(
             r#"
             INSERT INTO rate_quote_terms
-                (payment_lookup_id, fiat_unit, fiat_subunits, fiat_fee_subunits, snapshot_json, sats_invoiced, sats_unbuffered, expiry_unix)
+                (payment_lookup_id, fiat_unit, fiat_subunits, fiat_fee_subunits, snapshot_json, sats_invoiced, sats_unbuffered, expiry_unix, side)
             VALUES
-                (:payment_lookup_id, :fiat_unit, :fiat_subunits, :fiat_fee_subunits, :snapshot_json, :sats_invoiced, :sats_unbuffered, :expiry_unix)
+                (:payment_lookup_id, :fiat_unit, :fiat_subunits, :fiat_fee_subunits, :snapshot_json, :sats_invoiced, :sats_unbuffered, :expiry_unix, :side)
             "#,
         )
         .map_err(storage_error)?
         .bind("payment_lookup_id", record.payment_lookup_id.to_string())
+        .bind("side", record.side.to_string())
         .bind("fiat_unit", record.fiat_unit.to_string())
         .bind(
             "fiat_subunits",
@@ -289,6 +298,22 @@ impl RateQuoteStore for PostgresRateQuoteStore {
             .map_err(storage_error)?;
 
         let result = async {
+            let Some(row) = query(SELECT_QUOTE_FOR_UPDATE_SQL)
+                .map_err(storage_error)?
+                .bind("payment_lookup_id", payment_lookup_id.to_string())
+                .fetch_one(&*conn)
+                .await
+                .map_err(storage_error)?
+            else {
+                return Ok(false);
+            };
+            let already_settled = int_col(&row[9])? != 0;
+            let record = row_to_record(row)?;
+            record.validate_settlement(unit, settlement)?;
+            if already_settled {
+                return Ok(false);
+            }
+
             let affected = query(
                 r#"
                 UPDATE rate_quote_terms
@@ -521,7 +546,7 @@ impl RateQuoteStore for PostgresRateQuoteStore {
 fn row_to_record(
     row: Vec<cdk_sql_common::stmt::Column>,
 ) -> Result<RateQuoteRecord, RateQuoteStoreError> {
-    if row.len() < 8 {
+    if row.len() < 9 {
         return Err(RateQuoteStoreError::Storage(
             "rate quote row had too few columns".to_string(),
         ));
@@ -532,9 +557,13 @@ fn row_to_record(
         .parse::<CurrencyUnit>()
         .map_err(storage_error)?;
     let snapshot_json = serde_json::from_str(&text_col(&row[4])?).map_err(storage_error)?;
+    let side = text_col(&row[8])?
+        .parse::<RateQuoteSide>()
+        .map_err(storage_error)?;
 
     Ok(RateQuoteRecord {
         payment_lookup_id: PaymentIdentifier::CustomId(payment_lookup_id),
+        side,
         fiat_unit,
         fiat_subunits: int_col(&row[2])?,
         fiat_fee_subunits: int_col(&row[3])?,
@@ -596,23 +625,33 @@ fn int_col(value: &cdk_sql_common::stmt::Column) -> Result<u64, RateQuoteStoreEr
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     /// Live-Postgres store with an isolated schema per test.
     async fn store(test_id: &str) -> PostgresRateQuoteStore {
+        static SCHEMA_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
         let db_url = std::env::var("CDK_MINTD_DATABASE_URL")
             .or_else(|_| std::env::var("PG_DB_URL"))
             .unwrap_or(
                 "host=localhost user=cdk_user password=cdk_password dbname=cdk_mint port=5432"
                     .to_owned(),
             );
-        let db_url = format!("{db_url} schema=rate_quote_{test_id}");
+        let schema_sequence = SCHEMA_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let db_url = format!(
+            "{db_url} schema=rate_quote_{test_id}_{}_{}",
+            std::process::id(),
+            schema_sequence
+        );
         PostgresRateQuoteStore::new(&db_url).await.expect("store")
     }
 
-    fn record(lookup_id: &str) -> RateQuoteRecord {
+    fn record(lookup_id: &str, side: RateQuoteSide) -> RateQuoteRecord {
         RateQuoteRecord {
             payment_lookup_id: PaymentIdentifier::CustomId(lookup_id.to_string()),
+            side,
             fiat_unit: CurrencyUnit::Usd,
             fiat_subunits: 100,
             fiat_fee_subunits: 3,
@@ -636,22 +675,148 @@ mod tests {
     #[tokio::test]
     async fn quote_terms_round_trip() {
         let store = store("round_trip").await;
-        let record = record("rt-1");
+        let mint_record = record("rt-mint", RateQuoteSide::Mint);
+        let melt_record = record("rt-melt", RateQuoteSide::Melt);
 
-        store.insert(record.clone()).await.expect("insert");
-        let loaded = store
-            .get_by_lookup_id(&record.payment_lookup_id)
+        store
+            .insert(mint_record.clone())
+            .await
+            .expect("insert mint");
+        store
+            .insert(melt_record.clone())
+            .await
+            .expect("insert melt");
+        let loaded_mint = store
+            .get_by_lookup_id(&mint_record.payment_lookup_id)
+            .await
+            .expect("lookup")
+            .expect("record");
+        let loaded_melt = store
+            .get_by_lookup_id(&melt_record.payment_lookup_id)
             .await
             .expect("lookup")
             .expect("record");
 
-        assert_eq!(loaded, record);
+        assert_eq!(loaded_mint, mint_record);
+        assert_eq!(loaded_melt, melt_record);
+    }
+
+    #[tokio::test]
+    async fn rate_quote_schema_rejects_invalid_persisted_values() {
+        let store = store("side_constraints").await;
+        let conn = store.conn().await.expect("connection");
+
+        let missing = query(
+            r#"
+            INSERT INTO rate_quote_terms
+                (payment_lookup_id, fiat_unit, fiat_subunits, snapshot_json, sats_invoiced, expiry_unix)
+            VALUES
+                ('missing-side', 'usd', 100, '{}', 1000, 42)
+            "#,
+        )
+        .expect("missing-side query")
+        .execute(&*conn)
+        .await;
+        assert!(missing.is_err(), "side must be NOT NULL with no default");
+
+        let unknown = query(
+            r#"
+            INSERT INTO rate_quote_terms
+                (payment_lookup_id, side, fiat_unit, fiat_subunits, snapshot_json, sats_invoiced, expiry_unix)
+            VALUES
+                ('unknown-side', 'unknown', 'usd', 100, '{}', 1000, 42)
+            "#,
+        )
+        .expect("unknown-side query")
+        .execute(&*conn)
+        .await;
+        assert!(unknown.is_err(), "side CHECK must reject unknown values");
+
+        let negative = query(
+            r#"
+            INSERT INTO rate_quote_terms
+                (payment_lookup_id, side, fiat_unit, fiat_subunits, snapshot_json, sats_invoiced, expiry_unix)
+            VALUES
+                ('negative-amount', 'mint', 'usd', -1, '{}', 1000, 42)
+            "#,
+        )
+        .expect("negative query")
+        .execute(&*conn)
+        .await;
+        assert!(
+            negative.is_err(),
+            "u64-backed columns must reject negatives"
+        );
+
+        let invalid_unbuffered = query(
+            r#"
+            INSERT INTO rate_quote_terms
+                (payment_lookup_id, side, fiat_unit, fiat_subunits, snapshot_json, sats_invoiced, sats_unbuffered, expiry_unix)
+            VALUES
+                ('invalid-unbuffered', 'mint', 'usd', 100, '{}', 1000, 1001, 42)
+            "#,
+        )
+        .expect("unbuffered query")
+        .execute(&*conn)
+        .await;
+        assert!(
+            invalid_unbuffered.is_err(),
+            "unbuffered sats must not exceed invoiced sats"
+        );
+
+        let invalid_settled = query(
+            r#"
+            INSERT INTO rate_quote_terms
+                (payment_lookup_id, side, fiat_unit, fiat_subunits, snapshot_json, sats_invoiced, expiry_unix, settled)
+            VALUES
+                ('invalid-settled', 'mint', 'usd', 100, '{}', 1000, 42, 2)
+            "#,
+        )
+        .expect("settled query")
+        .execute(&*conn)
+        .await;
+        assert!(
+            invalid_settled.is_err(),
+            "settled flag must be boolean-valued"
+        );
+
+        let invalid_control = query(
+            r#"
+            INSERT INTO rate_unit_control
+                (unit, mint_paused, melt_paused, cap)
+            VALUES
+                ('usd', 2, 0, -1)
+            "#,
+        )
+        .expect("control query")
+        .execute(&*conn)
+        .await;
+        assert!(
+            invalid_control.is_err(),
+            "unit control booleans and counters must be constrained"
+        );
+
+        let invalid_parked = query(
+            r#"
+            INSERT INTO parked_payments
+                (payment_lookup_id, bolt11_payment_hash, received_sats, observed_at, resolution_status)
+            VALUES
+                ('negative-parked', 'hash', -1, -1, 'parked')
+            "#,
+        )
+        .expect("parked query")
+        .execute(&*conn)
+        .await;
+        assert!(
+            invalid_parked.is_err(),
+            "parked u64-backed columns must reject negatives"
+        );
     }
 
     #[tokio::test]
     async fn park_or_credit_returns_terms_or_parks() {
         let store = store("park_or_credit").await;
-        let record = record("poc-1");
+        let record = record("poc-1", RateQuoteSide::Mint);
         store.insert(record.clone()).await.expect("insert");
 
         let credited = store
@@ -670,7 +835,7 @@ mod tests {
     #[tokio::test]
     async fn mark_settled_returns_true_exactly_once() {
         let store = store("mark_settled").await;
-        let record = record("ms-1");
+        let record = record("ms-1", RateQuoteSide::Mint);
         store.insert(record.clone()).await.expect("insert");
 
         assert!(store
@@ -691,8 +856,9 @@ mod tests {
     #[tokio::test]
     async fn settle_quote_and_commit_unit_control_is_one_shot() {
         let store = store("settle_commit").await;
-        let mint_record = record("sc-mint");
-        let melt_record = record("sc-melt");
+        let mint_record = record("sc-mint", RateQuoteSide::Mint);
+        let mut melt_record = record("sc-melt", RateQuoteSide::Melt);
+        melt_record.fiat_subunits = 37;
         let usd = CurrencyUnit::Usd;
         store
             .insert(mint_record.clone())
@@ -702,6 +868,45 @@ mod tests {
             .insert(melt_record.clone())
             .await
             .expect("insert melt");
+
+        for (unit, settlement) in [
+            (
+                CurrencyUnit::Usd,
+                RateQuoteSettlement::Melt { fiat_subunits: 100 },
+            ),
+            (
+                CurrencyUnit::Eur,
+                RateQuoteSettlement::MintCredit {
+                    fiat_subunits: 100,
+                    buffer_surplus_sats: 10,
+                },
+            ),
+            (
+                CurrencyUnit::Usd,
+                RateQuoteSettlement::MintCredit {
+                    fiat_subunits: 101,
+                    buffer_surplus_sats: 10,
+                },
+            ),
+        ] {
+            let error = store
+                .settle_quote_and_commit_unit_control(
+                    &mint_record.payment_lookup_id,
+                    &unit,
+                    settlement,
+                )
+                .await
+                .expect_err("conflicting settlement must fail");
+            assert!(matches!(error, RateQuoteStoreError::InvalidSettlement(_)));
+            assert!(
+                store
+                    .load_unit_controls()
+                    .await
+                    .expect("controls")
+                    .is_empty(),
+                "invalid settlement must not mutate unit control"
+            );
+        }
 
         assert!(store
             .settle_quote_and_commit_unit_control(

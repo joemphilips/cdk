@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::oracle::RateOracle;
 use crate::store::{
-    DynRateQuoteStore, ParkedPaymentRecord, RateQuoteRecord, RateQuoteSettlement,
+    DynRateQuoteStore, ParkedPaymentRecord, RateQuoteRecord, RateQuoteSettlement, RateQuoteSide,
     RateQuoteStoreError,
 };
 use crate::types::{fiat_subunit_scale, RateOracleError, RateSnapshot};
@@ -348,14 +348,14 @@ impl RateQuoteControlHandle {
     async fn ensure_not_paused(
         &self,
         unit: &CurrencyUnit,
-        side: QuoteSide,
+        side: RateQuoteSide,
     ) -> Result<(), RateConvertingPaymentError> {
         let units = self.units.lock().await;
         let paused = units
             .get(unit)
             .map(|state| match side {
-                QuoteSide::Mint => state.quote_state.mint_paused,
-                QuoteSide::Melt => state.quote_state.melt_paused,
+                RateQuoteSide::Mint => state.quote_state.mint_paused,
+                RateQuoteSide::Melt => state.quote_state.melt_paused,
             })
             .unwrap_or_default();
         if paused {
@@ -439,21 +439,6 @@ impl RateQuoteControlHandle {
         let mut units = self.units.lock().await;
         let state = units.entry(unit.clone()).or_default();
         state.outstanding = state.outstanding.saturating_sub(fiat_subunits);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum QuoteSide {
-    Mint,
-    Melt,
-}
-
-impl QuoteSide {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Mint => "mint",
-            Self::Melt => "melt",
-        }
     }
 }
 
@@ -811,7 +796,7 @@ where
             return Err(SelfError::UnsupportedUnit(options.amount.unit().clone()));
         }
         self.control
-            .ensure_not_paused(&self.config.fiat_unit, QuoteSide::Mint)
+            .ensure_not_paused(&self.config.fiat_unit, RateQuoteSide::Mint)
             .await?;
 
         let fiat_subunits = options.amount.value();
@@ -865,6 +850,7 @@ where
 
         let record = RateQuoteRecord {
             payment_lookup_id: response.request_lookup_id.clone(),
+            side: RateQuoteSide::Mint,
             fiat_unit: self.config.fiat_unit.clone(),
             fiat_subunits,
             fiat_fee_subunits: 0,
@@ -903,7 +889,7 @@ where
             return Err(SelfError::UnsupportedUnit(unit.clone()));
         }
         self.control
-            .ensure_not_paused(&self.config.fiat_unit, QuoteSide::Melt)
+            .ensure_not_paused(&self.config.fiat_unit, RateQuoteSide::Melt)
             .await?;
 
         let inner_quote = self
@@ -937,6 +923,7 @@ where
             self.store
                 .insert(RateQuoteRecord {
                     payment_lookup_id: payment_lookup_id.clone(),
+                    side: RateQuoteSide::Melt,
                     fiat_unit: self.config.fiat_unit.clone(),
                     fiat_subunits,
                     fiat_fee_subunits,
@@ -976,6 +963,7 @@ where
         else {
             return Ok(response);
         };
+        ensure_rate_record(&record, RateQuoteSide::Melt, &self.config.fiat_unit)?;
         self.settle_melt(&record, &response).await;
 
         Ok(MakePaymentResponse {
@@ -1056,6 +1044,7 @@ where
         else {
             return Ok(response);
         };
+        ensure_rate_record(&record, RateQuoteSide::Melt, &self.config.fiat_unit)?;
         self.settle_melt(&record, &response).await;
 
         Ok(MakePaymentResponse {
@@ -1085,6 +1074,14 @@ async fn convert_payment_event(
     // the lookup and the park.
     match store.park_or_credit(parked.clone()).await {
         Ok(Some(record)) => {
+            if let Err(error) = ensure_rate_record(&record, RateQuoteSide::Mint, &fiat_unit) {
+                tracing::warn!(
+                    payment_lookup_id = %payment.payment_identifier,
+                    error = %error,
+                    "suppressing rate-converted payment with conflicting stored terms"
+                );
+                return None;
+            }
             if payment.payment_amount.value() < record.sats_invoiced {
                 tracing::warn!(
                     payment_lookup_id = %payment.payment_identifier,
@@ -1123,6 +1120,26 @@ async fn convert_payment_event(
             None
         }
     }
+}
+
+fn ensure_rate_record(
+    record: &RateQuoteRecord,
+    expected_side: RateQuoteSide,
+    expected_unit: &CurrencyUnit,
+) -> Result<(), RateQuoteStoreError> {
+    if record.side != expected_side {
+        return Err(RateQuoteStoreError::InvalidSettlement(format!(
+            "stored side {} does not match converter side {expected_side}",
+            record.side
+        )));
+    }
+    if &record.fiat_unit != expected_unit {
+        return Err(RateQuoteStoreError::InvalidSettlement(format!(
+            "stored unit {} does not match converter unit {expected_unit}",
+            record.fiat_unit
+        )));
+    }
+    Ok(())
 }
 
 /// Apply the one-shot counter effects of a credited mint payment: vacate the
@@ -1342,6 +1359,20 @@ mod tests {
     use super::*;
     use crate::types::{AggregationMeta, SourceReading};
 
+    fn stored_record(side: RateQuoteSide, unit: CurrencyUnit) -> RateQuoteRecord {
+        RateQuoteRecord {
+            payment_lookup_id: PaymentIdentifier::CustomId("lookup".to_string()),
+            side,
+            fiat_unit: unit,
+            fiat_subunits: 100,
+            fiat_fee_subunits: 0,
+            snapshot_json: serde_json::json!({}),
+            sats_invoiced: 1_000,
+            sats_unbuffered: 1_000,
+            expiry_unix: 42,
+        }
+    }
+
     #[test]
     fn sats_for_fiat_subunits_uses_whole_unit_rate() {
         let sats =
@@ -1394,6 +1425,31 @@ mod tests {
     }
 
     #[test]
+    fn converter_rejects_wrong_side_and_unit() {
+        let wrong_side = ensure_rate_record(
+            &stored_record(RateQuoteSide::Melt, CurrencyUnit::Usd),
+            RateQuoteSide::Mint,
+            &CurrencyUnit::Usd,
+        )
+        .expect_err("wrong side");
+        assert!(matches!(
+            wrong_side,
+            RateQuoteStoreError::InvalidSettlement(_)
+        ));
+
+        let wrong_unit = ensure_rate_record(
+            &stored_record(RateQuoteSide::Mint, CurrencyUnit::Eur),
+            RateQuoteSide::Mint,
+            &CurrencyUnit::Usd,
+        )
+        .expect_err("wrong unit");
+        assert!(matches!(
+            wrong_unit,
+            RateQuoteStoreError::InvalidSettlement(_)
+        ));
+    }
+
+    #[test]
     fn effective_expiry_uses_decorator_ttl() {
         let before = unix_time();
         let expiry = effective_expiry(77);
@@ -1410,7 +1466,7 @@ mod tests {
             .expect("set pause state");
 
         let error = control
-            .ensure_not_paused(&CurrencyUnit::Usd, QuoteSide::Mint)
+            .ensure_not_paused(&CurrencyUnit::Usd, RateQuoteSide::Mint)
             .await
             .expect_err("mint side should be paused");
         assert!(matches!(
@@ -1418,7 +1474,7 @@ mod tests {
             RateConvertingPaymentError::UnitPaused { side: "mint", .. }
         ));
         control
-            .ensure_not_paused(&CurrencyUnit::Usd, QuoteSide::Melt)
+            .ensure_not_paused(&CurrencyUnit::Usd, RateQuoteSide::Melt)
             .await
             .expect("melt side should stay open");
     }

@@ -41,7 +41,7 @@ use cdk_common::Amount;
 #[cfg(feature = "prometheus")]
 use cdk_common::payment::MetricsMintPayment;
 use cdk_common::payment::MintPayment;
-use cdk_exchange_rate::{MsatSatConverter, SharedMintPayment};
+use cdk_exchange_rate::{sat_msat_backends, MsatSatConverter, SharedMintPayment};
 #[cfg(feature = "postgres")]
 use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig};
 #[cfg(feature = "sqlite")]
@@ -996,12 +996,7 @@ async fn setup_database(
             }
 
             #[cfg(feature = "postgres")]
-            let db_config = PgConfig::new(
-                pg_config.url.as_str(),
-                pg_config.tls_mode.as_deref(),
-                pg_config.max_connections,
-                pg_config.connection_timeout_seconds,
-            );
+            let db_config = resolved_postgres_config(pg_config);
             #[cfg(feature = "postgres")]
             let pg_db = Arc::new(MintPgDatabase::new(db_config).await?);
             tracing::info!("PostgreSQL database connection established");
@@ -1622,38 +1617,61 @@ async fn configure_sat_msat_backend_for_unit(
     mint_melt_limits: MintMeltLimits,
     backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
 ) -> Result<MintBuilder> {
+    if unit != CurrencyUnit::Sat {
+        let backend = normalize_non_sat_backend_unit(unit.clone(), backend).await?;
+        let mint_builder =
+            configure_backend_for_unit(settings, mint_builder, unit, mint_melt_limits, backend)
+                .await?;
+        return Ok(mint_builder);
+    }
+
+    let backends = sat_msat_backends(backend).await?;
     let mut mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
-        unit.clone(),
+        CurrencyUnit::Sat,
         mint_melt_limits,
-        backend.clone(),
+        backends.sat.clone(),
     )
     .await?;
-    if unit != CurrencyUnit::Sat {
-        return Ok(mint_builder);
-    }
-    let msat_limits = MintMeltLimits {
+
+    // The MSAT route exposes the same economic limits in millisatoshis:
+    // 1 sat = 1000 msat.
+    let msat_mint_melt_limits = MintMeltLimits {
         mint_min: Amount::from(mint_melt_limits.mint_min.to_u64().saturating_mul(1000)),
         mint_max: Amount::from(mint_melt_limits.mint_max.to_u64().saturating_mul(1000)),
         melt_min: Amount::from(mint_melt_limits.melt_min.to_u64().saturating_mul(1000)),
         melt_max: Amount::from(mint_melt_limits.melt_max.to_u64().saturating_mul(1000)),
     };
-    let msat_backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync> =
-        if backend.get_settings().await?.unit == "msat" {
-            backend
-        } else {
-            Arc::new(MsatSatConverter::new(SharedMintPayment::new(backend)))
-        };
     mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
         CurrencyUnit::Msat,
-        msat_limits,
-        msat_backend,
+        msat_mint_melt_limits,
+        backends.msat,
     )
     .await?;
+
     Ok(mint_builder)
+}
+
+async fn normalize_non_sat_backend_unit(
+    configured_unit: CurrencyUnit,
+    backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
+) -> Result<Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>> {
+    let settings = backend.get_settings().await?;
+    let backend_unit = CurrencyUnit::from_str(&settings.unit)
+        .with_context(|| format!("Payment backend returned invalid unit `{}`", settings.unit))?;
+
+    match (&backend_unit, &configured_unit) {
+        (backend_unit, configured_unit) if backend_unit == configured_unit => Ok(backend),
+        (CurrencyUnit::Sat, CurrencyUnit::Msat) => Ok(Arc::new(MsatSatConverter::new(
+            SharedMintPayment::new(backend),
+        ))),
+        _ => bail!(
+            "Payment backend reports unit {backend_unit} but config registers unit {configured_unit}; only matching units or sat/msat conversions are supported"
+        ),
+    }
 }
 
 /// Helper function to configure a mint builder with a payment backend for a specific currency unit
@@ -3899,6 +3917,120 @@ backend = "fakewallet"
             .expect_err("duplicate unit/method pair should be rejected");
 
         assert!(err.to_string().contains("Duplicate payment processor"));
+    }
+
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn rate_quoter_requires_exactly_one_configured_sat_backend() {
+        use crate::config::{Ln, LnBackend, RateQuoter};
+
+        let rate_quoter = RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            ..Default::default()
+        };
+        let no_lightning = config::Settings {
+            rate_quoter: Some(rate_quoter.clone()),
+            ..Default::default()
+        };
+        let msat_only = config::Settings {
+            ln: vec![Ln {
+                ln_backend: LnBackend::FakeWallet,
+                unit: CurrencyUnit::Msat,
+                ..Default::default()
+            }],
+            rate_quoter: Some(rate_quoter.clone()),
+            ..Default::default()
+        };
+        let one_sat = config::Settings {
+            ln: vec![Ln {
+                ln_backend: LnBackend::FakeWallet,
+                unit: CurrencyUnit::Sat,
+                ..Default::default()
+            }],
+            rate_quoter: Some(rate_quoter.clone()),
+            ..Default::default()
+        };
+        let multiple_sat = config::Settings {
+            ln: vec![
+                Ln {
+                    ln_backend: LnBackend::FakeWallet,
+                    unit: CurrencyUnit::Sat,
+                    ..Default::default()
+                },
+                Ln {
+                    ln_backend: LnBackend::FakeWallet,
+                    unit: CurrencyUnit::Sat,
+                    ..Default::default()
+                },
+            ],
+            rate_quoter: Some(rate_quoter),
+            ..Default::default()
+        };
+
+        let no_lightning_error = validate_rate_quoter_sat_backend_count(&no_lightning)
+            .expect_err("an active rate quoter must reject an empty Lightning config");
+        let msat_only_error = validate_rate_quoter_sat_backend_count(&msat_only)
+            .expect_err("an active rate quoter must reject an MSAT-only Lightning config");
+        validate_rate_quoter_sat_backend_count(&one_sat)
+            .expect("one configured SAT backend should be accepted");
+        let multiple_sat_error = validate_rate_quoter_sat_backend_count(&multiple_sat)
+            .expect_err("multiple SAT backends must fail closed with rate quoting");
+
+        assert!(no_lightning_error.to_string().contains("found 0"));
+        assert!(msat_only_error.to_string().contains("found 0"));
+        assert!(multiple_sat_error.to_string().contains("found 2"));
+    }
+
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn empty_rate_quoter_section_is_a_no_op() {
+        use crate::config::{Ln, LnBackend, RateQuoter};
+
+        let settings = config::Settings {
+            ln: vec![
+                Ln {
+                    ln_backend: LnBackend::FakeWallet,
+                    unit: CurrencyUnit::Sat,
+                    ..Default::default()
+                },
+                Ln {
+                    ln_backend: LnBackend::FakeWallet,
+                    unit: CurrencyUnit::Sat,
+                    ..Default::default()
+                },
+            ],
+            rate_quoter: Some(RateQuoter::default()),
+            ..Default::default()
+        };
+
+        validate_rate_quoter_sat_backend_count(&settings)
+            .expect("a rate-quoter section without units should remain a no-op");
+    }
+
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn multiple_sat_backends_are_not_rejected_without_rate_quoter() {
+        use crate::config::{Ln, LnBackend};
+
+        let settings = config::Settings {
+            ln: vec![
+                Ln {
+                    ln_backend: LnBackend::FakeWallet,
+                    unit: CurrencyUnit::Sat,
+                    ..Default::default()
+                },
+                Ln {
+                    ln_backend: LnBackend::FakeWallet,
+                    unit: CurrencyUnit::Sat,
+                    ..Default::default()
+                },
+            ],
+            rate_quoter: None,
+            ..Default::default()
+        };
+
+        validate_rate_quoter_sat_backend_count(&settings)
+            .expect("non-rate-quoter multi-backend behavior should remain unchanged");
     }
 
     #[cfg(all(feature = "fakewallet", feature = "sqlite"))]
