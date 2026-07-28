@@ -7,8 +7,8 @@ use serde_json::{Map, Value};
 
 use super::manifest::{strict_keyset_id, strict_public_key};
 use super::{
-    ctf_receive_commitment, CanonicalHash, Error, PayToUnlockCondition, PayToUnlockMode, PoolEntry,
-    PoolManifest, SelectionBitmap,
+    ctf_receive_commitment, CanonicalHash, Error, PayToUnlockAuthorization, PayToUnlockCondition,
+    PayToUnlockMode, PoolEntry, PoolManifest, SelectionBitmap,
 };
 use crate::nuts::nut00::{BlindedMessage, Proof, Proofs, Witness};
 use crate::nuts::nut01::PublicKey;
@@ -283,6 +283,18 @@ impl CtfSettlementRequest {
 
     /// Validate protocol-pure structure, commitments, selections, and policies.
     pub fn validate(&self, limits: CtfSettlementLimits) -> Result<(), Error> {
+        self.validated_authorizations(limits).map(drop)
+    }
+
+    /// Validate the request and return one shared authorization per participant.
+    ///
+    /// Returned authorizations preserve canonical participant order. Each
+    /// authorization has already been checked against every input in its
+    /// participant and deliberately excludes proof-local nonces.
+    pub fn validated_authorizations(
+        &self,
+        limits: CtfSettlementLimits,
+    ) -> Result<Vec<PayToUnlockAuthorization>, Error> {
         limits.validate()?;
         if self.participants.len() < 2 {
             return Err(Error::InvalidStructure(
@@ -314,8 +326,9 @@ impl CtfSettlementRequest {
         let mut condition_nonces = HashSet::with_capacity(input_count);
         let mut output_points = HashSet::with_capacity(output_count);
         let mut previous_participant_key = None;
+        let mut authorizations = Vec::with_capacity(self.participants.len());
         for participant in &self.participants {
-            let participant_key = validate_participant(
+            let (participant_key, authorization) = validate_participant(
                 participant,
                 limits.max_pool_entries,
                 &mut proof_secrets,
@@ -329,8 +342,9 @@ impl CtfSettlementRequest {
                 return Err(Error::NonCanonicalParticipantOrder);
             }
             previous_participant_key = Some(participant_key);
+            authorizations.push(authorization);
         }
-        Ok(())
+        Ok(authorizations)
     }
 
     /// Require every participating input keyset to advertise a positive fee.
@@ -641,7 +655,7 @@ fn validate_participant(
     proof_secrets: &mut HashSet<Secret>,
     condition_nonces: &mut HashSet<CanonicalHash>,
     output_points: &mut HashSet<PublicKey>,
-) -> Result<(String, String), Error> {
+) -> Result<((String, String), PayToUnlockAuthorization), Error> {
     if participant.inputs.is_empty() || participant.outputs.is_empty() {
         return Err(Error::InvalidStructure(
             "each participant requires inputs and outputs",
@@ -652,9 +666,13 @@ fn validate_participant(
     let authorization = parse_authorization(participant, proof_secrets, condition_nonces)?;
     validate_participant_mode(participant, max_pool_entries, &authorization)?;
 
-    Ok(input_order_key(participant.inputs.first().ok_or(
-        Error::InvalidStructure("participant inputs are empty"),
-    )?))
+    let participant_key = input_order_key(
+        participant
+            .inputs
+            .first()
+            .ok_or(Error::InvalidStructure("participant inputs are empty"))?,
+    );
+    Ok((participant_key, authorization.authorization()))
 }
 
 fn validate_unique_outputs(

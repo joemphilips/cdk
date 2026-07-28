@@ -99,6 +99,23 @@ pub enum PayToUnlockMode {
     Pool(PoolPolicy),
 }
 
+/// Participant-wide settlement authority shared by every input proof.
+///
+/// This deliberately excludes the proof-local nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PayToUnlockAuthorization {
+    /// CTF receive or manifest commitment.
+    pub data: CanonicalHash,
+    /// Keyset of every proof carrying this authority.
+    pub offer_keyset: Id,
+    /// Last unix second before which settlement is valid.
+    pub expiry: u64,
+    /// Fresh BIP-340 x-only refund public key.
+    pub refund: XOnlyPublicKey,
+    /// Closed standard or pool authorization.
+    pub mode: PayToUnlockMode,
+}
+
 /// A validated CTF `PAY_TO_UNLOCK` condition.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PayToUnlockCondition {
@@ -156,11 +173,18 @@ impl PayToUnlockCondition {
     ///
     /// The nonce is intentionally excluded because it must be unique per proof.
     pub fn has_same_authorization(&self, other: &Self) -> bool {
-        self.data == other.data
-            && self.offer_keyset == other.offer_keyset
-            && self.expiry == other.expiry
-            && self.refund == other.refund
-            && self.mode == other.mode
+        self.authorization() == other.authorization()
+    }
+
+    /// Return the participant-wide authority without a proof-local nonce.
+    pub const fn authorization(&self) -> PayToUnlockAuthorization {
+        PayToUnlockAuthorization {
+            data: self.data,
+            offer_keyset: self.offer_keyset,
+            expiry: self.expiry,
+            refund: self.refund,
+            mode: self.mode,
+        }
     }
 }
 
