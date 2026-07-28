@@ -7,12 +7,16 @@ mod canonical;
 mod condition;
 mod manifest;
 mod request;
+mod settings;
 
 pub use canonical::{ctf_receive_commitment, CanonicalHash};
 pub use condition::{PayToUnlockCondition, PayToUnlockMode, PoolPolicy};
 pub use manifest::{PoolEntry, PoolEntryRole, PoolManifest, SelectionBitmap};
 pub use request::{
     CtfSettlementLimits, CtfSettlementParticipant, CtfSettlementRequest, ParticipantMode,
+};
+pub use settings::{
+    NutCtfSettlementSettings, NutCtfSettlementSettingsError, NutCtfSplitMergeSettings,
 };
 
 /// Errors produced while decoding or validating multi-party CTF settlement.
