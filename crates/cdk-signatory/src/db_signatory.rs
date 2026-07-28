@@ -27,6 +27,8 @@ use tracing::instrument;
 use crate::common::{
     check_unit_string_collision, create_new_keyset, derivation_path_from_unit, init_keysets,
 };
+#[cfg(feature = "conditional-tokens")]
+use crate::signatory::PreparedConditionalKeySet;
 use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
 
 /// Immutable in-memory view of the keysets, swapped atomically on every change.
@@ -496,6 +498,46 @@ impl Signatory for DbSignatory {
         self.load_keys_from_db().await?;
 
         Ok(signatory_keyset)
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tracing::instrument(skip(self))]
+    async fn prepare_conditional_keyset(
+        &self,
+        unit: CurrencyUnit,
+        condition_id: &str,
+        outcome_collection: &str,
+        outcome_collection_id: &str,
+        amounts: Vec<u64>,
+        input_fee_ppk: u64,
+        final_expiry: Option<u64>,
+    ) -> Result<PreparedConditionalKeySet, Error> {
+        let (keyset, mut info) = crate::common::create_conditional_keyset(
+            &self.secp_ctx,
+            self.xpriv,
+            unit,
+            condition_id,
+            outcome_collection_id,
+            &amounts,
+            input_fee_ppk,
+            final_expiry,
+        )
+        .ok_or(Error::UnsupportedUnit)?;
+
+        info.outcome_collection = Some(outcome_collection.to_string());
+        info.active = true;
+
+        let public = (&(info.clone(), keyset)).into();
+
+        Ok(PreparedConditionalKeySet {
+            keyset: public,
+            info,
+        })
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn reload_keysets_from_storage(&self) -> Result<(), Error> {
+        self.reload_keys_from_db().await
     }
 }
 

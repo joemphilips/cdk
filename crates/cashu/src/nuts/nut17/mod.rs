@@ -12,7 +12,6 @@ use crate::nuts::{
 };
 use crate::quote_id::QuoteIdError;
 use crate::MintQuoteBolt12Response;
-
 pub mod ws;
 
 /// Maximum length in bytes of a NUT-17 subscription ID.

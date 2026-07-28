@@ -170,7 +170,9 @@ where
                     r.quote.to_owned(),
                 )]
             }
-            NotificationPayload::ProofState(p) => vec![NotificationId::ProofState(p.y.to_owned())],
+            NotificationPayload::ProofState(p) => {
+                vec![NotificationId::ProofState(p.y.to_owned())]
+            }
         }
     }
 }

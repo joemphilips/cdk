@@ -48,6 +48,7 @@ postgres = ["cdk-postgres"]
 supabase = ["cdk-supabase"]
 # Nostr base bindings: keys, NIP-44 encryption and the NIP-17 inbox listener
 nostr = ["dep:cdk-nostr"]
+conditional-tokens = ["cdk/conditional-tokens", "cdk-common/conditional-tokens"]
 # Enable NpubCash client bindings
 npubcash = ["cdk/npubcash", "nostr", "cdk-nostr/npubcash"]
 # Enable Nostr Wallet Connect (NIP-47) wallet service bindings

@@ -22,6 +22,8 @@ use crate::stmt::query;
 
 mod auth;
 mod completed_operations;
+#[cfg(feature = "conditional-tokens")]
+mod conditions;
 mod keys;
 mod keyvalue;
 mod proofs;
