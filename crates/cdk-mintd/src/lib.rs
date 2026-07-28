@@ -28,6 +28,8 @@ use cdk::nuts::nut00::KnownMethod;
 ))]
 use cdk::nuts::nut17::SupportedMethods;
 use cdk::nuts::nut19::{CachedEndpoint, Method as NUT19Method, Path as NUT19Path};
+#[cfg(feature = "conditional-tokens")]
+use cdk::nuts::nut_ctf::RegistrationFeeSetting;
 use cdk::nuts::CurrencyUnit;
 use cdk::nuts::{
     AuthRequired, ContactInfo, Method, MintVersion, PaymentMethod, ProtectedEndpoint, RoutePath,
@@ -35,6 +37,7 @@ use cdk::nuts::{
 use cdk_axum::cache::HttpCache;
 use cdk_common::common::QuoteTTL;
 use cdk_common::database::DynMintDatabase;
+use cdk_common::Amount;
 // internal crate modules
 #[cfg(feature = "prometheus")]
 use cdk_common::payment::MetricsMintPayment;
@@ -42,7 +45,7 @@ use cdk_common::payment::MintPayment;
 use cdk_exchange_rate::sources::{BitstampRateSource, CoinbaseRateSource, KrakenRateSource};
 use cdk_exchange_rate::{
     AggregatingRateOracle, AggregatorConfig, DynRateQuoteStore, InMemoryRateQuoteStore,
-    PaymentErrorAdapter, RateConvertingPayment, RateConvertingPaymentConfig,
+    MsatSatConverter, PaymentErrorAdapter, RateConvertingPayment, RateConvertingPaymentConfig,
     RateQuoteControlHandle, RateSource, SharedMintPayment,
 };
 #[cfg(feature = "postgres")]
@@ -921,19 +924,16 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
         }
     }
     #[cfg(feature = "conditional-tokens")]
-    if settings.mint_info.ctf_registration_fee_base.is_some()
-        || settings.mint_info.ctf_registration_fee_per_keyset.is_some()
-    {
-        builder = builder.with_ctf_registration_fee(
-            settings
-                .mint_info
-                .ctf_registration_fee_base
-                .unwrap_or_default(),
-            settings
-                .mint_info
-                .ctf_registration_fee_per_keyset
-                .unwrap_or_default(),
-        );
+    if let Some(fees) = &settings.mint_info.ctf_registration_fees {
+        let fees = fees
+            .iter()
+            .map(|fee| RegistrationFeeSetting {
+                unit: fee.unit.to_string(),
+                registration_fee_base: fee.base,
+                registration_fee_per_keyset: fee.per_keyset,
+            })
+            .collect();
+        builder = builder.with_ctf_registration_fees(fees);
     }
 
     builder = builder.with_keyset_v2(settings.info.use_keyset_v2);
@@ -1297,7 +1297,7 @@ async fn configure_backend_and_rate_quoter_for_unit(
     mint_melt_limits: MintMeltLimits,
     backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
 ) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
-    let mint_builder = configure_backend_for_unit(
+    let mut mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
         unit.clone(),
@@ -1309,6 +1309,24 @@ async fn configure_backend_and_rate_quoter_for_unit(
     if unit != CurrencyUnit::Sat {
         return Ok((mint_builder, None));
     }
+
+    let msat_processor = MsatSatConverter::new(SharedMintPayment::new(backend.clone()));
+    // The underlying Lightning backend is sat-denominated, while the msat
+    // facade exposes the same economic limits in millisatoshis: 1 sat = 1000 msat.
+    let msat_mint_melt_limits = MintMeltLimits {
+        mint_min: Amount::from(mint_melt_limits.mint_min.to_u64().saturating_mul(1000)),
+        mint_max: Amount::from(mint_melt_limits.mint_max.to_u64().saturating_mul(1000)),
+        melt_min: Amount::from(mint_melt_limits.melt_min.to_u64().saturating_mul(1000)),
+        melt_max: Amount::from(mint_melt_limits.melt_max.to_u64().saturating_mul(1000)),
+    };
+    mint_builder = configure_backend_for_unit(
+        settings,
+        mint_builder,
+        CurrencyUnit::Msat,
+        msat_mint_melt_limits,
+        Arc::new(msat_processor),
+    )
+    .await?;
 
     configure_rate_quoter_for_sat_backend(settings, mint_builder, mint_melt_limits, backend).await
 }
