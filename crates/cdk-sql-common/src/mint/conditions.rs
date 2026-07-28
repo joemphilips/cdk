@@ -543,9 +543,12 @@ where
             SELECT outcome_collection, id
             FROM conditional_keyset
             WHERE condition_id = :condition_id
+              AND active = :active
+            ORDER BY outcome_collection ASC
             "#,
         )?
         .bind("condition_id", condition_id.to_string())
+        .bind("active", true)
         .fetch_all(&*conn)
         .await?;
 
@@ -556,6 +559,31 @@ where
         }
 
         Ok(map)
+    }
+
+    async fn get_conditional_keyset_infos_for_condition(
+        &self,
+        condition_id: &str,
+    ) -> Result<Vec<MintKeySetInfo>, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        let sql = format!(
+            "SELECT {} FROM conditional_keyset \
+             WHERE condition_id = :condition_id \
+             ORDER BY created_at ASC, id ASC",
+            CONDITIONAL_KEYSET_COLUMNS
+        );
+        query(&sql)?
+            .bind("condition_id", condition_id.to_string())
+            .fetch_all(&*conn)
+            .await?
+            .into_iter()
+            .map(sql_row_to_conditional_mint_keyset_info)
+            .map(|row| row.map(|(info, _)| info))
+            .collect()
     }
 
     async fn get_all_conditional_keyset_infos(
