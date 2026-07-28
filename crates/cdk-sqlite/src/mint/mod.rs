@@ -19,6 +19,10 @@ mod test {
     use std::time::Duration;
 
     #[cfg(feature = "conditional-tokens")]
+    use cdk_common::database::mint::{ConditionsDatabase, Database};
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::mint::StoredCondition;
+    #[cfg(feature = "conditional-tokens")]
     use cdk_common::mint_db_conditional_test;
     use cdk_common::mint_db_test;
     use cdk_sql_common::pool::Pool;
@@ -35,6 +39,69 @@ mod test {
 
     #[cfg(feature = "conditional-tokens")]
     cdk_common::mint_db_conditional_test!(provide_db);
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn condition_lock_serializes_attestation_across_connections() {
+        let path =
+            std::env::temp_dir().join(format!("cdk-condition-lock-{}.db", uuid::Uuid::new_v4()));
+        let db = std::sync::Arc::new(MintSqliteDatabase::new(path.clone()).await.unwrap());
+        let condition = StoredCondition {
+            condition_id: "ac".repeat(32),
+            threshold: 1,
+            tags_json: "[]".to_string(),
+            announcements_json: r#"["deadbeef"]"#.to_string(),
+            collateral: Some(cdk_common::CurrencyUnit::Sat),
+            attestation_status: "pending".to_string(),
+            winning_outcome: None,
+            attested_at: None,
+            created_at: 1_000_000,
+            condition_type: "enum".to_string(),
+            lo_bound: None,
+            hi_bound: None,
+            precision: None,
+        };
+        db.add_condition(condition.clone()).await.unwrap();
+
+        let mut condition_tx = db.begin_transaction().await.unwrap();
+        condition_tx
+            .get_condition_for_update(&condition.condition_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let attestation_db = db.clone();
+        let condition_id = condition.condition_id.clone();
+        let mut attestation = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            attestation_db
+                .update_condition_attestation(
+                    &condition_id,
+                    "attested",
+                    Some("YES"),
+                    Some(2_000_000),
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut attestation)
+                .await
+                .is_err(),
+            "attestation must remain blocked while the condition transaction is open"
+        );
+
+        condition_tx.commit().await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), attestation)
+            .await
+            .expect("attestation should resume after commit")
+            .expect("attestation task")
+            .unwrap());
+
+        drop(db);
+        remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn bug_opening_relative_path() {

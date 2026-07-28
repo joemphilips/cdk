@@ -265,6 +265,7 @@ macro_rules! mint_db_conditional_test {
             $make_db_fn,
             add_and_get_condition,
             get_nonexistent_condition,
+            get_condition_for_update,
             get_conditions_multiple,
             get_conditions_since,
             update_condition_attestation,
