@@ -366,6 +366,89 @@ fn request_rejects_duplicates_and_noncanonical_order() {
 }
 
 #[test]
+fn nut06_default_retains_legacy_single_party_only() {
+    let settings = NutCtfSplitMergeSettings::default();
+    let value = serde_json::to_value(&settings).expect("serialize settings");
+    let decoded: NutCtfSplitMergeSettings =
+        serde_json::from_value(value.clone()).expect("legacy settings decode");
+
+    assert_eq!(value, json!({"supported": true}));
+    assert_eq!(decoded, settings);
+    assert!(settings.multi_party().is_none());
+}
+
+#[test]
+fn nut06_multi_party_is_complete_and_round_trips() {
+    let multi_party = NutCtfSettlementSettings::new(64, 4096, 8192, 1_048_576, 3600, 256)
+        .expect("valid multi-party settings");
+    let settings = NutCtfSplitMergeSettings::default()
+        .with_multi_party(multi_party)
+        .expect("legacy convert is enabled");
+    let value = serde_json::to_value(&settings).expect("serialize settings");
+    let decoded: NutCtfSplitMergeSettings =
+        serde_json::from_value(value.clone()).expect("deserialize settings");
+
+    assert_eq!(value["max_participants"], 64);
+    assert_eq!(value["idempotent_retries"], true);
+    assert_eq!(value["partial_fill"], true);
+    assert_eq!(decoded, settings);
+    assert_eq!(
+        decoded
+            .multi_party()
+            .expect("multi-party advertised")
+            .structural_limits()
+            .expect("limits fit this platform")
+            .max_pool_entries,
+        256
+    );
+}
+
+#[test]
+fn nut06_rejects_partial_unknown_or_disabled_multi_party_fields() {
+    assert!(serde_json::from_value::<NutCtfSplitMergeSettings>(json!({
+        "supported": true,
+        "max_participants": 64
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<NutCtfSplitMergeSettings>(json!({
+        "supported": true,
+        "unexpected": 1
+    }))
+    .is_err());
+
+    for (idempotent_retries, partial_fill) in [(false, true), (true, false)] {
+        assert!(serde_json::from_value::<NutCtfSplitMergeSettings>(json!({
+            "supported": true,
+            "max_participants": 64,
+            "max_inputs": 4096,
+            "max_outputs": 8192,
+            "max_request_bytes": 1048576,
+            "idempotent_retries": idempotent_retries,
+            "max_expiry_seconds": 3600,
+            "partial_fill": partial_fill,
+            "max_pool_entries": 256
+        }))
+        .is_err());
+    }
+}
+
+#[test]
+fn nut06_rejects_multi_party_when_legacy_convert_is_disabled() {
+    let mut value = serde_json::to_value(
+        NutCtfSplitMergeSettings::default()
+            .with_multi_party(
+                NutCtfSettlementSettings::new(64, 4096, 8192, 1_048_576, 3600, 256)
+                    .expect("valid multi-party settings"),
+            )
+            .expect("legacy convert is enabled"),
+    )
+    .expect("serialize settings");
+    value["supported"] = json!(false);
+
+    assert!(serde_json::from_value::<NutCtfSplitMergeSettings>(value).is_err());
+}
+
+#[test]
 fn mixed_standard_and_pool_request_validates_exact_selection() {
     let standard = standard_participant(KEYSET_B, KEYSET_A, POINT_B, POINT_B, 6, 6, "02");
     let entries = vec![

@@ -18,6 +18,9 @@ use crate::dhke;
 pub mod dlc;
 pub(crate) mod serde_oracle_witness;
 pub mod settlement;
+pub use settlement::{
+    NutCtfSettlementSettings, NutCtfSettlementSettingsError, NutCtfSplitMergeSettings,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
@@ -339,19 +342,6 @@ pub struct CtfConvertRequest {
 pub struct CtfConvertResponse {
     /// Blind signatures per request output key.
     pub signatures: HashMap<String, Vec<BlindSignature>>,
-}
-
-/// NUT-06 mint info extension for NUT-CTF-split-merge (convert)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NutCtfSplitMergeSettings {
-    /// Whether NUT-CTF-split-merge (CTF convert) is supported
-    pub supported: bool,
-}
-
-impl Default for NutCtfSplitMergeSettings {
-    fn default() -> Self {
-        Self { supported: true }
-    }
 }
 
 /// NUT-06 mint info extension for NUT-CTF-numeric (numeric conditions)
