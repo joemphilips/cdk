@@ -11,7 +11,7 @@ use cdk::types::QuoteTTL;
 use cdk::Amount;
 use cdk_common::grpc::create_version_check_interceptor;
 use cdk_common::payment::WaitPaymentResponse;
-use cdk_exchange_rate::RateQuoteControlHandle;
+use cdk_exchange_rate::{RateQuoteControlHandle, RateQuoteStoreError};
 use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -29,6 +29,13 @@ use crate::{
     UpdateNameRequest, UpdateNut04QuoteRequest, UpdateNut04Request, UpdateNut05Request,
     UpdateQuoteTtlRequest, UpdateResponse, UpdateTosUrlRequest, UpdateUrlRequest,
 };
+
+fn set_unit_issuance_cap_status(error: RateQuoteStoreError) -> Status {
+    match error {
+        RateQuoteStoreError::InvalidControl(message) => Status::failed_precondition(message),
+        error => Status::internal(format!("could not persist unit issuance cap: {error}")),
+    }
+}
 
 /// Error
 #[derive(Debug, Error)]
@@ -904,9 +911,7 @@ impl CdkMint for MintRPCServer {
         control
             .set_unit_issuance_cap(unit, request.cap)
             .await
-            .map_err(|error| {
-                Status::internal(format!("could not persist unit issuance cap: {error}"))
-            })?;
+            .map_err(set_unit_issuance_cap_status)?;
         Ok(Response::new(SetUnitIssuanceCapResponse {}))
     }
 }
@@ -953,7 +958,7 @@ mod tests {
     use cdk::types::QuoteTTL;
     use cdk_common::nut00::KnownMethod;
     use cdk_fake_wallet::FakeWallet;
-    use tonic::Request;
+    use tonic::{Code, Request};
 
     use super::*;
     use crate::cdk_mint_server::CdkMint;
@@ -1084,5 +1089,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.into_inner().tos_url.unwrap(), tos);
+    }
+
+    #[test]
+    fn set_unit_issuance_cap_validation_error_is_failed_precondition() {
+        let status = set_unit_issuance_cap_status(RateQuoteStoreError::InvalidControl(
+            "rate quote buffer_bps must be nonzero before setting a nonzero issuance cap"
+                .to_string(),
+        ));
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
     }
 }
