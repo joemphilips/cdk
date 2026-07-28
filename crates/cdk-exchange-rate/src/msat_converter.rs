@@ -151,6 +151,7 @@ where
                 convert_outgoing_options_to_sat(options)?,
             )
             .await?;
+        validate_outgoing_response(&response, None, &CurrencyUnit::Sat)?;
         convert_make_payment_response_to_msat(response)
     }
 
@@ -186,9 +187,12 @@ where
         &self,
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
-        self.inner
+        let payments = self
+            .inner
             .check_incoming_payment_status(payment_identifier)
-            .await?
+            .await?;
+        validate_incoming_responses(&payments, payment_identifier, &CurrencyUnit::Sat)?;
+        payments
             .into_iter()
             .map(convert_wait_payment_response_to_msat)
             .collect()
@@ -199,11 +203,12 @@ where
         &self,
         payment_identifier: &PaymentIdentifier,
     ) -> Result<MakePaymentResponse, Self::Err> {
-        convert_make_payment_response_to_msat(
-            self.inner
-                .check_outgoing_payment(payment_identifier)
-                .await?,
-        )
+        let response = self
+            .inner
+            .check_outgoing_payment(payment_identifier)
+            .await?;
+        validate_outgoing_response(&response, Some(payment_identifier), &CurrencyUnit::Sat)?;
+        convert_make_payment_response_to_msat(response)
     }
 }
 
@@ -303,6 +308,7 @@ where
                 convert_outgoing_options_to_msat(options)?,
             )
             .await?;
+        validate_outgoing_response(&response, None, &CurrencyUnit::Msat)?;
         convert_make_payment_response_to_sat(response)
     }
 
@@ -338,9 +344,12 @@ where
         &self,
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
-        self.inner
+        let payments = self
+            .inner
             .check_incoming_payment_status(payment_identifier)
-            .await?
+            .await?;
+        validate_incoming_responses(&payments, payment_identifier, &CurrencyUnit::Msat)?;
+        payments
             .into_iter()
             .map(convert_wait_payment_response_to_sat)
             .collect()
@@ -351,11 +360,12 @@ where
         &self,
         payment_identifier: &PaymentIdentifier,
     ) -> Result<MakePaymentResponse, Self::Err> {
-        convert_make_payment_response_to_sat(
-            self.inner
-                .check_outgoing_payment(payment_identifier)
-                .await?,
-        )
+        let response = self
+            .inner
+            .check_outgoing_payment(payment_identifier)
+            .await?;
+        validate_outgoing_response(&response, Some(payment_identifier), &CurrencyUnit::Msat)?;
+        convert_make_payment_response_to_sat(response)
     }
 }
 
@@ -387,6 +397,78 @@ fn ensure_sat_unit(unit: &CurrencyUnit) -> Result<(), cdk_common::payment::Error
     } else {
         Err(cdk_common::payment::Error::UnsupportedUnit)
     }
+}
+
+/// Validate that every incoming status belongs to the requested physical
+/// payment and uses the backend's native unit.
+pub fn validate_incoming_responses(
+    payments: &[WaitPaymentResponse],
+    requested: &PaymentIdentifier,
+    native_unit: &CurrencyUnit,
+) -> Result<(), cdk_common::payment::Error> {
+    for payment in payments {
+        if &payment.payment_identifier != requested {
+            return Err(correlation_error(
+                "incoming",
+                requested,
+                &payment.payment_identifier,
+            ));
+        }
+        if payment.payment_amount.unit() != native_unit {
+            return Err(unit_error(
+                "incoming",
+                native_unit,
+                payment.payment_amount.unit(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate an outgoing result against an optional durable lookup id and the
+/// backend's native unit.
+pub fn validate_outgoing_response(
+    response: &MakePaymentResponse,
+    requested: Option<&PaymentIdentifier>,
+    native_unit: &CurrencyUnit,
+) -> Result<(), cdk_common::payment::Error> {
+    if let Some(requested) = requested {
+        if &response.payment_lookup_id != requested {
+            return Err(correlation_error(
+                "outgoing",
+                requested,
+                &response.payment_lookup_id,
+            ));
+        }
+    }
+    if response.total_spent.unit() != native_unit {
+        return Err(unit_error(
+            "outgoing",
+            native_unit,
+            response.total_spent.unit(),
+        ));
+    }
+    Ok(())
+}
+
+fn correlation_error(
+    direction: &str,
+    expected: &PaymentIdentifier,
+    actual: &PaymentIdentifier,
+) -> cdk_common::payment::Error {
+    cdk_common::payment::Error::Custom(format!(
+        "{direction} payment correlation mismatch: expected {expected}, got {actual}"
+    ))
+}
+
+fn unit_error(
+    direction: &str,
+    expected: &CurrencyUnit,
+    actual: &CurrencyUnit,
+) -> cdk_common::payment::Error {
+    cdk_common::payment::Error::Custom(format!(
+        "{direction} physical payment unit mismatch: expected {expected}, got {actual}"
+    ))
 }
 
 fn msats_to_sats(
@@ -1025,6 +1107,51 @@ mod tests {
             payments[0].payment_amount,
             Amount::new(1_000, CurrencyUnit::Msat)
         );
+    }
+
+    #[tokio::test]
+    async fn status_conversion_rejects_substituted_ids_and_native_units() {
+        let backend = MockSatPayment {
+            unit: CurrencyUnit::Sat,
+            ..Default::default()
+        };
+        backend
+            .incoming_status
+            .lock()
+            .expect("incoming status")
+            .push(WaitPaymentResponse {
+                payment_identifier: PaymentIdentifier::CustomId("other".to_string()),
+                payment_amount: Amount::new(1, CurrencyUnit::Sat),
+                payment_id: "payment-id".to_string(),
+            });
+        *backend.check_response.lock().expect("check response") = Some(MakePaymentResponse {
+            payment_lookup_id: PaymentIdentifier::CustomId("other".to_string()),
+            payment_proof: None,
+            status: MeltQuoteState::Paid,
+            total_spent: Amount::new(1, CurrencyUnit::Sat),
+        });
+        let converter = MsatSatConverter::new(backend.clone());
+        let requested = PaymentIdentifier::CustomId("expected".to_string());
+
+        assert!(converter
+            .check_incoming_payment_status(&requested)
+            .await
+            .is_err());
+        assert!(converter.check_outgoing_payment(&requested).await.is_err());
+
+        {
+            let mut statuses = backend.incoming_status.lock().expect("incoming status");
+            statuses.clear();
+            statuses.push(WaitPaymentResponse {
+                payment_identifier: requested.clone(),
+                payment_amount: Amount::new(1_000, CurrencyUnit::Msat),
+                payment_id: "payment-id".to_string(),
+            });
+        }
+        assert!(converter
+            .check_incoming_payment_status(&requested)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

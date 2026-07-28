@@ -9,7 +9,8 @@ pub mod types;
 
 pub use msat_converter::{
     convert_incoming_response_to_sat, convert_outgoing_response_to_unit, sat_msat_backends,
-    MsatSatConverter, SatMsatBackends, SatMsatConverter,
+    validate_incoming_responses, validate_outgoing_response, MsatSatConverter, SatMsatBackends,
+    SatMsatConverter,
 };
 pub use oracle::{AggregatingRateOracle, AggregatorConfig, BackoffState, RateOracle, RateSource};
 pub use payment::{

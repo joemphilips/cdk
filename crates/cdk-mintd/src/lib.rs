@@ -41,7 +41,7 @@ use cdk_common::Amount;
 #[cfg(feature = "prometheus")]
 use cdk_common::payment::MetricsMintPayment;
 use cdk_common::payment::{DynMintPayment, MintPayment};
-use cdk_exchange_rate::{sat_msat_backends, MsatSatConverter, SharedMintPayment};
+use cdk_exchange_rate::{MsatSatConverter, SharedMintPayment};
 #[cfg(feature = "postgres")]
 use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig};
 #[cfg(feature = "sqlite")]
@@ -73,7 +73,9 @@ pub use config_migration::{migrate_legacy_configuration, MigrationOutcome};
 pub use config_service::{ApplyOutcome, RollbackOutcome};
 mod canonical_payment_event_owner;
 
-use canonical_payment_event_owner::{CallStatusOnlyPayment, CanonicalPaymentEventOwner};
+use canonical_payment_event_owner::{
+    canonical_sat_msat_backends, CallStatusOnlyPayment, CanonicalPaymentEventOwner,
+};
 
 #[cfg(test)]
 pub(crate) mod test_utils {
@@ -1630,43 +1632,18 @@ async fn configure_sat_msat_backend_for_unit(
     backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
 ) -> Result<MintBuilder> {
     if unit != CurrencyUnit::Sat {
-        let backend = normalize_non_sat_backend_unit(unit.clone(), backend).await?;
-        let owner: DynMintPayment = Arc::new(CanonicalPaymentEventOwner::new(
-            backend,
+        return configure_non_sat_backend(
+            settings,
+            mint_builder,
             localstore,
-            unit.clone(),
-        ));
-        let mint_builder =
-            configure_backend_for_unit(settings, mint_builder, unit, mint_melt_limits, owner)
-                .await?;
-        return Ok(mint_builder);
+            unit,
+            mint_melt_limits,
+            backend,
+        )
+        .await;
     }
 
-    let backend_settings = backend.get_settings().await?;
-    let native_unit = CurrencyUnit::from_str(&backend_settings.unit).with_context(|| {
-        format!(
-            "Payment backend returned invalid unit `{}`",
-            backend_settings.unit
-        )
-    })?;
-    let owner = Arc::new(CanonicalPaymentEventOwner::new(
-        backend,
-        localstore,
-        native_unit.clone(),
-    ));
-    let owner_backend: DynMintPayment = owner.clone();
-    let raw_backends = sat_msat_backends(owner_backend).await?;
-    let backends = match native_unit {
-        CurrencyUnit::Sat => cdk_exchange_rate::SatMsatBackends {
-            sat: owner.clone(),
-            msat: Arc::new(CallStatusOnlyPayment::new(raw_backends.msat)),
-        },
-        CurrencyUnit::Msat => cdk_exchange_rate::SatMsatBackends {
-            sat: Arc::new(CallStatusOnlyPayment::new(raw_backends.sat)),
-            msat: owner.clone(),
-        },
-        _ => bail!("SAT rate routing requires a native SAT or MSAT backend"),
-    };
+    let (_owner, backends) = canonical_sat_msat_backends(backend, localstore).await?;
     let mut mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
@@ -1693,6 +1670,25 @@ async fn configure_sat_msat_backend_for_unit(
     )
     .await?;
 
+    Ok(mint_builder)
+}
+
+async fn configure_non_sat_backend(
+    settings: &config::Settings,
+    mint_builder: MintBuilder,
+    localstore: DynMintDatabase,
+    unit: CurrencyUnit,
+    mint_melt_limits: MintMeltLimits,
+    backend: DynMintPayment,
+) -> Result<MintBuilder> {
+    let backend = normalize_non_sat_backend_unit(unit.clone(), backend).await?;
+    let owner: DynMintPayment = Arc::new(CanonicalPaymentEventOwner::new(
+        backend,
+        localstore,
+        unit.clone(),
+    ));
+    let mint_builder =
+        configure_backend_for_unit(settings, mint_builder, unit, mint_melt_limits, owner).await?;
     Ok(mint_builder)
 }
 
@@ -2018,7 +2014,7 @@ async fn setup_authentication(
 
         Ok((mint_builder, Some(auth_localstore)))
     } else {
-        Ok((mint_builder, None))
+        Ok(mint_builder)
     }
 }
 
