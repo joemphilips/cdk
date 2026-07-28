@@ -17,6 +17,7 @@ use futures::{Stream, StreamExt};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use crate::msat_converter::{validate_incoming_responses, validate_outgoing_response};
 use crate::oracle::RateOracle;
 use crate::store::{
     DynRateQuoteStore, ParkedPaymentRecord, RateQuoteRecord, RateQuoteSettlement, RateQuoteSide,
@@ -912,6 +913,7 @@ where
         }
 
         let response = self.inner.make_payment(&CurrencyUnit::Sat, options).await?;
+        validate_outgoing_response(&response, None, &CurrencyUnit::Sat)?;
         Ok(convert_irreversible_rate_melt_response(
             Arc::clone(&self.store),
             self.control.clone(),
@@ -962,6 +964,7 @@ where
             .inner
             .check_incoming_payment_status(payment_identifier)
             .await?;
+        validate_incoming_responses(&payments, payment_identifier, &CurrencyUnit::Sat)?;
         let mut converted = Vec::new();
         for payment in payments {
             if let Some(payment) = convert_rate_mint_payment(
@@ -986,6 +989,7 @@ where
             .inner
             .check_outgoing_payment(payment_identifier)
             .await?;
+        validate_outgoing_response(&response, Some(payment_identifier), &CurrencyUnit::Sat)?;
         convert_completed_rate_melt_response(
             Arc::clone(&self.store),
             self.control.clone(),
@@ -1082,7 +1086,7 @@ pub async fn convert_rate_melt_response(
     response: MakePaymentResponse,
 ) -> Result<MakePaymentResponse, RateQuoteStoreError> {
     let record = load_rate_melt_record(&store, &fiat_unit, &response).await?;
-    settle_rate_melt(&store, &control, &record, &response).await?;
+    settle_loaded_rate_melt(&store, &control, &record, &response, true).await?;
     Ok(converted_rate_melt_response(record, response))
 }
 
@@ -1096,7 +1100,7 @@ async fn convert_completed_rate_melt_response(
     // The Lightning payment has already completed. Settlement failure is
     // durably parked, but returning an error could make the caller retry the
     // irreversible external payment.
-    let _ = settle_rate_melt(&store, &control, &record, &response).await;
+    settle_loaded_rate_melt(&store, &control, &record, &response, false).await?;
     Ok(converted_rate_melt_response(record, response))
 }
 
@@ -1119,8 +1123,21 @@ async fn convert_irreversible_rate_melt_response(
     };
     // The external payment is irreversible. Settlement failure is durably
     // parked; returning an error here could cause a duplicate payment.
-    let _ = settle_rate_melt(&store, &control, &record, &response).await;
+    let _ = settle_loaded_rate_melt(&store, &control, &record, &response, false).await;
     converted_rate_melt_response(record, response)
+}
+
+async fn settle_loaded_rate_melt(
+    store: &DynRateQuoteStore,
+    control: &RateQuoteControlHandle,
+    record: &RateQuoteRecord,
+    response: &MakePaymentResponse,
+    propagate_failure: bool,
+) -> Result<(), RateQuoteStoreError> {
+    match settle_rate_melt(store, control, record, response).await {
+        Err(error) if propagate_failure => Err(error),
+        _ => Ok(()),
+    }
 }
 
 async fn load_rate_melt_record(
