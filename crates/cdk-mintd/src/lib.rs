@@ -27,16 +27,21 @@ use cdk::nuts::nut00::KnownMethod;
 ))]
 use cdk::nuts::nut17::SupportedMethods;
 use cdk::nuts::nut19::{CachedEndpoint, Method as NUT19Method, Path as NUT19Path};
+#[cfg(feature = "conditional-tokens")]
+use cdk::nuts::nut_ctf::RegistrationFeeSetting;
+use cdk::nuts::CurrencyUnit;
 use cdk::nuts::{
     AuthRequired, ContactInfo, Method, MintVersion, PaymentMethod, ProtectedEndpoint, RoutePath,
 };
 use cdk_axum::cache::HttpCache;
 use cdk_common::common::QuoteTTL;
 use cdk_common::database::DynMintDatabase;
+use cdk_common::Amount;
 // internal crate modules
 #[cfg(feature = "prometheus")]
 use cdk_common::payment::MetricsMintPayment;
 use cdk_common::payment::MintPayment;
+use cdk_exchange_rate::{MsatSatConverter, SharedMintPayment};
 #[cfg(feature = "postgres")]
 use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig};
 #[cfg(feature = "sqlite")]
@@ -1240,19 +1245,16 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
         }
     }
     #[cfg(feature = "conditional-tokens")]
-    if settings.mint_info.ctf_registration_fee_base.is_some()
-        || settings.mint_info.ctf_registration_fee_per_keyset.is_some()
-    {
-        builder = builder.with_ctf_registration_fee(
-            settings
-                .mint_info
-                .ctf_registration_fee_base
-                .unwrap_or_default(),
-            settings
-                .mint_info
-                .ctf_registration_fee_per_keyset
-                .unwrap_or_default(),
-        );
+    if let Some(fees) = &settings.mint_info.ctf_registration_fees {
+        let fees = fees
+            .iter()
+            .map(|fee| RegistrationFeeSetting {
+                unit: fee.unit.to_string(),
+                registration_fee_base: fee.base,
+                registration_fee_per_keyset: fee.per_keyset,
+            })
+            .collect();
+        builder = builder.with_ctf_registration_fees(fees);
     }
 
     builder = builder.with_keyset_v2(settings.info.use_keyset_v2);
@@ -1307,7 +1309,7 @@ async fn configure_payment_backends(
                 #[cfg(feature = "prometheus")]
                 let cln = MetricsMintPayment::new(cln);
 
-                mint_builder = configure_backend_for_unit(
+                mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
                     backend_entry.unit.clone(),
@@ -1333,7 +1335,7 @@ async fn configure_payment_backends(
                 #[cfg(feature = "prometheus")]
                 let lnd = MetricsMintPayment::new(lnd);
 
-                mint_builder = configure_backend_for_unit(
+                mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
                     backend_entry.unit.clone(),
@@ -1363,7 +1365,7 @@ async fn configure_payment_backends(
                 #[cfg(feature = "prometheus")]
                 let fake = MetricsMintPayment::new(fake);
 
-                mint_builder = configure_backend_for_unit(
+                mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
                     backend_entry.unit.clone(),
@@ -1394,7 +1396,7 @@ async fn configure_payment_backends(
                 #[cfg(feature = "prometheus")]
                 let processor = MetricsMintPayment::new(processor);
 
-                mint_builder = configure_backend_for_unit(
+                mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
                     backend_entry.unit.clone(),
@@ -1420,7 +1422,7 @@ async fn configure_payment_backends(
                     )
                     .await?;
 
-                mint_builder = configure_backend_for_unit(
+                mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
                     backend_entry.unit.clone(),
@@ -1611,6 +1613,47 @@ async fn configure_onchain_backend(
     )
     .await?
     .0)
+}
+
+async fn configure_sat_msat_backend_for_unit(
+    settings: &config::Settings,
+    mint_builder: MintBuilder,
+    unit: CurrencyUnit,
+    mint_melt_limits: MintMeltLimits,
+    backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
+) -> Result<MintBuilder> {
+    let mut mint_builder = configure_backend_for_unit(
+        settings,
+        mint_builder,
+        unit.clone(),
+        mint_melt_limits,
+        backend.clone(),
+    )
+    .await?;
+    if unit != CurrencyUnit::Sat {
+        return Ok(mint_builder);
+    }
+    let msat_limits = MintMeltLimits {
+        mint_min: Amount::from(mint_melt_limits.mint_min.to_u64().saturating_mul(1000)),
+        mint_max: Amount::from(mint_melt_limits.mint_max.to_u64().saturating_mul(1000)),
+        melt_min: Amount::from(mint_melt_limits.melt_min.to_u64().saturating_mul(1000)),
+        melt_max: Amount::from(mint_melt_limits.melt_max.to_u64().saturating_mul(1000)),
+    };
+    let msat_backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync> =
+        if backend.get_settings().await?.unit == "msat" {
+            backend
+        } else {
+            Arc::new(MsatSatConverter::new(SharedMintPayment::new(backend)))
+        };
+    mint_builder = configure_backend_for_unit(
+        settings,
+        mint_builder,
+        CurrencyUnit::Msat,
+        msat_limits,
+        msat_backend,
+    )
+    .await?;
+    Ok(mint_builder)
 }
 
 /// Helper function to configure a mint builder with a payment backend for a specific currency unit

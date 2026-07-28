@@ -1,9 +1,16 @@
 //! NUT-CTF conditional token tests for swap and redeem operations
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::panic;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
+use bip39::Mnemonic;
 use cdk_common::amount::SplitTarget;
 use cdk_common::dhke::construct_proofs;
+use cdk_common::error::{ErrorCode, ErrorResponse};
+use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::nut_ctf::test_helpers::{
     create_digit_decomposition_announcement, create_multi_oracle_witness,
     create_numeric_oracle_witness, create_oracle_witness, create_test_announcement,
@@ -11,14 +18,19 @@ use cdk_common::nuts::nut_ctf::test_helpers::{
 };
 use cdk_common::nuts::nut_ctf::{
     CtfConvertRequest, NutCtfSettings, RedeemOutcomeRequest, RegisterConditionRequest,
+    RegistrationFeeSetting,
 };
 use cdk_common::nuts::{
-    Conditions, Id, PreMintSecrets, ProofsMethods, SecretKey, SigFlag, SpendingConditions,
-    SwapRequest, Witness,
+    Conditions, Id, PaymentMethod, PreMintSecrets, ProofsMethods, SecretKey, SigFlag,
+    SpendingConditions, SwapRequest, Witness,
 };
 use cdk_common::{Amount, CurrencyUnit, State};
+use cdk_fake_wallet::FakeWallet;
+use tokio::time::sleep;
 
-use crate::test_helpers::mint::{create_test_mint, mint_test_proofs};
+use crate::mint::{Mint, MintBuilder, MintMeltLimits, UnitConfig};
+use crate::test_helpers::mint::mint_test_proofs;
+use crate::types::{FeeReserve, QuoteTTL};
 use crate::Error;
 
 /// Helper: create an enum RegisterConditionRequest with all fields
@@ -48,6 +60,33 @@ fn enum_condition_request(
     }
 }
 
+fn registration_fee_setting(
+    unit: CurrencyUnit,
+    registration_fee_base: u64,
+    registration_fee_per_keyset: u64,
+) -> RegistrationFeeSetting {
+    RegistrationFeeSetting {
+        unit: unit.to_string(),
+        registration_fee_base,
+        registration_fee_per_keyset,
+    }
+}
+
+async fn create_test_mint() -> Result<Mint, Error> {
+    let mint = crate::test_helpers::mint::create_test_mint().await?;
+    let mut mint_info = mint.mint_info().await?;
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 0, 0)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await?;
+    Ok(mint)
+}
+
+async fn create_test_mint_without_registration_fees() -> Result<Mint, Error> {
+    crate::test_helpers::mint::create_test_mint().await
+}
+
 /// Get the regular (non-conditional) active keyset ID for SAT.
 /// Must be called BEFORE registering any conditions.
 fn get_regular_keyset_id(mint: &crate::mint::Mint) -> Id {
@@ -73,6 +112,153 @@ async fn register_test_condition(
 
     let condition_response = mint.register_condition(request).await.unwrap();
     (condition_response.condition_id, condition_response.keysets)
+}
+
+/// Register a test condition using a specific collateral unit.
+async fn register_test_condition_with_collateral(
+    mint: &crate::mint::Mint,
+    outcomes: &[&str],
+    collateral: CurrencyUnit,
+) -> (String, HashMap<String, Id>) {
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, outcomes, "test-event");
+
+    let mut request = enum_condition_request("Test condition", vec![hex_tlv]);
+    request.collateral = Some(collateral.to_string());
+
+    let condition_response = mint.register_condition(request).await.unwrap();
+    (condition_response.condition_id, condition_response.keysets)
+}
+
+async fn create_test_mint_with_unit(unit: CurrencyUnit, input_fee_ppk: u64) -> Result<Mint, Error> {
+    let db = Arc::new(cdk_sqlite::mint::memory::empty().await?);
+    let mut mint_builder = MintBuilder::new(db.clone());
+
+    mint_builder.configure_unit(
+        unit.clone(),
+        UnitConfig {
+            amounts: (0..32).map(|i| 2_u64.pow(i)).collect(),
+            input_fee_ppk,
+        },
+    )?;
+
+    let fee_reserve = FeeReserve {
+        min_fee_reserve: Amount::from(1),
+        percent_fee_reserve: 1.0,
+    };
+    let ln_fake_backend = FakeWallet::new(
+        fee_reserve,
+        HashMap::default(),
+        HashSet::default(),
+        2,
+        unit.clone(),
+    );
+
+    mint_builder
+        .add_payment_processor(
+            unit.clone(),
+            PaymentMethod::Known(KnownMethod::Bolt11),
+            MintMeltLimits::new(1, 10_000_000),
+            Arc::new(ln_fake_backend),
+        )
+        .await?;
+
+    let mnemonic = Mnemonic::generate(12).map_err(|e| Error::Custom(e.to_string()))?;
+    let quote_ttl = QuoteTTL::new(10000, 10000);
+    let mint = mint_builder
+        .with_name("test mint".to_string())
+        .with_description("test mint for unit tests".to_string())
+        .with_urls(vec!["https://test-mint".to_string()])
+        .build_with_seed(db, &mnemonic.to_seed_normalized(""))
+        .await?;
+
+    mint.set_quote_ttl(quote_ttl).await?;
+    let mut mint_info = mint.mint_info().await?;
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(unit.clone(), 0, 0)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await?;
+    mint.start().await?;
+
+    Ok(mint)
+}
+
+async fn mint_test_proofs_for_unit(
+    mint: &Mint,
+    amount: Amount,
+    unit: CurrencyUnit,
+) -> Result<cdk_common::Proofs, Error> {
+    let mint_quote: cdk_common::MintQuoteBolt11Response<_> = mint
+        .get_mint_quote(
+            cdk_common::MintQuoteBolt11Request {
+                amount,
+                unit: unit.clone(),
+                description: None,
+                pubkey: None,
+            }
+            .into(),
+        )
+        .await?
+        .into();
+
+    loop {
+        let check: cdk_common::MintQuoteBolt11Response<_> = mint
+            .check_mint_quotes(&[cdk_common::QuoteId::from_str(&mint_quote.quote).unwrap()])
+            .await
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone()
+            .into();
+
+        if check.state == cdk_common::MintQuoteState::Paid {
+            break;
+        }
+
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    let keyset_id = *mint
+        .get_active_keysets()
+        .get(&unit)
+        .expect("mint should have an active keyset for the requested unit");
+
+    let keys = mint
+        .keyset_pubkeys(&keyset_id)?
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+
+    let fees: (u64, Vec<u64>) = (0, keys.iter().map(|a| a.0.to_u64()).collect::<Vec<_>>());
+    let premint_secrets =
+        PreMintSecrets::random(keyset_id, amount, &SplitTarget::None, &fees.into()).unwrap();
+
+    let request = cdk_common::MintRequest {
+        quote: mint_quote.quote,
+        outputs: premint_secrets.blinded_messages(),
+        signature: None,
+    };
+
+    let mint_res = mint
+        .process_mint_request(crate::mint::MintInput::Single(request.try_into().unwrap()))
+        .await?;
+
+    Ok(construct_proofs(
+        mint_res.signatures,
+        premint_secrets.rs(),
+        premint_secrets.secrets(),
+        &keys,
+    )?)
+}
+
+fn get_regular_keyset_id_for_unit(mint: &crate::mint::Mint, unit: &CurrencyUnit) -> Id {
+    *mint
+        .get_active_keysets()
+        .get(unit)
+        .expect("mint should have an active keyset for the requested unit")
 }
 
 /// Helper: create PreMintSecrets for a given keyset
@@ -254,6 +440,47 @@ async fn test_get_condition_by_id() {
     assert_eq!(info.threshold, 1);
     assert_eq!(info.keysets.len(), 2);
     assert_eq!(info.keysets, keysets);
+}
+
+#[tokio::test]
+async fn nut_ctf_register_with_collateral_condition_info_echoes_it() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "collateral-event");
+
+    let mut request = enum_condition_request("Collateral condition", vec![hex_tlv]);
+    request.collateral = Some("usd".to_string());
+
+    let response = mint.register_condition(request).await.unwrap();
+    let info = mint.get_condition(&response.condition_id).await.unwrap();
+
+    assert_eq!(info.collateral, Some(CurrencyUnit::Usd));
+
+    let conditions = mint.get_conditions(None, None, &[]).await.unwrap();
+    assert_eq!(conditions.conditions.len(), 1);
+    assert_eq!(conditions.conditions[0].collateral, Some(CurrencyUnit::Usd));
+}
+
+#[test]
+fn nut_ctf_legacy_stored_condition_without_collateral_deserializes_with_none() {
+    let json = r#"{
+        "condition_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "threshold": 1,
+        "tags_json": "[[\"description\",\"legacy\"]]",
+        "announcements_json": "[\"deadbeef\"]",
+        "attestation_status": "pending",
+        "winning_outcome": null,
+        "attested_at": null,
+        "created_at": 1000000,
+        "condition_type": "enum",
+        "lo_bound": null,
+        "hi_bound": null,
+        "precision": null
+    }"#;
+
+    let stored: cdk_common::mint::StoredCondition = serde_json::from_str(json).unwrap();
+
+    assert_eq!(stored.collateral, None);
 }
 
 /// Full redeem outcome flow:
@@ -805,8 +1032,7 @@ async fn test_register_condition_charges_registration_fee_once() {
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        registration_fee_base: 2,
-        registration_fee_per_keyset: 3,
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 2, 3)],
         ..NutCtfSettings::default()
     });
     mint.set_mint_info(mint_info).await.unwrap();
@@ -842,8 +1068,7 @@ async fn test_register_condition_returns_registration_fee_change() {
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        registration_fee_base: 2,
-        registration_fee_per_keyset: 3,
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 2, 3)],
         ..NutCtfSettings::default()
     });
     mint.set_mint_info(mint_info).await.unwrap();
@@ -872,12 +1097,175 @@ async fn test_register_condition_returns_registration_fee_change() {
 }
 
 #[tokio::test]
+async fn test_register_condition_uses_per_unit_msat_registration_fee() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 0)
+        .await
+        .unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Msat, 10000, 10000)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "msat-fee-scale");
+
+    let mut insufficient = enum_condition_request("MSAT fee scale", vec![hex_tlv.clone()]);
+    insufficient.collateral = Some(CurrencyUnit::Msat.to_string());
+    insufficient.fee = Some(
+        mint_test_proofs_for_unit(&mint, Amount::from(29999), CurrencyUnit::Msat)
+            .await
+            .unwrap(),
+    );
+    let result = mint.register_condition(insufficient).await;
+    assert!(
+        matches!(result, Err(Error::RegistrationFeeInsufficient)),
+        "29999 msat must not satisfy a 30000 msat registration fee"
+    );
+
+    let mut request = enum_condition_request("MSAT fee scale", vec![hex_tlv]);
+    request.collateral = Some(CurrencyUnit::Msat.to_string());
+    request.fee = Some(
+        mint_test_proofs_for_unit(&mint, Amount::from(30000), CurrencyUnit::Msat)
+            .await
+            .unwrap(),
+    );
+
+    let response = mint.register_condition(request).await.unwrap();
+    assert_eq!(response.keysets.len(), 2);
+    assert!(response.change.is_none());
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_missing_collateral_unit_fee() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Msat, 10000, 10000)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "sat-unsupported");
+    let mut request = enum_condition_request("SAT unsupported", vec![hex_tlv]);
+    request.collateral = Some(CurrencyUnit::Sat.to_string());
+
+    let result = mint.register_condition(request).await;
+    match result {
+        Err(Error::UnsupportedCollateralUnit) => {
+            let response = ErrorResponse::from(Error::UnsupportedCollateralUnit);
+            assert_eq!(response.code, ErrorCode::UnsupportedCollateralUnit);
+            assert_eq!(response.code.to_code(), 13048);
+        }
+        Ok(_) => panic!("expected unsupported collateral unit, got success"),
+        Err(err) => panic!("expected unsupported collateral unit, got {err}"),
+    }
+}
+
+#[tokio::test]
+async fn test_register_condition_empty_registration_fees_rejects_all_units() {
+    let mint = create_test_mint_without_registration_fees().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "empty-fees");
+    let mut request = enum_condition_request("Empty fees", vec![hex_tlv]);
+    request.collateral = Some(CurrencyUnit::Sat.to_string());
+
+    let result = mint.register_condition(request).await;
+    assert!(matches!(result, Err(Error::UnsupportedCollateralUnit)));
+}
+
+#[tokio::test]
+async fn test_register_condition_allows_explicit_free_registration() {
+    let mint = create_test_mint_without_registration_fees().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Msat, 0, 0)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "free-msat");
+    let mut request = enum_condition_request("Free MSAT", vec![hex_tlv]);
+    request.collateral = Some(CurrencyUnit::Msat.to_string());
+
+    let response = mint.register_condition(request).await.unwrap();
+    assert_eq!(response.keysets.len(), 2);
+    assert!(response.change.is_none());
+}
+
+#[tokio::test]
+async fn test_builder_rejects_duplicate_registration_fee_units() {
+    let db = Arc::new(
+        cdk_sqlite::mint::memory::empty()
+            .await
+            .expect("test database should initialize"),
+    );
+
+    let result = panic::catch_unwind(|| {
+        MintBuilder::new(db).with_ctf_registration_fees(vec![
+            registration_fee_setting(CurrencyUnit::Msat, 1, 1),
+            registration_fee_setting(CurrencyUnit::Msat, 2, 2),
+        ]);
+    });
+
+    assert!(
+        result.is_err(),
+        "duplicate fee units must panic at builder time"
+    );
+}
+
+#[tokio::test]
+async fn test_register_condition_returns_msat_registration_fee_change() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 0)
+        .await
+        .unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Msat, 2000, 3000)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let fee_proofs = mint_test_proofs_for_unit(&mint, Amount::from(9000), CurrencyUnit::Msat)
+        .await
+        .unwrap();
+    let fee_ys = fee_proofs.ys().unwrap();
+    let msat_keyset_id = get_regular_keyset_id_for_unit(&mint, &CurrencyUnit::Msat);
+    let (change_outputs, _) = create_premint(&mint, msat_keyset_id, Amount::from(1000));
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "msat-fee-change");
+    let mut request = enum_condition_request("MSAT fee change", vec![hex_tlv]);
+    request.collateral = Some(CurrencyUnit::Msat.to_string());
+    request.fee = Some(fee_proofs);
+    request.outputs = Some(change_outputs);
+
+    let response = mint.register_condition(request).await.unwrap();
+    let change = response
+        .change
+        .expect("overpaid msat fee should return msat-denominated change");
+    assert_eq!(
+        change.iter().map(|sig| sig.amount.to_u64()).sum::<u64>(),
+        1000
+    );
+    assert!(change.iter().all(|sig| sig.keyset_id == msat_keyset_id));
+
+    let states = mint.localstore().get_proofs_states(&fee_ys).await.unwrap();
+    assert!(
+        states.iter().all(|state| *state == Some(State::Spent)),
+        "fee proofs must be spent after successful msat paid registration"
+    );
+}
+
+#[tokio::test]
 async fn test_register_condition_rejects_overpaid_fee_without_change_outputs() {
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        registration_fee_base: 2,
-        registration_fee_per_keyset: 3,
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 2, 3)],
         ..NutCtfSettings::default()
     });
     mint.set_mint_info(mint_info).await.unwrap();
@@ -910,7 +1298,7 @@ async fn test_register_condition_rejects_missing_registration_fee_before_store()
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        registration_fee_base: 1,
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 1, 0)],
         ..NutCtfSettings::default()
     });
     mint.set_mint_info(mint_info).await.unwrap();
@@ -934,8 +1322,7 @@ async fn test_register_condition_rejects_insufficient_registration_fee() {
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        registration_fee_base: 2,
-        registration_fee_per_keyset: 3,
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 2, 3)],
         ..NutCtfSettings::default()
     });
     mint.set_mint_info(mint_info).await.unwrap();
@@ -971,7 +1358,7 @@ async fn test_register_condition_rejects_conditional_registration_fee() {
 
     let mut mint_info = mint.mint_info().await.unwrap();
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        registration_fee_base: 1,
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 1, 0)],
         ..NutCtfSettings::default()
     });
     mint.set_mint_info(mint_info).await.unwrap();
@@ -1450,6 +1837,72 @@ async fn test_ctf_split_balance_conserved() {
 
     let result = mint.process_ctf_convert(convert_request).await;
     assert!(result.is_err(), "zero-fee convert should be rejected");
+}
+
+/// Test that split-as-convert charges the input fee in the collateral unit.
+#[tokio::test]
+async fn test_ctf_split_msat_input_fee_charged_in_msat() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 1000)
+        .await
+        .unwrap();
+
+    let face_amount = Amount::from(8192);
+    let regular_proofs = mint_test_proofs_for_unit(&mint, face_amount, CurrencyUnit::Msat)
+        .await
+        .unwrap();
+    let fee = mint.get_proofs_fee(&regular_proofs).await.unwrap().total;
+    assert_eq!(
+        fee,
+        Amount::from(1),
+        "one 1000-ppk msat input proof must charge one msat, not one sat"
+    );
+
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(&mint, &["YES", "NO"], CurrencyUnit::Msat).await;
+
+    let yes_keyset_id = *keysets.get("YES").unwrap();
+    let no_keyset_id = *keysets.get("NO").unwrap();
+    let output_amount = face_amount - fee;
+    assert_eq!(output_amount, Amount::from(8191));
+
+    let (yes_outputs, _) = create_premint(&mint, yes_keyset_id, output_amount);
+    let (no_outputs, _) = create_premint(&mint, no_keyset_id, output_amount);
+
+    let mut outputs = HashMap::new();
+    outputs.insert("YES".to_string(), yes_outputs);
+    outputs.insert("NO".to_string(), no_outputs);
+
+    let mut inputs = HashMap::new();
+    inputs.insert("*".to_string(), regular_proofs);
+
+    let convert_request = CtfConvertRequest {
+        condition_id,
+        parent_collection_id: None,
+        inputs,
+        outputs,
+    };
+
+    let response = mint.process_ctf_convert(convert_request).await.unwrap();
+    assert_eq!(
+        response
+            .signatures
+            .get("YES")
+            .unwrap()
+            .iter()
+            .map(|sig| sig.amount.to_u64())
+            .sum::<u64>(),
+        8191
+    );
+    assert_eq!(
+        response
+            .signatures
+            .get("NO")
+            .unwrap()
+            .iter()
+            .map(|sig| sig.amount.to_u64())
+            .sum::<u64>(),
+        8191
+    );
 }
 
 /// Test that a split with unequal per-outcome totals is rejected.

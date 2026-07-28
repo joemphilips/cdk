@@ -27,6 +27,24 @@ pub fn fiat_subunit_scale(unit: &CurrencyUnit) -> Option<u64> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usd_uses_nut01_cent_subunits() {
+        assert_eq!(fiat_subunit_scale(&CurrencyUnit::Usd), Some(100));
+    }
+
+    #[test]
+    fn milli_cent_custom_unit_is_not_a_fiat_scale() {
+        assert_eq!(
+            fiat_subunit_scale(&CurrencyUnit::Custom("milli-cent".to_string())),
+            None
+        );
+    }
+}
+
 /// A successful exchange-rate snapshot for one fiat currency unit.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RateSnapshot {

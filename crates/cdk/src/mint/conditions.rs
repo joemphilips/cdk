@@ -13,6 +13,7 @@ use cdk_common::nuts::nut_ctf::{
     MAX_ANNOUNCEMENT_HEX_LENGTH, MAX_OUTCOMES, MAX_OUTCOME_COLLECTIONS, MAX_TAGS_JSON_LENGTH,
 };
 use cdk_common::nuts::{BlindSignature, BlindedMessage};
+use cdk_common::CurrencyUnit;
 use tracing::instrument;
 
 use super::Mint;
@@ -167,8 +168,22 @@ impl Mint {
             is_numeric,
             &default_keyset_creation,
         )?;
+        let collateral_unit = request
+            .collateral
+            .as_deref()
+            .map(CurrencyUnit::from_str)
+            .transpose()
+            .map_err(|_| {
+                Error::Custom(format!(
+                    "Invalid collateral unit: {}",
+                    request.collateral.as_deref().unwrap_or_default()
+                ))
+            })?;
         let required_fee = self
-            .required_registration_fee(requested_collections.len())
+            .required_registration_fee(
+                requested_collections.len(),
+                collateral_unit.as_ref().unwrap_or(&CurrencyUnit::Sat),
+            )
             .await?;
 
         // 4. Check for existing condition (idempotency or conflict)
@@ -194,6 +209,7 @@ impl Mint {
                 || existing.lo_bound != request.lo_bound
                 || existing.hi_bound != request.hi_bound
                 || existing.precision != request.precision
+                || existing.collateral != collateral_unit
             {
                 return Err(Error::ConditionAlreadyExists);
             }
@@ -222,8 +238,12 @@ impl Mint {
                         .to_string(),
                 )
             })?;
-            cdk_common::CurrencyUnit::from_str(collateral)
-                .map_err(|_| Error::Custom(format!("Invalid collateral unit: {}", collateral)))?;
+            if collateral_unit.is_none() {
+                return Err(Error::Custom(format!(
+                    "Invalid collateral unit: {}",
+                    collateral
+                )));
+            }
         }
 
         let fee_verification = if required_fee > 0 {
@@ -255,6 +275,7 @@ impl Mint {
             threshold: request.threshold,
             tags_json,
             announcements_json: serde_json::to_string(&request.announcements)?,
+            collateral: collateral_unit,
             attestation_status: STATUS_PENDING.to_string(),
             winning_outcome: None,
             attested_at: None,
@@ -355,13 +376,22 @@ impl Mint {
         })
     }
 
-    async fn required_registration_fee(&self, num_keysets: usize) -> Result<u64, Error> {
+    async fn required_registration_fee(
+        &self,
+        num_keysets: usize,
+        collateral_unit: &CurrencyUnit,
+    ) -> Result<u64, Error> {
         let settings = self.mint_info().await?.nuts.nut_ctf.unwrap_or_default();
-        let per_keyset = settings
+        let fee_setting = settings
+            .registration_fees
+            .iter()
+            .find(|fee| fee.unit == collateral_unit.to_string())
+            .ok_or(Error::UnsupportedCollateralUnit)?;
+        let per_keyset = fee_setting
             .registration_fee_per_keyset
             .checked_mul(num_keysets as u64)
             .ok_or(Error::AmountOverflow)?;
-        settings
+        fee_setting
             .registration_fee_base
             .checked_add(per_keyset)
             .ok_or(Error::AmountOverflow)
@@ -768,6 +798,7 @@ impl Mint {
             threshold: condition.threshold,
             tags: serde_json::from_str(&condition.tags_json).unwrap_or_default(),
             announcements,
+            collateral: condition.collateral,
             keysets,
             attestation: Some(AttestationState {
                 status: match condition.attestation_status.as_str() {
@@ -806,5 +837,59 @@ impl Mint {
             .await?;
 
         Ok(ConditionalKeysetsResponse { keysets })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cdk_common::nuts::nut_ctf::{NutCtfSettings, RegistrationFeeSetting};
+    use cdk_common::CurrencyUnit;
+
+    use super::*;
+
+    async fn mint_with_registration_fee(base: u64, per_keyset: u64) -> Mint {
+        let mint = crate::test_helpers::mint::create_test_mint()
+            .await
+            .expect("test mint should be created");
+        let mut mint_info = mint.mint_info().await.expect("mint info should load");
+        mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+            registration_fees: vec![RegistrationFeeSetting {
+                unit: CurrencyUnit::Sat.to_string(),
+                registration_fee_base: base,
+                registration_fee_per_keyset: per_keyset,
+            }],
+            ..NutCtfSettings::default()
+        });
+        mint.set_mint_info(mint_info)
+            .await
+            .expect("mint info should be updated");
+        mint
+    }
+
+    #[tokio::test]
+    async fn required_registration_fee_overflows_when_max_base_is_added_to_per_keyset_fee() {
+        let mint = mint_with_registration_fee(u64::MAX, 1).await;
+
+        let result = mint.required_registration_fee(1, &CurrencyUnit::Sat).await;
+
+        assert!(matches!(result, Err(Error::AmountOverflow)));
+    }
+
+    #[tokio::test]
+    async fn required_registration_fee_overflows_when_max_per_keyset_is_multiplied() {
+        let mint = mint_with_registration_fee(0, u64::MAX).await;
+
+        let result = mint.required_registration_fee(2, &CurrencyUnit::Sat).await;
+
+        assert!(matches!(result, Err(Error::AmountOverflow)));
+    }
+
+    #[tokio::test]
+    async fn required_registration_fee_overflows_for_large_num_keysets() {
+        let mint = mint_with_registration_fee(1, (u64::MAX / 2) + 1).await;
+
+        let result = mint.required_registration_fee(2, &CurrencyUnit::Sat).await;
+
+        assert!(matches!(result, Err(Error::AmountOverflow)));
     }
 }
