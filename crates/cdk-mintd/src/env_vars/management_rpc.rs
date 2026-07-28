@@ -53,14 +53,6 @@ mod tests {
 
     use super::*;
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-        ENV_LOCK
-            .lock()
-            .expect("management RPC env test lock should not be poisoned")
-    }
-
     fn clear_env_vars() {
         env::remove_var(ENV_MINT_MANAGEMENT_ENABLED);
         env::remove_var(ENV_MINT_MANAGEMENT_ENABLED_LEGACY);
@@ -99,7 +91,7 @@ mod tests {
 
     #[test]
     fn management_rpc_from_env_reads_canonical_env_vars() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_env_vars();
 
         env::set_var(ENV_MINT_MANAGEMENT_ENABLED, "true");
@@ -124,7 +116,7 @@ mod tests {
 
     #[test]
     fn management_rpc_from_env_still_reads_legacy_enabled_env_var() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_env_vars();
 
         env::set_var(ENV_MINT_MANAGEMENT_ENABLED_LEGACY, "true");
@@ -138,7 +130,7 @@ mod tests {
 
     #[test]
     fn management_rpc_from_env_allows_no_tls_configuration() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_env_vars();
 
         env::set_var(ENV_MINT_MANAGEMENT_ENABLED, "true");

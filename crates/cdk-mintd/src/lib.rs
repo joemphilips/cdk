@@ -2107,6 +2107,7 @@ async fn build_mint(
 struct ServiceStartupExtras {
     routers: Vec<Router>,
     auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
+    #[cfg(feature = "management-rpc")]
     rate_quote_control: Option<RateQuoteControlHandle>,
 }
 
@@ -2640,6 +2641,9 @@ pub async fn run_mintd_with_shutdown(
         Some(kv),
     )
     .await?;
+    #[cfg(not(feature = "management-rpc"))]
+    let _ = rate_quote_control;
+
     let (mint_builder, auth_localstore) =
         setup_authentication(settings, work_dir, mint_builder, db_password).await?;
 
@@ -2660,6 +2664,7 @@ pub async fn run_mintd_with_shutdown(
         ServiceStartupExtras {
             routers,
             auth_localstore,
+            #[cfg(feature = "management-rpc")]
             rate_quote_control,
         },
     )
