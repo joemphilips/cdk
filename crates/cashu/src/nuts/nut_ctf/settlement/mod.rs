@@ -51,17 +51,17 @@ pub enum Error {
         field: &'static str,
     },
     /// The PAY_TO_UNLOCK secret was malformed.
-    #[error("invalid PAY_TO_UNLOCK secret: {0}")]
-    InvalidCondition(String),
+    #[error("invalid PAY_TO_UNLOCK condition: {0}")]
+    InvalidCondition(&'static str),
     /// A required PAY_TO_UNLOCK tag was absent.
     #[error("missing PAY_TO_UNLOCK tag: {0}")]
     MissingTag(&'static str),
     /// A PAY_TO_UNLOCK tag appeared more than once.
-    #[error("duplicate PAY_TO_UNLOCK tag: {0}")]
-    DuplicateTag(String),
+    #[error("duplicate PAY_TO_UNLOCK tag")]
+    DuplicateTag,
     /// A PAY_TO_UNLOCK tag is not defined by CTF settlement.
-    #[error("unknown PAY_TO_UNLOCK tag: {0}")]
-    UnknownTag(String),
+    #[error("unknown PAY_TO_UNLOCK tag")]
+    UnknownTag,
     /// Standard and pool tags were mixed.
     #[error("pool tags must be all present or all absent")]
     PartialPoolTags,
