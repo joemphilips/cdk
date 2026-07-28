@@ -1,9 +1,25 @@
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::nuts::nut_ctf::settlement::{
+    verify_pay_to_unlock_refund, Error as SettlementError,
+};
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::util::unix_time;
 use cdk_common::SpendingConditionVerification;
 use swap_saga::SwapSaga;
 use tracing::instrument;
 
 use super::{Mint, SwapRequest, SwapResponse};
 use crate::Error;
+
+#[cfg(feature = "conditional-tokens")]
+#[derive(Clone, PartialEq, Eq)]
+enum RefundAssetClass {
+    Regular,
+    Conditional {
+        condition_id: String,
+        outcome_collection_id: String,
+    },
+}
 
 pub(in crate::mint) mod atomic;
 pub mod swap_saga;
@@ -141,8 +157,22 @@ impl Mint {
                 err
             })?;
 
+            #[cfg(feature = "conditional-tokens")]
+            let is_pay_to_unlock_refund = verify_pay_to_unlock_refund(&swap_request, unix_time())
+                .map_err(map_pay_to_unlock_refund_error)?;
+            #[cfg(feature = "conditional-tokens")]
+            if is_pay_to_unlock_refund {
+                self.verify_pay_to_unlock_refund_class(&swap_request)
+                    .await?;
+            }
+
             // Verify spending conditions (NUT-10/NUT-11/NUT-14), i.e. P2PK
             // and HTLC (including SIGALL)
+            #[cfg(feature = "conditional-tokens")]
+            if !is_pay_to_unlock_refund {
+                swap_request.verify_spending_conditions()?;
+            }
+            #[cfg(not(feature = "conditional-tokens"))]
             swap_request.verify_spending_conditions()?;
 
             // Step 1: Initialize the swap saga
@@ -175,5 +205,52 @@ impl Mint {
         }
 
         result
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn verify_pay_to_unlock_refund_class(&self, request: &SwapRequest) -> Result<(), Error> {
+        let first_input = request
+            .inputs()
+            .first()
+            .ok_or(Error::PayToUnlockInvalidCondition)?;
+        let expected = self.refund_asset_class(&first_input.keyset_id).await?;
+        for input in request.inputs().iter().skip(1) {
+            if self.refund_asset_class(&input.keyset_id).await? != expected {
+                return Err(Error::PayToUnlockInvalidCondition);
+            }
+        }
+        for output in request.outputs() {
+            if self.refund_asset_class(&output.keyset_id).await? != expected {
+                return Err(Error::PayToUnlockInvalidCondition);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn refund_asset_class(
+        &self,
+        keyset_id: &cdk_common::nuts::Id,
+    ) -> Result<RefundAssetClass, Error> {
+        Ok(
+            match self.localstore.get_condition_for_keyset(keyset_id).await? {
+                Some((condition_id, _outcome_collection, outcome_collection_id)) => {
+                    RefundAssetClass::Conditional {
+                        condition_id,
+                        outcome_collection_id,
+                    }
+                }
+                None => RefundAssetClass::Regular,
+            },
+        )
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn map_pay_to_unlock_refund_error(error: SettlementError) -> Error {
+    match error {
+        SettlementError::RefundBeforeExpiry => Error::RefundBeforeExpiry,
+        SettlementError::RefundWitnessMissingOrInvalid => Error::RefundWitnessMissingOrInvalid,
+        _ => Error::PayToUnlockInvalidCondition,
     }
 }

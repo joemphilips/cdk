@@ -542,6 +542,23 @@ pub enum Error {
     #[cfg(feature = "conditional-tokens")]
     #[error("EC point operation failed")]
     EcPointOperationFailed,
+    // 15xxx - Multi-party exchange errors
+    /// Unsupported or malformed PAY_TO_UNLOCK condition/spend path (15001)
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Unsupported or malformed PAY_TO_UNLOCK condition")]
+    PayToUnlockInvalidCondition,
+    /// Settlement request arrived at or after authorization expiry (15005)
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Settlement authorization has expired")]
+    SettlementAfterExpiry,
+    /// PAY_TO_UNLOCK refund arrived before authorization expiry (15006)
+    #[cfg(feature = "conditional-tokens")]
+    #[error("PAY_TO_UNLOCK refund is not yet available")]
+    RefundBeforeExpiry,
+    /// PAY_TO_UNLOCK refund witness was missing or invalid (15007)
+    #[cfg(feature = "conditional-tokens")]
+    #[error("PAY_TO_UNLOCK refund witness is missing or invalid")]
+    RefundWitnessMissingOrInvalid,
     /// Invalid numeric range (13030)
     #[cfg(feature = "conditional-tokens")]
     #[error("Invalid numeric range")]
@@ -864,7 +881,11 @@ impl Error {
             | Self::InvalidNumericRange
             | Self::DigitSignatureVerificationFailed
             | Self::AttestedValueOutsideRange
-            | Self::PayoutCalculationOverflow => true,
+            | Self::PayoutCalculationOverflow
+            | Self::PayToUnlockInvalidCondition
+            | Self::SettlementAfterExpiry
+            | Self::RefundBeforeExpiry
+            | Self::RefundWitnessMissingOrInvalid => true,
 
             // HTTP Errors
             Self::HttpError(Some(status), _) => {
@@ -1258,6 +1279,26 @@ impl From<Error> for ErrorResponse {
                 detail: err.to_string(),
             },
             #[cfg(feature = "conditional-tokens")]
+            Error::PayToUnlockInvalidCondition => ErrorResponse {
+                code: ErrorCode::PayToUnlockInvalidCondition,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "conditional-tokens")]
+            Error::SettlementAfterExpiry => ErrorResponse {
+                code: ErrorCode::SettlementAfterExpiry,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "conditional-tokens")]
+            Error::RefundBeforeExpiry => ErrorResponse {
+                code: ErrorCode::RefundBeforeExpiry,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "conditional-tokens")]
+            Error::RefundWitnessMissingOrInvalid => ErrorResponse {
+                code: ErrorCode::RefundWitnessMissingOrInvalid,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "conditional-tokens")]
             Error::HashToCurveFailed => ErrorResponse {
                 code: ErrorCode::HashToCurveFailed,
                 detail: err.to_string(),
@@ -1628,6 +1669,20 @@ pub enum ErrorCode {
     /// Unsupported CTF collateral unit (13048)
     #[cfg(feature = "conditional-tokens")]
     UnsupportedCollateralUnit,
+
+    // 15xxx - Multi-party exchange errors
+    /// Unsupported or malformed PAY_TO_UNLOCK condition/spend path (15001)
+    #[cfg(feature = "conditional-tokens")]
+    PayToUnlockInvalidCondition,
+    /// Settlement request arrived at or after authorization expiry (15005)
+    #[cfg(feature = "conditional-tokens")]
+    SettlementAfterExpiry,
+    /// PAY_TO_UNLOCK refund arrived before authorization expiry (15006)
+    #[cfg(feature = "conditional-tokens")]
+    RefundBeforeExpiry,
+    /// PAY_TO_UNLOCK refund witness was missing or invalid (15007)
+    #[cfg(feature = "conditional-tokens")]
+    RefundWitnessMissingOrInvalid,
     /// Hash to curve failed (13045)
     #[cfg(feature = "conditional-tokens")]
     HashToCurveFailed,
@@ -1755,6 +1810,15 @@ impl ErrorCode {
             13047 => Self::RegistrationFeeChangeOutputs,
             #[cfg(feature = "conditional-tokens")]
             13048 => Self::UnsupportedCollateralUnit,
+            // 15xxx - Multi-party exchange errors
+            #[cfg(feature = "conditional-tokens")]
+            15001 => Self::PayToUnlockInvalidCondition,
+            #[cfg(feature = "conditional-tokens")]
+            15005 => Self::SettlementAfterExpiry,
+            #[cfg(feature = "conditional-tokens")]
+            15006 => Self::RefundBeforeExpiry,
+            #[cfg(feature = "conditional-tokens")]
+            15007 => Self::RefundWitnessMissingOrInvalid,
             // 20xxx - Quote/Payment errors
             20001 => Self::QuoteNotPaid,
             20002 => Self::TokensAlreadyIssued,
@@ -1853,6 +1917,15 @@ impl ErrorCode {
             Self::RegistrationFeeChangeOutputs => 13047,
             #[cfg(feature = "conditional-tokens")]
             Self::UnsupportedCollateralUnit => 13048,
+            // 15xxx - Multi-party exchange errors
+            #[cfg(feature = "conditional-tokens")]
+            Self::PayToUnlockInvalidCondition => 15001,
+            #[cfg(feature = "conditional-tokens")]
+            Self::SettlementAfterExpiry => 15005,
+            #[cfg(feature = "conditional-tokens")]
+            Self::RefundBeforeExpiry => 15006,
+            #[cfg(feature = "conditional-tokens")]
+            Self::RefundWitnessMissingOrInvalid => 15007,
             // 20xxx - Quote/Payment errors
             Self::QuoteNotPaid => 20001,
             Self::TokensAlreadyIssued => 20002,

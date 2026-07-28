@@ -54,6 +54,12 @@ mod subscription;
 mod swap;
 mod verification;
 
+#[cfg(feature = "conditional-tokens")]
+fn reject_pay_to_unlock_spend(inputs: &cdk_common::Proofs) -> Result<(), Error> {
+    cdk_common::nuts::nut_ctf::settlement::reject_pay_to_unlock_inputs(inputs)
+        .map_err(|_| Error::PayToUnlockInvalidCondition)
+}
+
 pub use builder::{KeysetRotation, MintBuilder, MintMeltLimits, UnitConfig};
 pub use cdk_common::mint::{MeltQuote, MintKeySetInfo, MintQuote};
 pub use cdk_common::mint_quote::{MintQuoteRequest, MintQuoteResponse};

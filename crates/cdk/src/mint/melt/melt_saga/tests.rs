@@ -10,6 +10,7 @@
 
 use std::str::FromStr;
 
+use cdk_common::dhke::construct_proofs;
 use cdk_common::melt::MeltQuoteRequest;
 use cdk_common::mint::{
     MeltFinalizationData, MeltPaymentRequest, MeltQuote, MeltSagaState, OperationKind, Saga,
@@ -17,8 +18,12 @@ use cdk_common::mint::{
 };
 use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
-use cdk_common::nuts::{MeltQuoteBolt11Request, MeltQuoteState, MeltRequest, MintQuoteState};
+use cdk_common::nuts::{
+    MeltQuoteBolt11Request, MeltQuoteState, MeltRequest, MintQuoteState, PreMintSecrets, SecretKey,
+    SwapRequest,
+};
 use cdk_common::payment::PaymentIdentifier;
+use cdk_common::secret::Secret;
 use cdk_common::util::unix_time;
 use cdk_common::{
     Amount, CurrencyUnit, MintQuoteBolt11Request, PaymentMethod, ProofsMethods, State,
@@ -41,6 +46,92 @@ async fn test_melt_saga_initial_state_creation() {
 
     let _saga = MeltSaga::new(std::sync::Arc::new(mint.clone()), db, pubsub);
     // Type system enforces Initial state - if this compiles, test passes
+}
+
+#[tokio::test]
+async fn test_melt_setup_rejects_pay_to_unlock_without_spending_it() {
+    let mint = create_test_mint().await.unwrap();
+    let quote = create_test_onchain_melt_quote(&mint).await;
+    let amount = Amount::from(9_500);
+    let protected = mint_pay_to_unlock_proofs(&mint, amount).await;
+    let protected_ys = protected.ys().unwrap();
+    let request = create_test_melt_request(&protected, &quote).fee_index(0);
+    let verification = mint.verify_inputs(request.inputs()).await.unwrap();
+    let saga = MeltSaga::new(
+        std::sync::Arc::new(mint.clone()),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    );
+
+    let result = saga
+        .setup_melt(
+            &request,
+            verification,
+            PaymentMethod::Known(KnownMethod::Onchain),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(cdk_common::Error::PayToUnlockInvalidCondition)
+    ));
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&protected_ys)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+}
+
+async fn mint_pay_to_unlock_proofs(mint: &crate::mint::Mint, amount: Amount) -> cdk_common::Proofs {
+    let source = mint_test_proofs(mint, amount).await.unwrap();
+    let keyset_id = *mint
+        .get_active_keysets()
+        .get(&CurrencyUnit::Sat)
+        .expect("test mint must have an active sat keyset");
+    let refund_key = SecretKey::generate();
+    let keys = mint
+        .keyset_pubkeys(&keyset_id)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+    let fee_and_amounts: (u64, Vec<u64>) =
+        (0, keys.iter().map(|(value, _)| value.to_u64()).collect());
+    let amounts = amount.split(&fee_and_amounts.into()).unwrap();
+    let secrets = amounts
+        .iter()
+        .enumerate()
+        .map(|(index, _)| pay_to_unlock_secret(keyset_id, &refund_key, index))
+        .collect();
+    let premint = PreMintSecrets::from_secrets(keyset_id, amounts, secrets).unwrap();
+    let response = mint
+        .process_swap_request(SwapRequest::new(source, premint.blinded_messages()))
+        .await
+        .unwrap();
+    construct_proofs(response.signatures, premint.rs(), premint.secrets(), &keys).unwrap()
+}
+
+fn pay_to_unlock_secret(
+    keyset_id: cdk_common::nuts::Id,
+    refund_key: &SecretKey,
+    nonce: usize,
+) -> Secret {
+    Secret::from_str(&format!(
+        concat!(
+            "[\"PAY_TO_UNLOCK\",{{\"nonce\":\"{:064x}\",\"data\":\"{}\",",
+            "\"tags\":[[\"offer_keyset\",\"{}\"],[\"expiry\",\"{}\"],",
+            "[\"refund\",\"{}\"]]}}]"
+        ),
+        nonce,
+        "11".repeat(32),
+        keyset_id,
+        unix_time() + 3600,
+        refund_key.public_key().x_only_public_key()
+    ))
+    .unwrap()
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
+use super::canonical::write_canonical_json;
 use super::manifest::{strict_keyset_id, strict_public_key};
 use super::{
     ctf_receive_commitment, CanonicalHash, Error, PayToUnlockAuthorization, PayToUnlockCondition,
@@ -836,38 +837,4 @@ fn canonical_output_value(output: &BlindedMessage) -> Value {
         Value::String(output.keyset_id.to_string()),
     );
     Value::Object(value)
-}
-
-fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Error> {
-    match value {
-        Value::Null => output.extend_from_slice(b"null"),
-        Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
-        Value::Number(number) => output.extend_from_slice(number.to_string().as_bytes()),
-        Value::String(string) => serde_json::to_writer(output, string)?,
-        Value::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                write_canonical_json(value, output)?;
-            }
-            output.push(b']');
-        }
-        Value::Object(values) => {
-            output.push(b'{');
-            let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_by_key(|(key, _)| *key);
-            for (index, (key, value)) in entries.into_iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                serde_json::to_writer(&mut *output, key)?;
-                output.push(b':');
-                write_canonical_json(value, output)?;
-            }
-            output.push(b'}');
-        }
-    }
-    Ok(())
 }

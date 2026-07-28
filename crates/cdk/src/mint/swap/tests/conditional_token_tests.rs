@@ -11,6 +11,7 @@ use cdk_common::amount::SplitTarget;
 use cdk_common::dhke::construct_proofs;
 use cdk_common::error::{ErrorCode, ErrorResponse};
 use cdk_common::nut00::KnownMethod;
+use cdk_common::nuts::nut_ctf::settlement::sign_pay_to_unlock_refund;
 use cdk_common::nuts::nut_ctf::test_helpers::{
     create_digit_decomposition_announcement, create_multi_oracle_witness,
     create_numeric_oracle_witness, create_oracle_witness, create_test_announcement,
@@ -24,6 +25,8 @@ use cdk_common::nuts::{
     Conditions, Id, PaymentMethod, PreMintSecrets, ProofsMethods, SecretKey, SigFlag,
     SpendingConditions, SwapRequest, Witness,
 };
+use cdk_common::secret::Secret;
+use cdk_common::util::unix_time;
 use cdk_common::{Amount, CurrencyUnit, State};
 use cdk_fake_wallet::FakeWallet;
 use tokio::time::{sleep, timeout};
@@ -477,6 +480,65 @@ async fn swap_to_conditional(
         pre_mint.secrets(),
         &keys,
     )
+    .unwrap()
+}
+
+async fn lock_pay_to_unlock(
+    mint: &Mint,
+    inputs: cdk_common::Proofs,
+    offer_keyset: Id,
+    amount: Amount,
+    expiry: u64,
+    refund_key: &SecretKey,
+) -> cdk_common::Proofs {
+    let keys = mint
+        .keyset_pubkeys(&offer_keyset)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+    let fee_and_amounts: (u64, Vec<u64>) =
+        (0, keys.iter().map(|(value, _)| value.to_u64()).collect());
+    let amounts = amount.split(&fee_and_amounts.into()).unwrap();
+    let secrets = amounts
+        .iter()
+        .enumerate()
+        .map(|(index, _)| pay_to_unlock_secret(offer_keyset, expiry, refund_key, index))
+        .collect();
+    let pre_mint = PreMintSecrets::from_secrets(offer_keyset, amounts, secrets).unwrap();
+    let response = mint
+        .process_swap_request(SwapRequest::new(inputs, pre_mint.blinded_messages()))
+        .await
+        .expect("locking PAY_TO_UNLOCK proof should succeed");
+    construct_proofs(
+        response.signatures,
+        pre_mint.rs(),
+        pre_mint.secrets(),
+        &keys,
+    )
+    .unwrap()
+}
+
+fn pay_to_unlock_secret(
+    offer_keyset: Id,
+    expiry: u64,
+    refund_key: &SecretKey,
+    nonce: usize,
+) -> Secret {
+    Secret::from_str(&format!(
+        concat!(
+            "[\"PAY_TO_UNLOCK\",{{\"nonce\":\"{:064x}\",\"data\":\"{}\",",
+            "\"tags\":[[\"offer_keyset\",\"{}\"],[\"expiry\",\"{}\"],",
+            "[\"refund\",\"{}\"]]}}]"
+        ),
+        nonce,
+        "11".repeat(32),
+        offer_keyset,
+        expiry,
+        refund_key.public_key().x_only_public_key()
+    ))
     .unwrap()
 }
 
@@ -941,6 +1003,182 @@ async fn test_swap_rejects_conditional_inputs_to_different_outcome() {
     );
 }
 
+#[tokio::test]
+async fn test_pay_to_unlock_refund_rejects_before_expiry() {
+    let mint = create_test_mint().await.unwrap();
+    let keyset_id = get_regular_keyset_id(&mint);
+    let amount = Amount::from(64);
+    let inputs = mint_test_proofs(&mint, amount).await.unwrap();
+    let refund_key = SecretKey::generate();
+    let locked = lock_pay_to_unlock(
+        &mint,
+        inputs,
+        keyset_id,
+        amount,
+        unix_time() + 3600,
+        &refund_key,
+    )
+    .await;
+    let (outputs, _) = create_premint(&mint, keyset_id, amount);
+    let mut request = SwapRequest::new(locked, outputs);
+    sign_pay_to_unlock_refund(&mut request, 0, &refund_key).unwrap();
+
+    let response: ErrorResponse = mint
+        .process_swap_request(request)
+        .await
+        .expect_err("refund before expiry must fail")
+        .into();
+    assert_eq!(response.code, ErrorCode::RefundBeforeExpiry);
+}
+
+#[tokio::test]
+async fn test_pay_to_unlock_refund_accepts_active_same_unit_rotation() {
+    let mint = create_test_mint().await.unwrap();
+    let old_keyset = get_regular_keyset_id(&mint);
+    let amount = Amount::from(64);
+    let inputs = mint_test_proofs(&mint, amount).await.unwrap();
+    let refund_key = SecretKey::generate();
+    let locked = lock_pay_to_unlock(
+        &mint,
+        inputs,
+        old_keyset,
+        amount,
+        unix_time().saturating_sub(1),
+        &refund_key,
+    )
+    .await;
+
+    mint.rotate_keyset(
+        CurrencyUnit::Sat,
+        (0..32).map(|power| 2_u64.pow(power)).collect(),
+        0,
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let active_keyset = get_regular_keyset_id(&mint);
+    assert_ne!(active_keyset, old_keyset);
+
+    let (outputs, _) = create_premint(&mint, active_keyset, amount);
+    let mut request = SwapRequest::new(locked, outputs);
+    sign_pay_to_unlock_refund(&mut request, 0, &refund_key).unwrap();
+    let response = mint
+        .process_swap_request(request)
+        .await
+        .expect("post-expiry refund into active same-unit keyset should succeed");
+    assert!(response
+        .signatures
+        .iter()
+        .all(|signature| signature.keyset_id == active_keyset));
+}
+
+#[tokio::test]
+async fn test_pay_to_unlock_refund_rejects_regular_to_conditional_output() {
+    let mint = create_test_mint().await.unwrap();
+    let regular_keyset = get_regular_keyset_id(&mint);
+    let amount = Amount::from(64);
+    let inputs = mint_test_proofs(&mint, amount).await.unwrap();
+    let refund_key = SecretKey::generate();
+    let locked = lock_pay_to_unlock(
+        &mint,
+        inputs,
+        regular_keyset,
+        amount,
+        unix_time().saturating_sub(1),
+        &refund_key,
+    )
+    .await;
+
+    let (_, conditional_keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let conditional_keyset = *conditional_keysets.get("YES").unwrap();
+    let (outputs, _) = create_premint(&mint, conditional_keyset, amount);
+    let mut request = SwapRequest::new(locked, outputs);
+    sign_pay_to_unlock_refund(&mut request, 0, &refund_key).unwrap();
+
+    let response: ErrorResponse = mint
+        .process_swap_request(request)
+        .await
+        .expect_err("regular PAY_TO_UNLOCK refund must preserve the regular asset class")
+        .into();
+    assert_eq!(response.code, ErrorCode::PayToUnlockInvalidCondition);
+}
+
+#[tokio::test]
+async fn test_pay_to_unlock_refund_rejects_cross_collection_output() {
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(64);
+    let regular = mint_test_proofs(&mint, amount).await.unwrap();
+    let (_, conditional_keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let yes_keyset = *conditional_keysets.get("YES").unwrap();
+    let no_keyset = *conditional_keysets.get("NO").unwrap();
+    let conditional = swap_to_conditional(&mint, regular, yes_keyset, amount).await;
+    let refund_key = SecretKey::generate();
+    let locked = lock_pay_to_unlock(
+        &mint,
+        conditional,
+        yes_keyset,
+        after_conditional_input_fee(amount),
+        unix_time().saturating_sub(1),
+        &refund_key,
+    )
+    .await;
+
+    let refund_amount = after_conditional_input_fee(after_conditional_input_fee(amount));
+    let (outputs, _) = create_premint(&mint, no_keyset, refund_amount);
+    let mut request = SwapRequest::new(locked, outputs);
+    sign_pay_to_unlock_refund(&mut request, 0, &refund_key).unwrap();
+
+    let response: ErrorResponse = mint
+        .process_swap_request(request)
+        .await
+        .expect_err("conditional refund must remain in the same outcome collection")
+        .into();
+    assert_eq!(response.code, ErrorCode::InputsMustUseSameConditionalKeyset);
+}
+
+#[tokio::test]
+async fn test_redeem_rejects_pay_to_unlock_without_spending_it() {
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(64);
+    let regular = mint_test_proofs(&mint, amount).await.unwrap();
+    let regular_keyset = get_regular_keyset_id(&mint);
+    let (_, conditional_keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let yes_keyset = *conditional_keysets.get("YES").unwrap();
+    let conditional = swap_to_conditional(&mint, regular, yes_keyset, amount).await;
+    let refund_key = SecretKey::generate();
+    let locked = lock_pay_to_unlock(
+        &mint,
+        conditional,
+        yes_keyset,
+        after_conditional_input_fee(amount),
+        unix_time() + 3600,
+        &refund_key,
+    )
+    .await;
+    let locked_ys = locked.ys().unwrap();
+    let output_amount = after_conditional_input_fee(after_conditional_input_fee(amount));
+    let (outputs, _) = create_premint(&mint, regular_keyset, output_amount);
+
+    let result = mint
+        .process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: locked,
+            outputs,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(Error::PayToUnlockInvalidCondition)),
+        "protected redeem must be rejected at the spend-path boundary: {result:?}"
+    );
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&locked_ys)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+}
+
 /// Test that a second redemption uses the stored attestation (skips witness verification)
 #[tokio::test]
 async fn test_redeem_second_uses_stored_attestation() {
@@ -1206,6 +1444,49 @@ async fn test_register_condition_returns_registration_fee_change() {
         states.iter().all(|state| *state == Some(State::Spent)),
         "fee proofs must be marked spent after successful paid registration"
     );
+}
+
+#[tokio::test]
+async fn test_register_condition_rejects_pay_to_unlock_fee_without_spending_it() {
+    let mint = create_test_mint().await.unwrap();
+    let mut mint_info = mint.mint_info().await.unwrap();
+    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
+        registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 2, 3)],
+        ..NutCtfSettings::default()
+    });
+    mint.set_mint_info(mint_info).await.unwrap();
+
+    let keyset_id = get_regular_keyset_id(&mint);
+    let fee_source = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+    let refund_key = SecretKey::generate();
+    let locked = lock_pay_to_unlock(
+        &mint,
+        fee_source,
+        keyset_id,
+        Amount::from(8),
+        unix_time() + 3600,
+        &refund_key,
+    )
+    .await;
+    let locked_ys = locked.ys().unwrap();
+
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "protected-fee-rejected");
+    let mut request = enum_condition_request("Protected fee rejected", vec![hex_tlv]);
+    request.fee = Some(locked);
+
+    let result = mint.register_condition(request).await;
+    assert!(
+        matches!(result, Err(Error::PayToUnlockInvalidCondition)),
+        "protected registration fee must be rejected at the spend-path boundary: {result:?}"
+    );
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&locked_ys)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
 }
 
 #[tokio::test]
@@ -1915,6 +2196,55 @@ async fn test_ctf_split_creates_conditional_tokens() {
 
     let result = mint.process_ctf_convert(convert_request).await;
     assert!(result.is_err(), "zero-fee convert should be rejected");
+}
+
+#[tokio::test]
+async fn test_ctf_split_rejects_pay_to_unlock_without_spending_it() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let source_amount = Amount::from(8192);
+    let keyset_id = get_regular_keyset_id(&mint);
+    let source = mint_test_proofs(&mint, source_amount).await.unwrap();
+    let refund_key = SecretKey::generate();
+    let locked_amount = source_amount - Amount::ONE;
+    let locked = lock_pay_to_unlock(
+        &mint,
+        source,
+        keyset_id,
+        locked_amount,
+        unix_time() + 3600,
+        &refund_key,
+    )
+    .await;
+    let locked_ys = locked.ys().unwrap();
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let output_amount = locked_amount - Amount::ONE;
+    let (yes_outputs, _) = create_premint(&mint, *keysets.get("YES").unwrap(), output_amount);
+    let (no_outputs, _) = create_premint(&mint, *keysets.get("NO").unwrap(), output_amount);
+
+    let result = mint
+        .process_ctf_convert(CtfConvertRequest {
+            condition_id,
+            parent_collection_id: None,
+            inputs: HashMap::from([("*".to_string(), locked)]),
+            outputs: HashMap::from([
+                ("YES".to_string(), yes_outputs),
+                ("NO".to_string(), no_outputs),
+            ]),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(Error::PayToUnlockInvalidCondition)),
+        "protected split must be rejected at the spend-path boundary: {result:?}"
+    );
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&locked_ys)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
 }
 
 /// Test that split-as-convert uses payoff conservation instead of old partition matching.

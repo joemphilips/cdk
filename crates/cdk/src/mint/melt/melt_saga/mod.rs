@@ -211,6 +211,9 @@ impl MeltSaga<Initial> {
             }
         }
 
+        #[cfg(feature = "conditional-tokens")]
+        super::super::reject_pay_to_unlock_spend(melt_request.inputs())?;
+
         // Verify spending conditions (NUT-10/NUT-11/NUT-14), i.e. P2PK
         // and HTLC (including SIGALL)
         melt_request.verify_spending_conditions()?;

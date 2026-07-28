@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use bitcoin::secp256k1::XOnlyPublicKey;
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::canonical::{parse_minimal_u128, parse_minimal_u64};
 use super::{CanonicalHash, Error};
@@ -143,6 +144,21 @@ impl fmt::Debug for PayToUnlockCondition {
 }
 
 impl PayToUnlockCondition {
+    /// Decode a `PAY_TO_UNLOCK` secret, or return `None` for another secret kind.
+    pub fn parse_optional(secret: &Secret) -> Result<Option<Self>, Error> {
+        let Ok(value) = serde_json::from_slice::<Value>(secret.as_bytes()) else {
+            return Ok(None);
+        };
+        let kind = value
+            .as_array()
+            .and_then(|parts| parts.first())
+            .and_then(Value::as_str);
+        if kind != Some("PAY_TO_UNLOCK") {
+            return Ok(None);
+        }
+        Self::parse(secret).map(Some)
+    }
+
     /// Strictly decode and validate one CTF `PAY_TO_UNLOCK` proof secret.
     pub fn parse(secret: &Secret) -> Result<Self, Error> {
         let (kind, data): (String, StrictSecretData) = serde_json::from_slice(secret.as_bytes())
