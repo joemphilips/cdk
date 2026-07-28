@@ -122,6 +122,43 @@ impl RateQuoteRecord {
     }
 }
 
+/// One durable, unpaid, unexpired mint quote that still reserves issuance
+/// cap headroom during startup reconstruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveMintReservation {
+    /// Inner payment backend lookup id used as the reservation key.
+    pub payment_lookup_id: PaymentIdentifier,
+    /// Fiat unit whose cap is reserved.
+    pub fiat_unit: CurrencyUnit,
+    /// Reserved amount in the fiat unit's minor subunits.
+    pub fiat_subunits: u64,
+    /// Quote expiry as a Unix timestamp in seconds.
+    pub expiry_unix: u64,
+}
+
+impl ActiveMintReservation {
+    /// Construct a projection row, rejecting an inactive expiry boundary.
+    pub fn new(
+        payment_lookup_id: PaymentIdentifier,
+        fiat_unit: CurrencyUnit,
+        fiat_subunits: u64,
+        expiry_unix: u64,
+        now_unix: u64,
+    ) -> Result<Self, RateQuoteStoreError> {
+        if expiry_unix <= now_unix {
+            return Err(RateQuoteStoreError::Storage(format!(
+                "active mint reservation expiry {expiry_unix} is not after {now_unix}"
+            )));
+        }
+        Ok(Self {
+            payment_lookup_id,
+            fiat_unit,
+            fiat_subunits,
+            expiry_unix,
+        })
+    }
+}
+
 /// Parked payment row for fail-closed orphaned payment events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParkedPaymentRecord {
@@ -251,6 +288,12 @@ pub trait RateQuoteStore: Send + Sync {
     /// Load all persisted per-unit control records.
     async fn load_unit_controls(&self) -> Result<Vec<UnitControlRecord>, RateQuoteStoreError>;
 
+    /// Load unsettled, unexpired mint quote reservations at `now_unix`.
+    async fn load_active_mint_reservations(
+        &self,
+        now_unix: u64,
+    ) -> Result<Vec<ActiveMintReservation>, RateQuoteStoreError>;
+
     /// Persist pause state for one unit.
     async fn set_unit_quote_state(
         &self,
@@ -306,6 +349,7 @@ struct InMemoryRateQuoteStoreState {
     unit_controls: HashMap<CurrencyUnit, UnitControlRecord>,
     fail_next_insert: bool,
     fail_next_get: bool,
+    fail_next_active_reservations_load: bool,
     fail_next_settle: bool,
     fail_parked_insert_on_attempt: Option<usize>,
     parked_insert_attempts: usize,
@@ -325,6 +369,11 @@ impl InMemoryRateQuoteStore {
     /// Cause the next quoted-terms lookup to fail.
     pub async fn fail_next_get(&self) {
         self.inner.lock().await.fail_next_get = true;
+    }
+
+    /// Cause the next active mint-reservation projection load to fail.
+    pub async fn fail_next_active_reservations_load(&self) {
+        self.inner.lock().await.fail_next_active_reservations_load = true;
     }
 
     /// Cause a selected parked-evidence upsert attempt to fail.
@@ -470,6 +519,39 @@ impl RateQuoteStore for InMemoryRateQuoteStore {
             .collect())
     }
 
+    async fn load_active_mint_reservations(
+        &self,
+        now_unix: u64,
+    ) -> Result<Vec<ActiveMintReservation>, RateQuoteStoreError> {
+        let mut inner = self.inner.lock().await;
+        if inner.fail_next_active_reservations_load {
+            inner.fail_next_active_reservations_load = false;
+            return Err(RateQuoteStoreError::Storage(
+                "forced active mint-reservation load failure".to_string(),
+            ));
+        }
+        let mut reservations = inner
+            .records
+            .iter()
+            .filter(|(key, record)| {
+                record.side == RateQuoteSide::Mint
+                    && !inner.settled.contains(*key)
+                    && record.expiry_unix > now_unix
+            })
+            .map(|(_, record)| {
+                ActiveMintReservation::new(
+                    record.payment_lookup_id.clone(),
+                    record.fiat_unit.clone(),
+                    record.fiat_subunits,
+                    record.expiry_unix,
+                    now_unix,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        reservations.sort_by_key(|reservation| reservation.payment_lookup_id.to_string());
+        Ok(reservations)
+    }
+
     async fn set_unit_quote_state(
         &self,
         unit: &CurrencyUnit,
@@ -572,6 +654,16 @@ mod tests {
         }
     }
 
+    fn record_expiring_at(
+        lookup_id: &str,
+        side: RateQuoteSide,
+        expiry_unix: u64,
+    ) -> RateQuoteRecord {
+        let mut record = record(lookup_id, side);
+        record.expiry_unix = expiry_unix;
+        record
+    }
+
     #[tokio::test]
     async fn memory_store_round_trips_quote_side() {
         let store = InMemoryRateQuoteStore::new();
@@ -602,6 +694,54 @@ mod tests {
             .expect_err("duplicate insert must fail");
 
         assert!(matches!(error, RateQuoteStoreError::DuplicateQuote(_)));
+    }
+
+    #[tokio::test]
+    async fn active_mint_reservations_exclude_expired_melt_and_settled_terms() {
+        let store = InMemoryRateQuoteStore::new();
+        let now_unix = 100;
+        let active = record_expiring_at("active", RateQuoteSide::Mint, now_unix + 1);
+        let expired = record_expiring_at("expired", RateQuoteSide::Mint, now_unix);
+        let melt = record_expiring_at("melt", RateQuoteSide::Melt, now_unix + 1);
+        let settled = record_expiring_at("settled", RateQuoteSide::Mint, now_unix + 1);
+
+        for record in [active.clone(), expired, melt, settled.clone()] {
+            store.insert(record).await.expect("insert terms");
+        }
+        store
+            .mark_settled(&settled.payment_lookup_id)
+            .await
+            .expect("mark settled");
+
+        let reservations = store
+            .load_active_mint_reservations(now_unix)
+            .await
+            .expect("load active reservations");
+        assert_eq!(
+            reservations,
+            vec![ActiveMintReservation::new(
+                active.payment_lookup_id,
+                active.fiat_unit,
+                active.fiat_subunits,
+                active.expiry_unix,
+                now_unix,
+            )
+            .expect("active projection")]
+        );
+    }
+
+    #[test]
+    fn active_mint_reservation_rejects_expiry_boundary() {
+        let error = ActiveMintReservation::new(
+            PaymentIdentifier::CustomId("expired".to_string()),
+            CurrencyUnit::Usd,
+            100,
+            42,
+            42,
+        )
+        .expect_err("expiry at now is inactive");
+
+        assert!(matches!(error, RateQuoteStoreError::Storage(_)));
     }
 
     #[tokio::test]

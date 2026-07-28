@@ -648,6 +648,37 @@ async fn unit_control_state_survives_restart_via_store() {
 }
 
 #[tokio::test]
+async fn pending_mint_quote_reservation_survives_restart_via_store() {
+    let store = InMemoryRateQuoteStore::new();
+    let dyn_store: DynRateQuoteStore = Arc::new(store.clone());
+    let control = RateQuoteControlHandle::with_store_and_buffer_bps(dyn_store.clone(), 100);
+    control
+        .set_unit_issuance_cap(CurrencyUnit::Usd, 500)
+        .await
+        .expect("persist cap");
+    let processor1 = processor(30, store.clone(), control, 120);
+    processor1
+        .create_incoming_payment_request(mint_quote(200))
+        .await
+        .expect("persist unpaid mint quote");
+
+    let restarted = RateQuoteControlHandle::with_store_and_buffer_bps(dyn_store, 100);
+    restarted
+        .load_persisted()
+        .await
+        .expect("restore active reservation");
+    let processor2 = processor(30, store, restarted, 120);
+    processor2
+        .create_incoming_payment_request(mint_quote(301))
+        .await
+        .expect_err("pending quote must retain its cap reservation after restart");
+    processor2
+        .create_incoming_payment_request(mint_quote(300))
+        .await
+        .expect("remaining headroom stays available");
+}
+
+#[tokio::test]
 async fn forced_melt_failure_keeps_outstanding_and_returns_failed_status() {
     // ADR-023 Melt-Path Staleness (WS6 verification duty): a forced USD melt
     // LN payment failure must surface the failed status unchanged and leave

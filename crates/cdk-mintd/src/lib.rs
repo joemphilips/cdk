@@ -2731,6 +2731,8 @@ pub async fn run_mintd_with_shutdown(
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     routers: Vec<Router>,
 ) -> Result<()> {
+    validate_settings(settings)?;
+
     let (localstore, keystore, kv, _configuration_store) =
         initial_setup(work_dir, settings, db_password.clone()).await?;
 
@@ -5667,6 +5669,133 @@ backend = "fakewallet"
         .expect("config with env port override should load");
 
         assert_eq!(settings.info.listen_port, 9090);
+    }
+
+    fn configured_sources(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[cfg(feature = "fakewallet")]
+    fn active_rate_quoter_settings() -> config::Settings {
+        use crate::config::{FakeWallet, Ln, LnBackend};
+
+        config::Settings {
+            info: config::Info {
+                mnemonic: Some(TEST_MNEMONIC.to_string()),
+                ..Default::default()
+            },
+            ln: vec![Ln {
+                ln_backend: LnBackend::FakeWallet,
+                unit: CurrencyUnit::Sat,
+                ..Default::default()
+            }],
+            fake_wallet: Some(FakeWallet::default()),
+            rate_quoter: Some(config::RateQuoter {
+                units: vec![CurrencyUnit::Usd],
+                buffer_bps: 100,
+                per_unit_caps: HashMap::from([(CurrencyUnit::Usd, 100)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn validate_settings_rejects_invalid_active_rate_source() {
+        let mut settings = active_rate_quoter_settings();
+        settings.rate_quoter.as_mut().expect("rate quoter").sources =
+            configured_sources(&["coinbase-pro"]);
+
+        let error = validate_settings(&settings)
+            .expect_err("static provider validation must run before mint startup");
+
+        assert!(error.to_string().contains("Unsupported rate_quoter source"));
+    }
+
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn validate_settings_rejects_invalid_active_rate_quorum() {
+        let mut settings = active_rate_quoter_settings();
+        let rate_quoter = settings.rate_quoter.as_mut().expect("rate quoter");
+        rate_quoter.sources = configured_sources(&["coinbase", "kraken"]);
+        rate_quoter.min_fetched = 3;
+
+        let error = validate_settings(&settings)
+            .expect_err("static quorum validation must run before mint startup");
+
+        assert!(error
+            .to_string()
+            .contains("cannot exceed the distinct provider count"));
+    }
+
+    #[test]
+    fn rate_quoter_canonicalizes_supported_provider_aliases() {
+        let providers = configured_rate_oracle_providers(&configured_sources(&[
+            "Coinbase", "KRAKEN", "bitstamp",
+        ]))
+        .expect("mixed-case aliases");
+
+        assert_eq!(providers, RateOracleProvider::ALL);
+        assert_eq!(
+            configured_rate_oracle_providers(&[]).expect("default providers"),
+            RateOracleProvider::ALL
+        );
+    }
+
+    #[test]
+    fn rate_quoter_rejects_urls_duplicates_ambiguous_and_inexact_sources() {
+        for (sources, expected) in [
+            (
+                configured_sources(&["https://api.coinbase.com"]),
+                "URLs are not supported",
+            ),
+            (
+                configured_sources(&["coinbase", "CoinBase"]),
+                "Duplicate rate_quoter provider",
+            ),
+            (
+                configured_sources(&["coinbase-kraken"]),
+                "Ambiguous rate_quoter source",
+            ),
+            (configured_sources(&[" coinbase"]), "surrounding whitespace"),
+            (
+                configured_sources(&["coinbase-pro"]),
+                "Unsupported rate_quoter source",
+            ),
+        ] {
+            let error = configured_rate_oracle_providers(&sources)
+                .expect_err("invalid provider configuration must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_quoter_quorum_must_fit_distinct_provider_count() {
+        for (min_fetched, min_survived, expected) in [
+            (0, 0, "at least 1"),
+            (3, 0, "at least 1"),
+            (2, 3, "cannot exceed rate_quoter.min_fetched"),
+            (4, 3, "cannot exceed the distinct provider count"),
+        ] {
+            let rate_quoter = config::RateQuoter {
+                min_fetched,
+                min_survived,
+                ..Default::default()
+            };
+            let error =
+                validate_rate_quoter_quorum(&rate_quoter, 3).expect_err("invalid quorum must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
+
+        validate_rate_quoter_quorum(&config::RateQuoter::default(), 3)
+            .expect("default 3/2 quorum over three providers");
     }
 
     fn rate_quoter_with_usd_cap(buffer_bps: u64, cap: u64) -> config::RateQuoter {

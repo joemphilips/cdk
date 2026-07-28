@@ -7,8 +7,8 @@ use cdk_common::database::Error;
 use cdk_common::nuts::CurrencyUnit;
 use cdk_common::payment::PaymentIdentifier;
 use cdk_exchange_rate::{
-    ParkedPaymentRecord, RateQuoteRecord, RateQuoteSettlement, RateQuoteSide, RateQuoteStore,
-    RateQuoteStoreError, UnitControlRecord,
+    ActiveMintReservation, ParkedPaymentRecord, RateQuoteRecord, RateQuoteSettlement,
+    RateQuoteSide, RateQuoteStore, RateQuoteStoreError, UnitControlRecord,
 };
 use cdk_sql_common::pool::Pool;
 use cdk_sql_common::stmt::query;
@@ -61,6 +61,15 @@ SELECT payment_lookup_id, fiat_unit, fiat_subunits, fiat_fee_subunits, snapshot_
 FROM rate_quote_terms
 WHERE payment_lookup_id = :payment_lookup_id
 FOR UPDATE
+"#;
+
+const SELECT_ACTIVE_MINT_RESERVATIONS_SQL: &str = r#"
+SELECT payment_lookup_id, fiat_unit, fiat_subunits, expiry_unix
+FROM rate_quote_terms
+WHERE side = 'mint'
+  AND settled = 0
+  AND expiry_unix > :now_unix
+ORDER BY payment_lookup_id
 "#;
 
 const INSERT_PARKED_SQL: &str = r#"
@@ -413,6 +422,22 @@ impl RateQuoteStore for PostgresRateQuoteStore {
         rows.into_iter().map(row_to_unit_control).collect()
     }
 
+    async fn load_active_mint_reservations(
+        &self,
+        now_unix: u64,
+    ) -> Result<Vec<ActiveMintReservation>, RateQuoteStoreError> {
+        let conn = self.conn().await?;
+        let rows = query(SELECT_ACTIVE_MINT_RESERVATIONS_SQL)
+            .map_err(storage_error)?
+            .bind("now_unix", checked_i64(now_unix, "now_unix")?)
+            .fetch_all(&*conn)
+            .await
+            .map_err(storage_error)?;
+        rows.into_iter()
+            .map(|row| row_to_active_mint_reservation(row, now_unix))
+            .collect()
+    }
+
     async fn set_unit_quote_state(
         &self,
         unit: &CurrencyUnit,
@@ -597,6 +622,29 @@ fn row_to_unit_control(
     })
 }
 
+fn row_to_active_mint_reservation(
+    row: Vec<cdk_sql_common::stmt::Column>,
+    now_unix: u64,
+) -> Result<ActiveMintReservation, RateQuoteStoreError> {
+    if row.len() != 4 {
+        return Err(RateQuoteStoreError::Storage(format!(
+            "active mint reservation row had {} columns, expected 4",
+            row.len()
+        )));
+    }
+    let payment_lookup_id = PaymentIdentifier::CustomId(text_col(&row[0])?);
+    let fiat_unit = text_col(&row[1])?
+        .parse::<CurrencyUnit>()
+        .map_err(storage_error)?;
+    ActiveMintReservation::new(
+        payment_lookup_id,
+        fiat_unit,
+        int_col(&row[2])?,
+        int_col(&row[3])?,
+        now_unix,
+    )
+}
+
 fn checked_i64(value: u64, column: &str) -> Result<i64, RateQuoteStoreError> {
     i64::try_from(value).map_err(|_| {
         RateQuoteStoreError::Storage(format!("{column} value {value} exceeds postgres BIGINT"))
@@ -626,6 +674,8 @@ fn int_col(value: &cdk_sql_common::stmt::Column) -> Result<u64, RateQuoteStoreEr
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use cdk_sql_common::value::Value;
 
     use super::*;
 
@@ -672,6 +722,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_mint_reservation_query_uses_authoritative_filters() {
+        let sql = SELECT_ACTIVE_MINT_RESERVATIONS_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(sql.contains("WHERE side = 'mint' AND settled = 0 AND expiry_unix > :now_unix"));
+        assert!(sql.ends_with("ORDER BY payment_lookup_id"));
+        assert!(!sql.contains("expiry_unix >= :now_unix"));
+    }
+
+    #[test]
+    fn active_mint_reservation_decoder_enforces_shape_types_and_expiry() {
+        let row = vec![
+            Value::Text("lookup".to_string()),
+            Value::Text("usd".to_string()),
+            Value::Integer(100),
+            Value::Integer(101),
+        ];
+        let reservation =
+            row_to_active_mint_reservation(row.clone(), 100).expect("valid projection row");
+        assert_eq!(
+            reservation.payment_lookup_id,
+            PaymentIdentifier::CustomId("lookup".to_string())
+        );
+        assert_eq!(reservation.fiat_unit, CurrencyUnit::Usd);
+        assert_eq!(reservation.fiat_subunits, 100);
+        assert_eq!(reservation.expiry_unix, 101);
+
+        assert!(row_to_active_mint_reservation(row[..3].to_vec(), 100).is_err());
+        assert!(row_to_active_mint_reservation(
+            vec![
+                Value::Text("lookup".to_string()),
+                Value::Text("usd".to_string()),
+                Value::Integer(-1),
+                Value::Integer(101),
+            ],
+            100,
+        )
+        .is_err());
+        assert!(row_to_active_mint_reservation(row, 101).is_err());
+    }
+
     #[tokio::test]
     async fn quote_terms_round_trip() {
         let store = store("round_trip").await;
@@ -699,6 +793,44 @@ mod tests {
 
         assert_eq!(loaded_mint, mint_record);
         assert_eq!(loaded_melt, melt_record);
+    }
+
+    #[tokio::test]
+    async fn active_mint_reservations_filter_side_settlement_and_expiry() {
+        let store = store("active_reservations").await;
+        let now_unix = 100;
+        let mut active = record("active", RateQuoteSide::Mint);
+        active.expiry_unix = now_unix + 1;
+        let mut expired = record("expired", RateQuoteSide::Mint);
+        expired.expiry_unix = now_unix;
+        let mut melt = record("melt", RateQuoteSide::Melt);
+        melt.expiry_unix = now_unix + 1;
+        let mut settled = record("settled", RateQuoteSide::Mint);
+        settled.expiry_unix = now_unix + 1;
+
+        for record in [active.clone(), expired, melt, settled.clone()] {
+            store.insert(record).await.expect("insert quote terms");
+        }
+        store
+            .mark_settled(&settled.payment_lookup_id)
+            .await
+            .expect("mark settled");
+
+        let reservations = store
+            .load_active_mint_reservations(now_unix)
+            .await
+            .expect("load active reservations");
+        assert_eq!(
+            reservations,
+            vec![ActiveMintReservation::new(
+                active.payment_lookup_id,
+                active.fiat_unit,
+                active.fiat_subunits,
+                active.expiry_unix,
+                now_unix,
+            )
+            .expect("active projection")]
+        );
     }
 
     #[tokio::test]

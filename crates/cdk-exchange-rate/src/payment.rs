@@ -20,8 +20,8 @@ use tokio::sync::Mutex;
 use crate::msat_converter::{validate_incoming_responses, validate_outgoing_response};
 use crate::oracle::RateOracle;
 use crate::store::{
-    DynRateQuoteStore, ParkedPaymentRecord, RateQuoteRecord, RateQuoteSettlement, RateQuoteSide,
-    RateQuoteStoreError,
+    ActiveMintReservation, DynRateQuoteStore, ParkedPaymentRecord, RateQuoteRecord,
+    RateQuoteSettlement, RateQuoteSide, RateQuoteStoreError, UnitControlRecord,
 };
 use crate::types::{fiat_subunit_scale, RateOracleError, RateSnapshot};
 
@@ -185,6 +185,53 @@ impl UnitControlState {
     }
 }
 
+fn restored_unit_states(
+    controls: Vec<UnitControlRecord>,
+    reservations: Vec<ActiveMintReservation>,
+) -> Result<(HashMap<CurrencyUnit, UnitControlState>, Vec<CurrencyUnit>), RateQuoteStoreError> {
+    let mut units = HashMap::with_capacity(controls.len());
+    let mut loaded = Vec::with_capacity(controls.len());
+    for control in controls {
+        let unit = control.unit.clone();
+        let state = UnitControlState {
+            quote_state: UnitQuoteState {
+                mint_paused: control.mint_paused,
+                melt_paused: control.melt_paused,
+            },
+            cap: control.cap,
+            outstanding: control.outstanding,
+            buffer_surplus_sats: control.buffer_surplus_sats,
+            reservations: HashMap::new(),
+        };
+        if units.insert(unit.clone(), state).is_some() {
+            return Err(RateQuoteStoreError::Storage(format!(
+                "duplicate persisted unit control for {unit}"
+            )));
+        }
+        loaded.push(unit);
+    }
+    for reservation in reservations {
+        let key = reservation.payment_lookup_id.to_string();
+        let state = units.entry(reservation.fiat_unit).or_default();
+        if state
+            .reservations
+            .insert(
+                key.clone(),
+                Reservation {
+                    fiat_subunits: reservation.fiat_subunits,
+                    expiry_unix: reservation.expiry_unix,
+                },
+            )
+            .is_some()
+        {
+            return Err(RateQuoteStoreError::Storage(format!(
+                "duplicate active mint reservation for {key}"
+            )));
+        }
+    }
+    Ok((units, loaded))
+}
+
 /// Shared control handle used by the decorator and management RPC.
 ///
 /// Pause flags, the issuance cap, the outstanding issued counter, and the
@@ -248,27 +295,20 @@ impl RateQuoteControlHandle {
         self.buffer_bps.load(Ordering::Relaxed)
     }
 
-    /// Load persisted unit-control state into memory. Returns the units that
-    /// had a persisted record so callers can seed config defaults for the
-    /// rest without overwriting operator-set values.
+    /// Load persisted controls and active mint reservations before traffic.
+    /// The current deployment starts one replica, so no distributed admission
+    /// protocol is required around this startup snapshot.
+    ///
+    /// Returns units with persisted control records so callers can seed config
+    /// defaults for the rest without overwriting operator-set values.
     pub async fn load_persisted(&self) -> Result<Vec<CurrencyUnit>, RateQuoteStoreError> {
         let Some(store) = &self.store else {
             return Ok(Vec::new());
         };
-        let records = store.load_unit_controls().await?;
-        let mut units = self.units.lock().await;
-        let mut loaded = Vec::with_capacity(records.len());
-        for record in records {
-            let state = units.entry(record.unit.clone()).or_default();
-            state.quote_state = UnitQuoteState {
-                mint_paused: record.mint_paused,
-                melt_paused: record.melt_paused,
-            };
-            state.cap = record.cap;
-            state.outstanding = record.outstanding;
-            state.buffer_surplus_sats = record.buffer_surplus_sats;
-            loaded.push(record.unit);
-        }
+        let controls = store.load_unit_controls().await?;
+        let reservations = store.load_active_mint_reservations(unix_time()).await?;
+        let (restored, loaded) = restored_unit_states(controls, reservations)?;
+        *self.units.lock().await = restored;
         Ok(loaded)
     }
 
@@ -1451,6 +1491,7 @@ mod tests {
 
     use super::*;
     use crate::types::{AggregationMeta, SourceReading};
+    use crate::{InMemoryRateQuoteStore, RateQuoteStore};
 
     fn stored_record(side: RateQuoteSide, unit: CurrencyUnit) -> RateQuoteRecord {
         RateQuoteRecord {
@@ -1464,6 +1505,18 @@ mod tests {
             sats_unbuffered: 1_000,
             expiry_unix: 42,
         }
+    }
+
+    fn active_mint_record(
+        lookup_id: &str,
+        fiat_subunits: u64,
+        expiry_unix: u64,
+    ) -> RateQuoteRecord {
+        let mut record = stored_record(RateQuoteSide::Mint, CurrencyUnit::Usd);
+        record.payment_lookup_id = PaymentIdentifier::CustomId(lookup_id.to_string());
+        record.fiat_subunits = fiat_subunits;
+        record.expiry_unix = expiry_unix;
+        record
     }
 
     #[test]
@@ -1685,5 +1738,82 @@ mod tests {
 
         control.commit_melted(&CurrencyUnit::Usd, 30).await;
         assert_eq!(control.outstanding(&CurrencyUnit::Usd).await, 70);
+    }
+
+    #[tokio::test]
+    async fn load_persisted_restores_and_idempotently_replaces_active_reservations() {
+        let store = InMemoryRateQuoteStore::new();
+        let dyn_store: DynRateQuoteStore = Arc::new(store.clone());
+        let configured = RateQuoteControlHandle::with_store_and_buffer_bps(dyn_store.clone(), 100);
+        configured
+            .set_unit_issuance_cap(CurrencyUnit::Usd, 100)
+            .await
+            .expect("persist cap");
+        store
+            .insert(active_mint_record("active", 80, unix_time() + 60))
+            .await
+            .expect("persist active mint quote");
+
+        let restarted = RateQuoteControlHandle::with_store_and_buffer_bps(dyn_store.clone(), 100);
+        let loaded = restarted.load_persisted().await.expect("first load");
+        assert_eq!(loaded, vec![CurrencyUnit::Usd]);
+        let error = restarted
+            .reserve(&CurrencyUnit::Usd, "too-large", 21, unix_time() + 60)
+            .await
+            .expect_err("restored reservation must consume cap");
+        assert!(matches!(
+            error,
+            RateConvertingPaymentError::IssuanceCapExceeded { available: 20, .. }
+        ));
+
+        restarted
+            .reserve(&CurrencyUnit::Usd, "ephemeral", 20, unix_time() + 60)
+            .await
+            .expect("use remaining cap");
+        restarted
+            .load_persisted()
+            .await
+            .expect("repeat load replaces runtime map");
+        restarted
+            .reserve(&CurrencyUnit::Usd, "after-reload", 20, unix_time() + 60)
+            .await
+            .expect("ephemeral reservation must not be appended forever");
+        restarted
+            .reserve(&CurrencyUnit::Usd, "over-cap", 1, unix_time() + 60)
+            .await
+            .expect_err("restored plus new reservation reaches cap");
+    }
+
+    #[tokio::test]
+    async fn failed_reservation_reload_leaves_runtime_state_unchanged() {
+        let store = InMemoryRateQuoteStore::new();
+        let dyn_store: DynRateQuoteStore = Arc::new(store.clone());
+        let control = RateQuoteControlHandle::with_store_and_buffer_bps(dyn_store, 100);
+        control
+            .set_unit_issuance_cap(CurrencyUnit::Usd, 100)
+            .await
+            .expect("persist cap");
+        control
+            .reserve(&CurrencyUnit::Usd, "existing", 40, unix_time() + 60)
+            .await
+            .expect("seed runtime reservation");
+        store
+            .insert(active_mint_record("durable", 80, unix_time() + 60))
+            .await
+            .expect("persist active mint quote");
+        store.fail_next_active_reservations_load().await;
+
+        control
+            .load_persisted()
+            .await
+            .expect_err("forced reservation projection failure");
+        let error = control
+            .reserve(&CurrencyUnit::Usd, "would-exceed", 61, unix_time() + 60)
+            .await
+            .expect_err("failed reload must not clear the existing reservation");
+        assert!(matches!(
+            error,
+            RateConvertingPaymentError::IssuanceCapExceeded { available: 60, .. }
+        ));
     }
 }
