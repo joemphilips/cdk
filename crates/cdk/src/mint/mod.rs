@@ -7,12 +7,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "conditional-tokens")]
 use std::sync::Mutex as StdMutex;
+#[cfg(feature = "conditional-tokens")]
+use std::sync::Weak;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use cdk_common::common::{PaymentProcessorKey, QuoteTTL};
 use cdk_common::database::mint::Acquired;
 use cdk_common::database::{self, DynMintAuthDatabase, DynMintDatabase};
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::nuts::nut_ctf::settlement::CanonicalHash;
 use cdk_common::nuts::{BlindSignature, BlindedMessage, CurrencyUnit, Id};
 use cdk_common::payment::{DynMintPayment, WaitPaymentResponse};
 pub use cdk_common::quote_id::QuoteId;
@@ -23,7 +27,7 @@ use cdk_signatory::signatory::{Signatory, SignatoryKeySet, SignatoryKeysets};
 use futures::{Stream, StreamExt};
 use nut21::ProtectedEndpoint;
 use subscription::PubSubManager;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{watch, Mutex, Notify, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::instrument;
 
@@ -48,6 +52,8 @@ mod proofs;
 mod redeem_outcome;
 mod saga_recovery;
 #[cfg(feature = "conditional-tokens")]
+mod settlement;
+#[cfg(feature = "conditional-tokens")]
 mod split_merge;
 mod start_up_check;
 mod subscription;
@@ -65,6 +71,8 @@ pub use cdk_common::mint::{MeltQuote, MintKeySetInfo, MintQuote};
 pub use cdk_common::mint_quote::{MintQuoteRequest, MintQuoteResponse};
 pub use issue::MintInput;
 pub use melt::PendingMelt;
+#[cfg(feature = "conditional-tokens")]
+pub use settlement::CtfSettlementError;
 pub use verification::Verification;
 
 const CDK_MINT_PRIMARY_NAMESPACE: &str = "cdk_mint";
@@ -91,13 +99,15 @@ pub struct Mint {
     oidc_client: Option<OidcClient>,
     /// In-memory keyset
     keysets: Arc<ArcSwap<Vec<SignatoryKeySet>>>,
-    /// Serializes writes to `keysets`.
+    /// Pins or replaces the authoritative `keysets` snapshot.
     ///
     /// Both a mint-initiated `rotate_keyset` and the signatory subscription
     /// drain task replace the snapshot. Holding this lock across "read the
     /// freshest signatory snapshot, then store it" makes the last write always
     /// the newest one, so a stale snapshot can never overwrite a newer one.
-    keyset_store_lock: Arc<Mutex<()>>,
+    /// Multi-party settlement holds a shared guard from lifecycle validation
+    /// through commit, while rotations take the exclusive guard.
+    keyset_store_lock: Arc<RwLock<()>>,
     /// Background task management
     task_state: Arc<Mutex<TaskState>>,
     /// Maximum number of inputs allowed per transaction
@@ -110,6 +120,9 @@ pub struct Mint {
     /// Inputs currently being prepared for atomic CTF conversion.
     #[cfg(feature = "conditional-tokens")]
     ctf_input_reservations: Arc<StdMutex<HashSet<PublicKey>>>,
+    /// Digest-scoped singleflight gates for identical CTF settlement retries.
+    #[cfg(feature = "conditional-tokens")]
+    ctf_settlement_flights: Arc<StdMutex<HashMap<CanonicalHash, Weak<tokio::sync::Mutex<()>>>>>,
     /// Deterministic pre-transaction pause for atomic CTF race tests.
     #[cfg(all(test, feature = "conditional-tokens"))]
     atomic_ctf_test_pause: Arc<swap::atomic::AtomicCtfTestPause>,
@@ -409,7 +422,7 @@ impl Mint {
             payment_processors,
             auth_localstore,
             keysets: Arc::new(ArcSwap::new(keysets.keysets.into())),
-            keyset_store_lock: Arc::new(Mutex::new(())),
+            keyset_store_lock: Arc::new(RwLock::new(())),
             task_state: Arc::new(Mutex::new(TaskState {
                 keyset_updates: Some(keyset_updates),
                 ..Default::default()
@@ -420,6 +433,8 @@ impl Mint {
             max_outcomes_per_condition,
             #[cfg(feature = "conditional-tokens")]
             ctf_input_reservations: Arc::new(StdMutex::new(HashSet::new())),
+            #[cfg(feature = "conditional-tokens")]
+            ctf_settlement_flights: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(all(test, feature = "conditional-tokens"))]
             atomic_ctf_test_pause: Arc::new(swap::atomic::AtomicCtfTestPause::default()),
             #[cfg(test)]
@@ -530,7 +545,7 @@ impl Mint {
             Some(rx) => Some(rx),
             None => match self.signatory.subscribe_keysets().await {
                 Ok(mut rx) => {
-                    let _store = self.keyset_store_lock.lock().await;
+                    let _store = self.keyset_store_lock.write().await;
                     let current = rx.borrow_and_update().keysets.clone();
                     if !current.is_empty() {
                         self.keysets.store(Arc::new(current));
@@ -571,7 +586,7 @@ impl Mint {
                             // freshest snapshot and store it under the lock, so a
                             // concurrent rotate cannot land a stale snapshot after
                             // this newer one.
-                            let _store = keyset_store_lock.lock().await;
+                            let _store = keyset_store_lock.write().await;
                             let updated =
                                 keyset_updates.borrow_and_update().keysets.clone();
                             if updated.is_empty() {

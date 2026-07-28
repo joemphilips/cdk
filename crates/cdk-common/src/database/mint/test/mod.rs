@@ -272,6 +272,7 @@ macro_rules! mint_db_conditional_test {
             add_and_get_conditional_keyset_info,
             get_conditional_keysets_multiple,
             get_conditional_keyset_infos_preserve_rotated_rows,
+            ctf_settlement_replay_round_trip,
             get_condition_for_keyset,
             get_condition_for_keyset_nonexistent,
             get_conditions_limit,

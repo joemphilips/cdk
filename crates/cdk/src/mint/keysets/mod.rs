@@ -102,6 +102,7 @@ impl Mint {
         use_keyset_v2: bool,
         final_expiry: Option<u64>,
     ) -> Result<MintKeySetInfo, Error> {
+        let _store = self.keyset_store_lock.write().await;
         let result = self
             .signatory
             .rotate_keyset(RotateKeyArguments {
@@ -121,7 +122,6 @@ impl Mint {
         // subscription drain task writes the same ArcSwap; serializing the
         // read-then-store here keeps the last write the newest one, so a
         // concurrent rotation's snapshot can never be clobbered by a stale read.
-        let _store = self.keyset_store_lock.lock().await;
         let new_keyset = self.signatory.keysets().await?;
         self.keysets.store(new_keyset.keysets.into());
 

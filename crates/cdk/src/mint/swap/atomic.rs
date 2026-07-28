@@ -1,6 +1,8 @@
 #[cfg(feature = "conditional-tokens")]
 use std::collections::HashSet;
 #[cfg(feature = "conditional-tokens")]
+use std::ops::Range;
+#[cfg(feature = "conditional-tokens")]
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cdk_common::database::mint::Acquired;
@@ -14,6 +16,8 @@ use uuid::Uuid;
 use super::super::conditions::STATUS_PENDING;
 use super::super::{Mint, Verification};
 use crate::fees::ProofsFeeBreakdown;
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse};
 
 /// Controls how preparation verifies a swap's balance.
 pub(super) enum BalanceCheck {
@@ -66,6 +70,43 @@ impl PreparedAtomicCtf {
             .collect();
         Ok(Self {
             swap,
+            signatures,
+            input_ys,
+            blinded_secrets,
+            _input_reservation: input_reservation,
+        })
+    }
+
+    async fn from_verified_settlement(
+        mint: &Mint,
+        input_proofs: &Proofs,
+        blinded_messages: &[BlindedMessage],
+        input_verification: Verification,
+        output_verification: Verification,
+        fee_breakdown: ProofsFeeBreakdown,
+    ) -> Result<Self, Error> {
+        let input_ys = canonical_input_ys(input_proofs)?;
+        let input_reservation = CtfInputReservation::acquire(mint, input_ys.clone())?;
+        reject_persisted_inputs(mint, &input_ys).await?;
+        let operation = Operation::new(
+            Uuid::now_v7(),
+            OperationKind::Swap,
+            output_verification.amount.into(),
+            input_verification.amount.into(),
+            fee_breakdown.total,
+            None,
+            None,
+        );
+        let signatures = mint.blind_sign(blinded_messages.to_vec()).await?;
+        let blinded_secrets = blinded_messages
+            .iter()
+            .map(|message| message.blinded_secret)
+            .collect();
+        Ok(Self {
+            swap: PreparedSwap {
+                operation,
+                fee_breakdown,
+            },
             signatures,
             input_ys,
             blinded_secrets,
@@ -291,6 +332,110 @@ pub(in crate::mint) async fn execute_atomic_ctf_convert(
     Ok(prepared.signatures)
 }
 
+/// Prepare, sign, and atomically persist one multi-party CTF settlement.
+#[cfg(feature = "conditional-tokens")]
+pub(in crate::mint) async fn execute_atomic_ctf_settlement(
+    mint: &Mint,
+    condition_id: &str,
+    request_digest: CanonicalHash,
+    input_proofs: &Proofs,
+    blinded_messages: &[BlindedMessage],
+    participant_output_ranges: &[Range<usize>],
+    input_verification: Verification,
+    output_verification: Verification,
+    fee_breakdown: ProofsFeeBreakdown,
+) -> Result<CtfSettlementResponse, Error> {
+    if let Some(response) = mint
+        .localstore()
+        .get_ctf_settlement_replay(request_digest)
+        .await?
+    {
+        return Ok(response);
+    }
+
+    let canonical_inputs = canonical_input_proofs(input_proofs)?;
+    let prepared = PreparedAtomicCtf::from_verified_settlement(
+        mint,
+        &canonical_inputs,
+        blinded_messages,
+        input_verification,
+        output_verification,
+        fee_breakdown,
+    )
+    .await?;
+    let response = grouped_settlement_response(&prepared.signatures, participant_output_ranges)?;
+    #[cfg(test)]
+    mint.atomic_ctf_test_pause.pause_if_armed().await;
+
+    finish_atomic_ctf_settlement(
+        mint,
+        condition_id,
+        request_digest,
+        &canonical_inputs,
+        blinded_messages,
+        prepared,
+        response,
+    )
+    .await
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn finish_atomic_ctf_settlement(
+    mint: &Mint,
+    condition_id: &str,
+    request_digest: CanonicalHash,
+    input_proofs: &Proofs,
+    blinded_messages: &[BlindedMessage],
+    prepared: PreparedAtomicCtf,
+    response: CtfSettlementResponse,
+) -> Result<CtfSettlementResponse, Error> {
+    let mut tx = mint.localstore().begin_transaction().await?;
+    let outcome = persist_atomic_ctf_settlement_transaction(
+        &mut tx,
+        AtomicCtfCommit {
+            condition_id,
+            input_proofs,
+            blinded_messages,
+            blinded_secrets: &prepared.blinded_secrets,
+            signatures: &prepared.signatures,
+            prepared: &prepared.swap,
+        },
+        request_digest,
+        &response,
+    )
+    .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(error);
+        }
+    };
+    tx.commit().await?;
+
+    if matches!(&outcome, AtomicSettlementOutcome::Committed) {
+        let pubsub = mint.pubsub_manager();
+        for y in prepared.input_ys {
+            pubsub.proof_state((y, State::Spent));
+        }
+    }
+    Ok(match outcome {
+        AtomicSettlementOutcome::Committed => response,
+        AtomicSettlementOutcome::Replayed(response) => response,
+    })
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn canonical_input_proofs(input_proofs: &Proofs) -> Result<Proofs, Error> {
+    let mut keyed = input_proofs
+        .iter()
+        .cloned()
+        .map(|proof| Ok((proof.y()?.to_bytes(), proof)))
+        .collect::<Result<Vec<_>, Error>>()?;
+    keyed.sort_unstable_by_key(|entry| entry.0);
+    Ok(keyed.into_iter().map(|(_, proof)| proof).collect())
+}
+
 #[cfg(feature = "conditional-tokens")]
 struct AtomicCtfCommit<'a> {
     condition_id: &'a str,
@@ -306,14 +451,15 @@ async fn persist_atomic_ctf_transaction(
     tx: &mut DynMintTransaction,
     commit: AtomicCtfCommit<'_>,
 ) -> Result<(), Error> {
-    let condition = tx
-        .get_condition_for_update(commit.condition_id)
-        .await?
-        .ok_or(Error::ConditionNotFound)?;
-    if condition.attestation_status != STATUS_PENDING {
-        return Err(Error::ConvertNotPermitted);
-    }
+    acquire_pending_condition(tx, commit.condition_id).await?;
+    persist_atomic_ctf_body(tx, commit).await
+}
 
+#[cfg(feature = "conditional-tokens")]
+async fn persist_atomic_ctf_body(
+    tx: &mut DynMintTransaction,
+    commit: AtomicCtfCommit<'_>,
+) -> Result<(), Error> {
     let mut input_proofs = tx
         .add_proofs(
             commit.input_proofs.clone(),
@@ -334,6 +480,82 @@ async fn persist_atomic_ctf_transaction(
         &commit.prepared.fee_breakdown,
     )
     .await
+}
+
+#[cfg(feature = "conditional-tokens")]
+enum AtomicSettlementOutcome {
+    Committed,
+    Replayed(CtfSettlementResponse),
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn persist_atomic_ctf_settlement_transaction(
+    tx: &mut DynMintTransaction,
+    commit: AtomicCtfCommit<'_>,
+    request_digest: CanonicalHash,
+    response: &CtfSettlementResponse,
+) -> Result<AtomicSettlementOutcome, Error> {
+    if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
+        return Ok(AtomicSettlementOutcome::Replayed(replay));
+    }
+
+    let condition = tx
+        .get_condition_for_update(commit.condition_id)
+        .await?
+        .ok_or(Error::ConditionNotFound)?;
+    if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
+        return Ok(AtomicSettlementOutcome::Replayed(replay));
+    }
+    if condition.attestation_status != STATUS_PENDING {
+        return Err(Error::ConvertNotPermitted);
+    }
+
+    let operation_id = *commit.prepared.operation.id();
+    persist_atomic_ctf_body(tx, commit).await?;
+    fail_if_requested("ADD_CTF_SETTLEMENT_REPLAY")?;
+    tx.add_ctf_settlement_replay(request_digest, &operation_id, response)
+        .await?;
+    Ok(AtomicSettlementOutcome::Committed)
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn acquire_pending_condition(
+    tx: &mut DynMintTransaction,
+    condition_id: &str,
+) -> Result<(), Error> {
+    let condition = tx
+        .get_condition_for_update(condition_id)
+        .await?
+        .ok_or(Error::ConditionNotFound)?;
+    if condition.attestation_status != STATUS_PENDING {
+        return Err(Error::ConvertNotPermitted);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn grouped_settlement_response(
+    signatures: &[BlindSignature],
+    ranges: &[Range<usize>],
+) -> Result<CtfSettlementResponse, Error> {
+    let grouped = ranges
+        .iter()
+        .map(|range| {
+            signatures
+                .get(range.clone())
+                .map(<[BlindSignature]>::to_vec)
+                .ok_or(Error::Internal)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if ranges
+        .last()
+        .is_none_or(|range| range.end != signatures.len())
+    {
+        return Err(Error::Internal);
+    }
+    Ok(CtfSettlementResponse {
+        signatures: grouped,
+    })
 }
 
 #[cfg(feature = "conditional-tokens")]

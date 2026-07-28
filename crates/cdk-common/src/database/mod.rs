@@ -16,6 +16,11 @@ pub use kvstore::{
 /// Arc-wrapped KV store for shared ownership
 pub type DynKVStore = std::sync::Arc<dyn KVStore<Err = Error> + Send + Sync>;
 
+#[cfg(all(feature = "mint", feature = "conditional-tokens"))]
+pub use mint::{
+    CtfSettlementReplayDatabase as MintCtfSettlementReplayDatabase,
+    CtfSettlementReplayTransaction as MintCtfSettlementReplayTransaction,
+};
 #[cfg(feature = "mint")]
 pub use mint::{
     Database as MintDatabase, DynMintDatabase, DynMintTransaction,

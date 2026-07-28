@@ -5,8 +5,12 @@ use std::str::FromStr;
 use bitcoin::bip32::DerivationPath;
 use cashu::{CurrencyUnit, Id};
 
-use crate::database::mint::{ConditionsDatabase, Database, Error, KeysDatabase};
-use crate::mint::{MintKeySetInfo, StoredCondition};
+use crate::database::mint::{
+    ConditionsDatabase, CtfSettlementReplayDatabase, Database, Error, KeysDatabase,
+};
+use crate::mint::{MintKeySetInfo, Operation, StoredCondition};
+use crate::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse};
+use crate::Amount;
 
 /// Build a minimal conditional keyset info for tests. The amounts/derivation_path
 /// values are arbitrary but syntactically valid.
@@ -260,6 +264,45 @@ where
         .unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active.get("YES"), Some(&new_id));
+}
+
+/// Test that a settlement response and its completed operation commit atomically.
+pub async fn ctf_settlement_replay_round_trip<DB>(db: DB)
+where
+    DB: Database<Error> + CtfSettlementReplayDatabase<Err = Error>,
+{
+    let digest = CanonicalHash::from_bytes([0x42; 32]);
+    let response = CtfSettlementResponse {
+        signatures: vec![Vec::new(), Vec::new()],
+    };
+    let operation = Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO);
+
+    let mut orphan = db.begin_transaction().await.unwrap();
+    assert!(orphan
+        .add_ctf_settlement_replay(digest, operation.id(), &response)
+        .await
+        .is_err());
+    orphan.rollback().await.unwrap();
+
+    let mut transaction = db.begin_transaction().await.unwrap();
+    transaction
+        .add_completed_operation(&operation, &std::collections::HashMap::new())
+        .await
+        .unwrap();
+    transaction
+        .add_ctf_settlement_replay(digest, operation.id(), &response)
+        .await
+        .unwrap();
+    assert_eq!(
+        transaction.get_ctf_settlement_replay(digest).await.unwrap(),
+        Some(response.clone())
+    );
+    transaction.commit().await.unwrap();
+
+    assert_eq!(
+        db.get_ctf_settlement_replay(digest).await.unwrap(),
+        Some(response)
+    );
 }
 
 /// Test get_condition_for_keyset lookup by keyset_id

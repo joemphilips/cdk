@@ -11,7 +11,11 @@ use cdk_common::amount::SplitTarget;
 use cdk_common::dhke::construct_proofs;
 use cdk_common::error::{ErrorCode, ErrorResponse};
 use cdk_common::nut00::KnownMethod;
-use cdk_common::nuts::nut_ctf::settlement::sign_pay_to_unlock_refund;
+use cdk_common::nuts::nut_ctf::settlement::{
+    ctf_receive_commitment, sign_pay_to_unlock_refund, CanonicalHash, CtfSettlementParticipant,
+    CtfSettlementRequest, NutCtfSettlementSettings, ParticipantMode, PoolEntry, PoolEntryRole,
+    PoolManifest, SelectionBitmap,
+};
 use cdk_common::nuts::nut_ctf::test_helpers::{
     create_digit_decomposition_announcement, create_multi_oracle_witness,
     create_numeric_oracle_witness, create_oracle_witness, create_test_announcement,
@@ -31,6 +35,7 @@ use cdk_common::{Amount, CurrencyUnit, State};
 use cdk_fake_wallet::FakeWallet;
 use tokio::time::{sleep, timeout};
 
+use crate::mint::settlement::CtfSettlementError;
 use crate::mint::{Mint, MintBuilder, MintMeltLimits, UnitConfig};
 use crate::test_helpers::mint::{clear_fail_for, mint_test_proofs, set_fail_for};
 use crate::types::{FeeReserve, QuoteTTL};
@@ -144,6 +149,16 @@ async fn register_test_condition_with_collateral(
 
 async fn create_test_mint_with_unit(unit: CurrencyUnit, input_fee_ppk: u64) -> Result<Mint, Error> {
     let db = Arc::new(cdk_sqlite::mint::memory::empty().await?);
+    let mnemonic = Mnemonic::generate(12).map_err(|e| Error::Custom(e.to_string()))?;
+    build_test_mint_with_unit(db, &mnemonic.to_seed_normalized(""), unit, input_fee_ppk).await
+}
+
+async fn build_test_mint_with_unit(
+    db: Arc<cdk_sqlite::mint::MintSqliteDatabase>,
+    seed: &[u8],
+    unit: CurrencyUnit,
+    input_fee_ppk: u64,
+) -> Result<Mint, Error> {
     let mut mint_builder = MintBuilder::new(db.clone());
 
     mint_builder.configure_unit(
@@ -175,13 +190,12 @@ async fn create_test_mint_with_unit(unit: CurrencyUnit, input_fee_ppk: u64) -> R
         )
         .await?;
 
-    let mnemonic = Mnemonic::generate(12).map_err(|e| Error::Custom(e.to_string()))?;
     let quote_ttl = QuoteTTL::new(10000, 10000);
     let mint = mint_builder
         .with_name("test mint".to_string())
         .with_description("test mint for unit tests".to_string())
         .with_urls(vec!["https://test-mint".to_string()])
-        .build_with_seed(db, &mnemonic.to_seed_normalized(""))
+        .build_with_seed(db, seed)
         .await?;
 
     mint.set_quote_ttl(quote_ttl).await?;
@@ -300,6 +314,275 @@ fn create_premint(
     .unwrap();
     let blinded_messages = pre_mint.blinded_messages().to_vec();
     (blinded_messages, pre_mint)
+}
+
+const SETTLEMENT_REFUND_KEY: &str =
+    "194603ffa36356f4a56b7df9371fc3192472351453ec7398b8da8117e7c3e104";
+
+struct StandardSettlementFixture {
+    request: CtfSettlementRequest,
+    output_only_keyset: Id,
+    input_ys: Vec<cdk_common::PublicKey>,
+    output_points: Vec<cdk_common::PublicKey>,
+}
+
+async fn standard_settlement_fixture(mint: &Mint, now: u64) -> StandardSettlementFixture {
+    let regular_keyset = get_regular_keyset_id(mint);
+    let alice_source = mint_test_proofs_for_unit(mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let bob_source = mint_test_proofs_for_unit(mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+    let yes_keyset = *keysets.get("YES").unwrap();
+    let no_keyset = *keysets.get("NO").unwrap();
+    let (yes_outputs, _) = create_premint(mint, yes_keyset, Amount::from(15));
+    let (no_outputs, _) = create_premint(mint, no_keyset, Amount::from(15));
+    let expiry = now + 60;
+    let alice =
+        standard_settlement_participant(mint, alice_source, regular_keyset, yes_outputs, expiry, 1)
+            .await;
+    let bob =
+        standard_settlement_participant(mint, bob_source, regular_keyset, no_outputs, expiry, 2)
+            .await;
+    let mut participants = vec![alice, bob];
+    canonicalize_settlement_participants(&mut participants);
+    let (input_ys, output_points) = settlement_storage_keys(&participants);
+
+    StandardSettlementFixture {
+        request: CtfSettlementRequest {
+            condition_id: CanonicalHash::parse(&condition_id, "condition_id").unwrap(),
+            parent_collection_id: CanonicalHash::from_bytes([0; 32]),
+            participants,
+        },
+        output_only_keyset: yes_keyset,
+        input_ys,
+        output_points,
+    }
+}
+
+struct MixedPoolSettlementFixture {
+    request: CtfSettlementRequest,
+    input_ys: Vec<cdk_common::PublicKey>,
+    selected_output_points: Vec<cdk_common::PublicKey>,
+    unselected_output_points: Vec<cdk_common::PublicKey>,
+    pool_participant: usize,
+}
+
+async fn mixed_pool_settlement_fixture(mint: &Mint, now: u64) -> MixedPoolSettlementFixture {
+    let regular_keyset = get_regular_keyset_id(mint);
+    let alice_source = mint_test_proofs_for_unit(mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let bob_source = mint_test_proofs_for_unit(mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+    let (yes_outputs, _) = create_premint(mint, *keysets.get("YES").unwrap(), Amount::from(15));
+    let (no_outputs, _) = create_premint(mint, *keysets.get("NO").unwrap(), Amount::from(15));
+    let (change_candidates, _) = create_premint(mint, regular_keyset, Amount::from(7));
+    let expiry = now + 60;
+    let alice =
+        standard_settlement_participant(mint, alice_source, regular_keyset, yes_outputs, expiry, 1)
+            .await;
+    let pool = pool_settlement_participant(
+        mint,
+        bob_source,
+        regular_keyset,
+        no_outputs,
+        &change_candidates,
+        expiry,
+        2,
+    )
+    .await;
+    let mut participants = vec![alice, pool];
+    canonicalize_settlement_participants(&mut participants);
+    let pool_participant = participants
+        .iter()
+        .position(|participant| matches!(&participant.mode, ParticipantMode::Pool { .. }))
+        .unwrap();
+    let (input_ys, selected_output_points) = settlement_storage_keys(&participants);
+    let unselected_output_points = change_candidates
+        .iter()
+        .map(|output| output.blinded_secret)
+        .collect();
+
+    MixedPoolSettlementFixture {
+        request: CtfSettlementRequest {
+            condition_id: CanonicalHash::parse(&condition_id, "condition_id").unwrap(),
+            parent_collection_id: CanonicalHash::from_bytes([0; 32]),
+            participants,
+        },
+        input_ys,
+        selected_output_points,
+        unselected_output_points,
+        pool_participant,
+    }
+}
+
+async fn pool_settlement_participant(
+    mint: &Mint,
+    source: cdk_common::Proofs,
+    offer_keyset: Id,
+    receive_outputs: Vec<cdk_common::BlindedMessage>,
+    change_candidates: &[cdk_common::BlindedMessage],
+    expiry: u64,
+    nonce: u8,
+) -> CtfSettlementParticipant {
+    let mut entries = Vec::new();
+    for output in &receive_outputs {
+        entries.push(pool_entry(entries.len(), PoolEntryRole::Receive, output));
+    }
+    for output in change_candidates {
+        entries.push(pool_entry(entries.len(), PoolEntryRole::Change, output));
+    }
+    let manifest = PoolManifest::new(entries, 32).unwrap();
+    let selection = SelectionBitmap::parse("0f", manifest.entries().len()).unwrap();
+    let secret = settlement_pool_pay_to_unlock_secret(
+        offer_keyset,
+        manifest.commitment().to_string(),
+        expiry,
+        nonce,
+    );
+    let input = issue_locked_proof(mint, source, offer_keyset, secret).await;
+    CtfSettlementParticipant {
+        inputs: vec![input],
+        outputs: receive_outputs,
+        mode: ParticipantMode::Pool {
+            manifest,
+            selection,
+        },
+    }
+}
+
+fn canonicalize_settlement_participants(participants: &mut [CtfSettlementParticipant]) {
+    participants.sort_by_key(|participant| {
+        let proof = participant.inputs.first().unwrap();
+        (proof.keyset_id.to_string(), proof.secret.to_string())
+    });
+}
+
+fn settlement_storage_keys(
+    participants: &[CtfSettlementParticipant],
+) -> (Vec<cdk_common::PublicKey>, Vec<cdk_common::PublicKey>) {
+    let input_ys = participants
+        .iter()
+        .flat_map(|participant| participant.inputs.iter().cloned())
+        .collect::<Vec<_>>()
+        .ys()
+        .unwrap();
+    let output_points = participants
+        .iter()
+        .flat_map(|participant| participant.outputs.iter())
+        .map(|output| output.blinded_secret)
+        .collect();
+    (input_ys, output_points)
+}
+
+fn pool_entry(index: usize, role: PoolEntryRole, output: &cdk_common::BlindedMessage) -> PoolEntry {
+    PoolEntry {
+        index: u64::try_from(index).unwrap(),
+        role,
+        amount: output.amount.to_u64(),
+        keyset_id: output.keyset_id,
+        blinded_secret: output.blinded_secret,
+    }
+}
+
+async fn standard_settlement_participant(
+    mint: &Mint,
+    source: cdk_common::Proofs,
+    offer_keyset: Id,
+    outputs: Vec<cdk_common::BlindedMessage>,
+    expiry: u64,
+    nonce: u8,
+) -> CtfSettlementParticipant {
+    let commitment = ctf_receive_commitment(&outputs).unwrap();
+    let secret =
+        settlement_pay_to_unlock_secret(offer_keyset, commitment.to_string(), expiry, nonce);
+    let input = issue_locked_proof(mint, source, offer_keyset, secret).await;
+    CtfSettlementParticipant {
+        inputs: vec![input],
+        outputs,
+        mode: ParticipantMode::Standard,
+    }
+}
+
+async fn issue_locked_proof(
+    mint: &Mint,
+    source: cdk_common::Proofs,
+    keyset: Id,
+    secret: Secret,
+) -> cdk_common::Proof {
+    let premint =
+        PreMintSecrets::from_secrets(keyset, vec![Amount::from(8)], vec![secret]).unwrap();
+    let response = mint
+        .process_swap_request(SwapRequest::new(source, premint.blinded_messages()))
+        .await
+        .unwrap();
+    let keys = mint
+        .keyset_pubkeys(&keyset)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+    construct_proofs(response.signatures, premint.rs(), premint.secrets(), &keys)
+        .unwrap()
+        .remove(0)
+}
+
+fn settlement_pay_to_unlock_secret(keyset: Id, data: String, expiry: u64, nonce: u8) -> Secret {
+    Secret::new(
+        serde_json::json!([
+            "PAY_TO_UNLOCK",
+            {
+                "nonce": format!("{nonce:02x}").repeat(32),
+                "data": data,
+                "tags": [
+                    ["offer_keyset", keyset.to_string()],
+                    ["expiry", expiry.to_string()],
+                    ["refund", SETTLEMENT_REFUND_KEY]
+                ]
+            }
+        ])
+        .to_string(),
+    )
+}
+
+fn settlement_pool_pay_to_unlock_secret(
+    keyset: Id,
+    data: String,
+    expiry: u64,
+    nonce: u8,
+) -> Secret {
+    Secret::new(
+        serde_json::json!([
+            "PAY_TO_UNLOCK",
+            {
+                "nonce": format!("{nonce:02x}").repeat(32),
+                "data": data,
+                "tags": [
+                    ["offer_keyset", keyset.to_string()],
+                    ["expiry", expiry.to_string()],
+                    ["refund", SETTLEMENT_REFUND_KEY],
+                    ["rate_n", "15"],
+                    ["rate_d", "8"],
+                    ["min_receive", "15"],
+                    ["max_debit", "8"]
+                ]
+            }
+        ])
+        .to_string(),
+    )
+}
+
+fn settlement_settings() -> NutCtfSettlementSettings {
+    NutCtfSettlementSettings::new(8, 32, 64, 64 * 1024, 3600, 32).unwrap()
 }
 
 struct AtomicConvertFixture {
@@ -2161,6 +2444,574 @@ async fn test_numeric_redemption_overspend_rejected() {
 // ============================================================================
 // NUT-CTF-split-merge: CTF Convert tests
 // ============================================================================
+
+#[tokio::test]
+async fn test_ctf_settlement_preparation_retains_exact_verified_artifacts_without_writes() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = cdk_common::util::unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let expected_inputs = fixture
+        .request
+        .participants
+        .iter()
+        .flat_map(|participant| participant.inputs.iter().cloned())
+        .collect::<Vec<_>>();
+    let expected_outputs = fixture
+        .request
+        .participants
+        .iter()
+        .flat_map(|participant| participant.outputs.iter().cloned())
+        .collect::<Vec<_>>();
+    let signing_attempts = mint.blind_sign_attempts();
+
+    let prepared = mint
+        .prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        prepared.condition_id,
+        fixture.request.condition_id.to_string()
+    );
+    assert_eq!(prepared.inputs, expected_inputs);
+    assert_eq!(prepared.outputs, expected_outputs);
+    assert_eq!(
+        prepared.participant_output_ranges,
+        vec![0..4, 4..8],
+        "participant output order and grouping must be retained"
+    );
+    assert_eq!(prepared.input_verification.amount.value(), 16);
+    assert_eq!(prepared.output_verification.amount.value(), 30);
+    assert_eq!(prepared.fee.total, Amount::from(1));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&fixture.input_ys)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert!(mint
+        .localstore()
+        .get_blind_signatures(&fixture.output_points)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_preparation_rejects_output_fee_and_keyset_lifecycle() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = cdk_common::util::unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let original = mint.keysets.load().as_ref().clone();
+
+    rewrite_test_keyset(&mint, fixture.output_only_keyset, true, 0, None);
+    assert!(matches!(
+        mint.prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Protocol(
+            cdk_common::nuts::nut_ctf::settlement::Error::ZeroFeeKeyset
+        ))
+    ));
+
+    mint.keysets.store(Arc::new(original.clone()));
+    rewrite_test_keyset(&mint, fixture.output_only_keyset, false, 1, None);
+    assert!(matches!(
+        mint.prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::InactiveKeyset))
+    ));
+
+    mint.keysets.store(Arc::new(original.clone()));
+    let input_keyset = fixture.request.participants[0].inputs[0].keyset_id;
+    rewrite_test_keyset(&mint, input_keyset, true, 1, Some(now - 1));
+    assert!(matches!(
+        mint.prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::ExpiredKeyset))
+    ));
+    mint.keysets.store(Arc::new(original));
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_preparation_uses_rotated_keyset_expiry() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = cdk_common::util::unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let mut rotated = mint
+        .localstore()
+        .get_conditional_keyset_infos_for_condition(&fixture.request.condition_id.to_string())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|keyset| keyset.id == fixture.output_only_keyset)
+        .expect("fixture keyset should exist");
+    rotated.id = Id::from_str("001711afb1de20d0").unwrap();
+    rotated.active = false;
+    rotated.final_expiry = Some(now + 30);
+    let mut transaction = mint
+        .localstore()
+        .begin_transaction()
+        .await
+        .expect("transaction should start");
+    transaction
+        .add_conditional_keyset(rotated, now - 1)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    assert!(matches!(
+        mint.prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::AuthorizationBeyondKeysetExpiry)
+    ));
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_mixed_pool_persists_only_selection_and_replays() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = mixed_pool_settlement_fixture(&mint, now).await;
+
+    let response = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .expect("mixed standard/pool settlement should commit");
+    assert_eq!(
+        response.signatures.len(),
+        fixture.request.participants.len()
+    );
+    for (participant, signatures) in fixture
+        .request
+        .participants
+        .iter()
+        .zip(&response.signatures)
+    {
+        assert_eq!(signatures.len(), participant.outputs.len());
+        assert!(signatures
+            .iter()
+            .zip(&participant.outputs)
+            .all(|(signature, output)| {
+                signature.amount == output.amount && signature.keyset_id == output.keyset_id
+            }));
+    }
+    assert!(matches!(
+        &fixture.request.participants[fixture.pool_participant].mode,
+        ParticipantMode::Pool { .. }
+    ));
+    assert_eq!(
+        mint.localstore()
+            .get_proofs_states(&fixture.input_ys)
+            .await
+            .unwrap(),
+        vec![Some(State::Spent); fixture.input_ys.len()]
+    );
+    assert!(mint
+        .localstore()
+        .get_blind_signatures(&fixture.selected_output_points)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_some));
+    assert!(mint
+        .localstore()
+        .get_blind_signatures(&fixture.unselected_output_points)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+
+    let signing_attempts = mint.blind_sign_attempts();
+    let replay = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .expect("mixed settlement should replay exactly");
+    assert_eq!(replay, response);
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_commits_once_and_replays_after_attestation() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let digest = fixture.request.request_digest().unwrap();
+
+    let response = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        response.signatures.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![4, 4]
+    );
+    assert_eq!(
+        mint.localstore()
+            .get_proofs_states(&fixture.input_ys)
+            .await
+            .unwrap(),
+        vec![Some(State::Spent); fixture.input_ys.len()]
+    );
+    assert!(mint
+        .localstore()
+        .get_blind_signatures(&fixture.output_points)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_some));
+    assert_eq!(
+        mint.localstore()
+            .get_ctf_settlement_replay(digest)
+            .await
+            .unwrap(),
+        Some(response.clone())
+    );
+
+    let signing_attempts = mint.blind_sign_attempts();
+    assert!(mint
+        .localstore()
+        .update_condition_attestation(
+            &fixture.request.condition_id.to_string(),
+            "attested",
+            Some("YES"),
+            Some(now + 1),
+        )
+        .await
+        .unwrap());
+    let replay = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now + 1)
+        .await
+        .unwrap();
+    assert_eq!(replay, response);
+    assert_eq!(
+        mint.blind_sign_attempts(),
+        signing_attempts,
+        "completed replay trusts the persisted successor without signing again"
+    );
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_attestation_gap_rejects_without_persistence() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let completed_before = completed_swap_count(&mint).await;
+    let (reached, release) = mint.arm_atomic_ctf_test_pause().await;
+    let settlement_mint = mint.clone();
+    let request = fixture.request.clone();
+    let settlement = tokio::spawn(async move {
+        settlement_mint
+            .process_ctf_settlement(&request, settlement_settings(), now)
+            .await
+    });
+
+    timeout(Duration::from_secs(2), reached)
+        .await
+        .expect("settlement should reach its pre-transaction pause")
+        .expect("settlement pause sender");
+    assert!(mint
+        .localstore()
+        .update_condition_attestation(
+            &fixture.request.condition_id.to_string(),
+            "attested",
+            Some("YES"),
+            Some(now + 1),
+        )
+        .await
+        .unwrap());
+    release
+        .send(())
+        .expect("settlement should still be waiting at the pause");
+
+    assert!(matches!(
+        timeout(Duration::from_secs(2), settlement)
+            .await
+            .expect("settlement should finish after release")
+            .expect("settlement task"),
+        Err(CtfSettlementError::Mint(Error::ConvertNotPermitted))
+    ));
+    assert_ctf_settlement_absent(&mint, &fixture, completed_before).await;
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_serializes_keyset_rotation_through_commit() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let input_keyset = fixture.request.participants[0].inputs[0].keyset_id;
+    let (reached, release) = mint.arm_atomic_ctf_test_pause().await;
+    let settlement_mint = mint.clone();
+    let request = fixture.request.clone();
+    let settlement = tokio::spawn(async move {
+        settlement_mint
+            .process_ctf_settlement(&request, settlement_settings(), now)
+            .await
+    });
+
+    timeout(Duration::from_secs(2), reached)
+        .await
+        .expect("settlement should reach its pre-transaction pause")
+        .expect("settlement pause sender");
+    let rotation_mint = mint.clone();
+    let mut rotation = tokio::spawn(async move {
+        rotation_mint
+            .rotate_keyset(
+                CurrencyUnit::Sat,
+                (0..32).map(|power| 2_u64.pow(power)).collect(),
+                1,
+                true,
+                None,
+            )
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut rotation)
+            .await
+            .is_err(),
+        "rotation must wait while the settlement pins its validated keyset snapshot"
+    );
+
+    release.send(()).expect("settlement should be paused");
+    timeout(Duration::from_secs(2), settlement)
+        .await
+        .expect("settlement should finish after release")
+        .expect("settlement task")
+        .expect("settlement should commit");
+    timeout(Duration::from_secs(2), rotation)
+        .await
+        .expect("rotation should finish after settlement")
+        .expect("rotation task")
+        .expect("rotation should succeed");
+    assert!(
+        !mint
+            .get_keyset_info(&input_keyset)
+            .expect("input keyset should remain known")
+            .active
+    );
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_overlap_signs_once_then_replays_exact_response() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let signing_before = mint.blind_sign_attempts();
+    let (reached, release) = mint.arm_atomic_ctf_test_pause().await;
+    let settlement_mint = mint.clone();
+    let request = fixture.request.clone();
+    let first = tokio::spawn(async move {
+        settlement_mint
+            .process_ctf_settlement(&request, settlement_settings(), now)
+            .await
+    });
+
+    timeout(Duration::from_secs(2), reached)
+        .await
+        .expect("first settlement should reach its pause")
+        .expect("settlement pause sender");
+    let signing_after_first = mint.blind_sign_attempts();
+    assert_eq!(signing_after_first, signing_before + 1);
+    let retry_mint = mint.clone();
+    let retry_request = fixture.request.clone();
+    let mut retry = tokio::spawn(async move {
+        retry_mint
+            .process_ctf_settlement(&retry_request, settlement_settings(), now)
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut retry)
+            .await
+            .is_err(),
+        "identical retry should wait for the in-flight settlement"
+    );
+    assert_eq!(mint.blind_sign_attempts(), signing_after_first);
+
+    release.send(()).expect("first settlement should be paused");
+    let response = timeout(Duration::from_secs(2), first)
+        .await
+        .expect("first settlement should finish after release")
+        .expect("first settlement task")
+        .expect("first settlement should commit");
+    let replay = timeout(Duration::from_secs(2), retry)
+        .await
+        .expect("identical retry should finish after commit")
+        .expect("identical retry task")
+        .expect("identical retry should replay");
+    assert_eq!(replay, response);
+    assert_eq!(mint.blind_sign_attempts(), signing_after_first);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_cross_instance_sqlite_replays_one_commit() {
+    let path =
+        std::env::temp_dir().join(format!("cdk-settlement-race-{}.db", uuid::Uuid::new_v4()));
+    let db = Arc::new(
+        cdk_sqlite::mint::MintSqliteDatabase::new(path.clone())
+            .await
+            .unwrap(),
+    );
+    let mnemonic = Mnemonic::generate(12).unwrap();
+    let seed = mnemonic.to_seed_normalized("");
+    let first_mint = build_test_mint_with_unit(db.clone(), &seed, CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&first_mint, now).await;
+    let second_mint = build_test_mint_with_unit(db.clone(), &seed, CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let completed_before = completed_swap_count(&first_mint).await;
+    let (reached, release) = first_mint.arm_atomic_ctf_test_pause().await;
+    let first_request = fixture.request.clone();
+    let first_runner = first_mint.clone();
+    let first = tokio::spawn(async move {
+        first_runner
+            .process_ctf_settlement(&first_request, settlement_settings(), now)
+            .await
+    });
+
+    timeout(Duration::from_secs(2), reached)
+        .await
+        .expect("first instance should reach its pre-transaction pause")
+        .expect("settlement pause sender");
+    let second_request = fixture.request.clone();
+    let second_runner = second_mint.clone();
+    let second = tokio::spawn(async move {
+        second_runner
+            .process_ctf_settlement(&second_request, settlement_settings(), now)
+            .await
+    });
+    let second_response = timeout(Duration::from_secs(2), second)
+        .await
+        .expect("second instance should commit")
+        .expect("second settlement task")
+        .expect("second settlement result");
+    release.send(()).expect("first settlement should be paused");
+    let first_response = timeout(Duration::from_secs(2), first)
+        .await
+        .expect("first instance should finish after release")
+        .expect("first settlement task")
+        .expect("first instance should replay the winning commit");
+
+    assert_eq!(first_response, second_response);
+    assert_eq!(
+        completed_swap_count(&first_mint).await,
+        completed_before + 1
+    );
+
+    first_mint.stop().await.unwrap();
+    second_mint.stop().await.unwrap();
+    drop(first_mint);
+    drop(second_mint);
+    drop(db);
+    for artifact in [
+        path.clone(),
+        path.with_extension("db-shm"),
+        path.with_extension("db-wal"),
+    ] {
+        let _ = std::fs::remove_file(artifact);
+    }
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_replay_write_failure_rolls_back_everything() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let completed_before = completed_swap_count(&mint).await;
+
+    set_fail_for("ADD_CTF_SETTLEMENT_REPLAY");
+    let result = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await;
+    clear_fail_for("ADD_CTF_SETTLEMENT_REPLAY");
+    assert!(result.is_err());
+    assert_ctf_settlement_absent(&mint, &fixture, completed_before).await;
+
+    mint.process_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .expect("identical settlement must succeed after rollback");
+}
+
+async fn completed_swap_count(mint: &Mint) -> usize {
+    mint.localstore()
+        .get_completed_operations_by_kind(cdk_common::mint::OperationKind::Swap)
+        .await
+        .unwrap()
+        .len()
+}
+
+async fn assert_ctf_settlement_absent(
+    mint: &Mint,
+    fixture: &StandardSettlementFixture,
+    completed_before: usize,
+) {
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&fixture.input_ys)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert!(mint
+        .localstore()
+        .get_blind_signatures(&fixture.output_points)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert!(mint
+        .localstore()
+        .get_ctf_settlement_replay(fixture.request.request_digest().unwrap())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(completed_swap_count(mint).await, completed_before);
+}
+
+fn rewrite_test_keyset(
+    mint: &Mint,
+    id: Id,
+    active: bool,
+    input_fee_ppk: u64,
+    final_expiry: Option<u64>,
+) {
+    let keysets = mint
+        .keysets
+        .load()
+        .iter()
+        .cloned()
+        .map(|mut keyset| {
+            if keyset.id == id {
+                keyset.active = active;
+                keyset.input_fee_ppk = input_fee_ppk;
+                keyset.final_expiry = final_expiry;
+            }
+            keyset
+        })
+        .collect();
+    mint.keysets.store(Arc::new(keysets));
+}
 
 /// Test that zero-fee split-as-convert is rejected.
 #[tokio::test]

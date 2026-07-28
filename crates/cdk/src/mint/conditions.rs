@@ -364,6 +364,7 @@ impl Mint {
         }
         tx.commit().await?;
 
+        let _store = self.keyset_store_lock.write().await;
         self.signatory.reload_keysets_from_storage().await?;
         let new_keysets = self.signatory.keysets().await?;
         self.keysets.store(new_keysets.keysets.into());

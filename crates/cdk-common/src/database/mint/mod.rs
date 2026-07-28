@@ -13,6 +13,8 @@ use crate::mint::StoredCondition;
 use crate::mint::{
     self, MeltQuote, MintKeySetInfo, MintQuote as MintMintQuote, Operation, ProofsWithState,
 };
+#[cfg(feature = "conditional-tokens")]
+use crate::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse};
 use crate::nuts::{
     BlindSignature, BlindedMessage, CurrencyUnit, Id, MeltQuoteState, Proof, Proofs, PublicKey,
     State,
@@ -722,6 +724,42 @@ pub trait ConditionsDatabase {
     ) -> Result<Option<(String, String, String)>, Self::Err>;
 }
 
+/// Atomic idempotency records for multi-party CTF settlement.
+#[cfg(feature = "conditional-tokens")]
+#[async_trait]
+pub trait CtfSettlementReplayTransaction {
+    /// Database error.
+    type Err: Into<Error> + From<Error>;
+
+    /// Read a committed response inside the current transaction.
+    async fn get_ctf_settlement_replay(
+        &mut self,
+        request_digest: CanonicalHash,
+    ) -> Result<Option<CtfSettlementResponse>, Self::Err>;
+
+    /// Persist the exact response after its swap operation has completed.
+    async fn add_ctf_settlement_replay(
+        &mut self,
+        request_digest: CanonicalHash,
+        operation_id: &uuid::Uuid,
+        response: &CtfSettlementResponse,
+    ) -> Result<(), Self::Err>;
+}
+
+/// Read-only idempotency lookup for multi-party CTF settlement.
+#[cfg(feature = "conditional-tokens")]
+#[async_trait]
+pub trait CtfSettlementReplayDatabase {
+    /// Database error.
+    type Err: Into<Error> + From<Error>;
+
+    /// Read the exact committed response for a request digest.
+    async fn get_ctf_settlement_replay(
+        &self,
+        request_digest: CanonicalHash,
+    ) -> Result<Option<CtfSettlementResponse>, Self::Err>;
+}
+
 /// Base database writer
 #[cfg(not(feature = "conditional-tokens"))]
 pub trait Transaction<Error>:
@@ -746,6 +784,7 @@ pub trait Transaction<Error>:
     + SagaTransaction<Err = Error>
     + CompletedOperationsTransaction<Err = Error>
     + ConditionsTransaction<Err = Error>
+    + CtfSettlementReplayTransaction<Err = Error>
 {
 }
 
@@ -775,6 +814,7 @@ pub trait Database<Error>:
     + SagaDatabase<Err = Error>
     + CompletedOperationsDatabase<Err = Error>
     + ConditionsDatabase<Err = Error>
+    + CtfSettlementReplayDatabase<Err = Error>
 {
     /// Begins a transaction
     async fn begin_transaction(&self) -> Result<Box<dyn Transaction<Error> + Send + Sync>, Error>;

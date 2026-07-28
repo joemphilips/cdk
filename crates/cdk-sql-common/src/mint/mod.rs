@@ -27,6 +27,8 @@ mod keyvalue;
 mod proofs;
 mod quotes;
 mod saga;
+#[cfg(feature = "conditional-tokens")]
+mod settlement_replays;
 mod signatures;
 
 #[rustfmt::skip]
