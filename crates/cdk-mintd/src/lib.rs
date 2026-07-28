@@ -1332,19 +1332,11 @@ async fn configure_backend_and_rate_quoter_for_unit(
     )
     .await?;
 
-    // The MSAT route exposes the same economic limits in millisatoshis:
-    // 1 sat = 1000 msat.
-    let msat_mint_melt_limits = MintMeltLimits {
-        mint_min: Amount::from(mint_melt_limits.mint_min.to_u64().saturating_mul(1000)),
-        mint_max: Amount::from(mint_melt_limits.mint_max.to_u64().saturating_mul(1000)),
-        melt_min: Amount::from(mint_melt_limits.melt_min.to_u64().saturating_mul(1000)),
-        melt_max: Amount::from(mint_melt_limits.melt_max.to_u64().saturating_mul(1000)),
-    };
     mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
         CurrencyUnit::Msat,
-        msat_mint_melt_limits,
+        msat_limits(mint_melt_limits),
         backends.msat,
     )
     .await?;
@@ -1357,6 +1349,17 @@ async fn configure_backend_and_rate_quoter_for_unit(
         owner,
     )
     .await
+}
+
+fn msat_limits(sat_limits: MintMeltLimits) -> MintMeltLimits {
+    // The MSAT route exposes the same economic limits in millisatoshis:
+    // 1 sat = 1000 msat.
+    MintMeltLimits {
+        mint_min: Amount::from(sat_limits.mint_min.to_u64().saturating_mul(1000)),
+        mint_max: Amount::from(sat_limits.mint_max.to_u64().saturating_mul(1000)),
+        melt_min: Amount::from(sat_limits.melt_min.to_u64().saturating_mul(1000)),
+        melt_max: Amount::from(sat_limits.melt_max.to_u64().saturating_mul(1000)),
+    }
 }
 
 async fn configure_non_sat_backend(
@@ -1424,58 +1427,10 @@ async fn configure_rate_quoter_for_sat_backend(
     sat_backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
     event_owner: Arc<CanonicalPaymentEventOwner>,
 ) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
-    let Some(rate_quoter) = settings.rate_quoter.clone() else {
+    let Some((rate_quoter, units)) = validated_rate_quoter(settings)? else {
         return Ok((mint_builder, None));
     };
-
-    let units = rate_quoter_units(&rate_quoter);
-    if units.is_empty() {
-        tracing::warn!("rate_quoter configured without units; no fiat processors registered");
-        return Ok((mint_builder, None));
-    }
-
-    // The rate snapshot is part of the quoted economic terms; quotes priced
-    // off it must expire well before the snapshot can go materially stale.
-    if !(60..=120).contains(&rate_quoter.ttl_secs) {
-        bail!(
-            "rate_quoter.ttl_secs must be between 60 and 120 seconds, got {}",
-            rate_quoter.ttl_secs
-        );
-    }
-    if rate_quoter.min_survived > rate_quoter.min_fetched {
-        bail!(
-            "rate_quoter.min_survived ({}) cannot exceed rate_quoter.min_fetched ({})",
-            rate_quoter.min_survived,
-            rate_quoter.min_fetched
-        );
-    }
-
-    validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)?;
-
-    let sources = rate_quoter_sources(&rate_quoter.sources)?;
-    let oracle = Arc::new(AggregatingRateOracle::with_config(
-        sources,
-        AggregatorConfig {
-            min_sources: rate_quoter.min_fetched,
-            min_survived: rate_quoter.min_survived,
-            max_clock_offset_secs: rate_quoter.staleness_secs,
-            ..AggregatorConfig::default()
-        },
-    ));
-    let store = rate_quote_store(settings, &rate_quoter).await?;
-
-    // Pause/cap/outstanding state persists in the quote store; operator
-    // values set over the management RPC take precedence over config, so
-    // config caps only seed units with no persisted control record.
-    let control =
-        RateQuoteControlHandle::with_store_and_buffer_bps(store.clone(), rate_quoter.buffer_bps);
-    let persisted_units = control.load_persisted().await?;
-    validate_persisted_rate_quoter_caps_require_buffer(&rate_quoter, &units, &control).await?;
-    for (unit, cap) in &rate_quoter.per_unit_caps {
-        if !persisted_units.contains(unit) {
-            control.set_unit_issuance_cap(unit.clone(), *cap).await?;
-        }
-    }
+    let (oracle, store, control) = rate_quoter_runtime(settings, &rate_quoter, &units).await?;
     event_owner.install_rate_context(store.clone(), control.clone())?;
 
     for fiat_unit in units {
@@ -1505,6 +1460,69 @@ async fn configure_rate_quoter_for_sat_backend(
     }
 
     Ok((mint_builder, Some(control)))
+}
+
+fn validated_rate_quoter(
+    settings: &config::Settings,
+) -> Result<Option<(config::RateQuoter, Vec<CurrencyUnit>)>> {
+    let Some(rate_quoter) = settings.rate_quoter.clone() else {
+        return Ok(None);
+    };
+    let units = rate_quoter_units(&rate_quoter);
+    if units.is_empty() {
+        tracing::warn!("rate_quoter configured without units; no fiat processors registered");
+        return Ok(None);
+    }
+    // Quotes priced from one snapshot must expire before it can become
+    // materially stale.
+    if !(60..=120).contains(&rate_quoter.ttl_secs) {
+        bail!(
+            "rate_quoter.ttl_secs must be between 60 and 120 seconds, got {}",
+            rate_quoter.ttl_secs
+        );
+    }
+    if rate_quoter.min_survived > rate_quoter.min_fetched {
+        bail!(
+            "rate_quoter.min_survived ({}) cannot exceed rate_quoter.min_fetched ({})",
+            rate_quoter.min_survived,
+            rate_quoter.min_fetched
+        );
+    }
+    validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)?;
+    Ok(Some((rate_quoter, units)))
+}
+
+async fn rate_quoter_runtime(
+    settings: &config::Settings,
+    rate_quoter: &config::RateQuoter,
+    units: &[CurrencyUnit],
+) -> Result<(
+    Arc<AggregatingRateOracle>,
+    DynRateQuoteStore,
+    RateQuoteControlHandle,
+)> {
+    let oracle = Arc::new(AggregatingRateOracle::with_config(
+        rate_quoter_sources(&rate_quoter.sources)?,
+        AggregatorConfig {
+            min_sources: rate_quoter.min_fetched,
+            min_survived: rate_quoter.min_survived,
+            max_clock_offset_secs: rate_quoter.staleness_secs,
+            ..AggregatorConfig::default()
+        },
+    ));
+    let store = rate_quote_store(settings, rate_quoter).await?;
+    // Persisted pause/cap/outstanding values take precedence; configuration
+    // seeds only units without an existing control record.
+    let control =
+        RateQuoteControlHandle::with_store_and_buffer_bps(store.clone(), rate_quoter.buffer_bps);
+    let persisted_units = control.load_persisted().await?;
+    validate_persisted_rate_quoter_caps_require_buffer(rate_quoter, units, &control).await?;
+    for (unit, cap) in &rate_quoter.per_unit_caps {
+        if !persisted_units.contains(unit) {
+            control.set_unit_issuance_cap(unit.clone(), *cap).await?;
+        }
+    }
+    Ok((oracle, store, control))
 }
 
 fn rate_quoter_units(rate_quoter: &config::RateQuoter) -> Vec<CurrencyUnit> {

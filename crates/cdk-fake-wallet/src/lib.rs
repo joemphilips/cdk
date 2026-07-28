@@ -717,15 +717,6 @@ impl MintPayment for FakeWallet {
                         .ok_or(Error::UnknownInvoiceAmount)?
                 };
 
-                if let Some(description) = status {
-                    if description.check_err {
-                        let mut fail = self.failed_payment_check.lock().await;
-                        fail.insert(payment_hash.clone());
-                    }
-
-                    ensure_cdk!(!description.pay_err, Error::UnknownInvoice.into());
-                }
-
                 let total_spent = convert_currency_amount(
                     amount_msat,
                     &CurrencyUnit::Msat,
@@ -743,6 +734,14 @@ impl MintPayment for FakeWallet {
                     payment_hash.clone(),
                     (checkout_going_status, checked_total_spent),
                 );
+                if let Some(description) = status {
+                    if description.check_err {
+                        let mut fail = self.failed_payment_check.lock().await;
+                        fail.insert(payment_hash.clone());
+                    }
+
+                    ensure_cdk!(!description.pay_err, Error::UnknownInvoice.into());
+                }
 
                 Ok(MakePaymentResponse {
                     payment_lookup_id: PaymentIdentifier::PaymentHash(
@@ -1093,9 +1092,9 @@ fn fake_secret_key(seed: &str) -> SecretKey {
 #[cfg(test)]
 mod tests {
     use cdk_common::payment::{
-        Bolt11IncomingPaymentOptions, CustomIncomingPaymentOptions, CustomOutgoingPaymentOptions,
-        IncomingPaymentOptions, MintPayment, OnchainOutgoingPaymentOptions, OutgoingPaymentOptions,
-        PaymentIdentifier,
+        Bolt11IncomingPaymentOptions, Bolt11OutgoingPaymentOptions, CustomIncomingPaymentOptions,
+        CustomOutgoingPaymentOptions, IncomingPaymentOptions, MintPayment,
+        OnchainOutgoingPaymentOptions, OutgoingPaymentOptions, PaymentIdentifier,
     };
 
     use super::*;
@@ -1254,6 +1253,47 @@ mod tests {
             .expect("configured custom method should make outgoing payment");
 
         assert_eq!(response.total_spent, Amount::new(21, CurrencyUnit::Sat));
+    }
+
+    #[tokio::test]
+    async fn pay_error_preserves_requested_unit_for_status_replay() {
+        let wallet = FakeWallet::new(
+            FeeReserve {
+                min_fee_reserve: 0.into(),
+                percent_fee_reserve: 0.0,
+            },
+            HashMap::new(),
+            HashSet::new(),
+            0,
+            CurrencyUnit::Msat,
+        );
+        let description = serde_json::to_string(&FakeInvoiceDescription {
+            pay_err: true,
+            ..Default::default()
+        })
+        .expect("description");
+        let invoice = create_fake_invoice(1_500, description);
+        let payment_id = PaymentIdentifier::PaymentHash(*invoice.payment_hash().as_ref());
+        let options = OutgoingPaymentOptions::Bolt11(Box::new(Bolt11OutgoingPaymentOptions {
+            bolt11: invoice,
+            max_fee_amount: None,
+            timeout_secs: None,
+            melt_options: None,
+            quote_id: cdk_common::QuoteId::new(),
+        }));
+
+        wallet
+            .make_payment(&CurrencyUnit::Sat, options)
+            .await
+            .expect_err("injected payment error");
+        let replay = wallet
+            .check_outgoing_payment(&payment_id)
+            .await
+            .expect("persisted payment status");
+
+        assert_eq!(replay.payment_lookup_id, payment_id);
+        assert_eq!(replay.status, MeltQuoteState::Paid);
+        assert_eq!(replay.total_spent, Amount::new(2, CurrencyUnit::Sat));
     }
 
     #[tokio::test]
