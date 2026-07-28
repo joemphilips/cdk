@@ -46,6 +46,8 @@ mod proofs;
 mod redeem_outcome;
 mod saga_recovery;
 #[cfg(feature = "conditional-tokens")]
+mod settlement;
+#[cfg(feature = "conditional-tokens")]
 mod split_merge;
 mod start_up_check;
 mod subscription;
