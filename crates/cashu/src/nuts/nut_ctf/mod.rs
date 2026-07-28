@@ -17,6 +17,7 @@ use crate::dhke;
 
 pub mod dlc;
 pub(crate) mod serde_oracle_witness;
+pub mod settlement;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
