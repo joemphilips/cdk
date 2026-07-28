@@ -265,7 +265,11 @@ where
         keyset_info: MintKeySetInfo,
         created_at: u64,
     ) -> Result<(), Self::Err> {
-        let conn = self.pool.get().map_err(|e| Error::Database(Box::new(e)))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
 
         let condition_id = keyset_info.condition_id.as_ref().ok_or_else(|| {
             Error::Internal("add_conditional_keyset: condition_id missing".to_string())
