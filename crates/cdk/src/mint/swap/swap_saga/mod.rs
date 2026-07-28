@@ -2,13 +2,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cdk_common::database::DynMintDatabase;
-use cdk_common::mint::{Operation, Saga, SwapSagaState};
+use cdk_common::mint::{Saga, SwapSagaState};
 use cdk_common::nuts::BlindedMessage;
 use cdk_common::{database, Error, Proofs, ProofsMethods, PublicKey, QuoteId, State};
 use tracing::instrument;
 
 use self::compensation::{CompensatingAction, RemoveSwapSetup};
 use self::state::{Initial, SetupComplete, Signed};
+use super::atomic::{persist_swap_completion, prepare_swap, BalanceCheck};
 use crate::mint::subscription::PubSubManager;
 use crate::Mint;
 
@@ -101,15 +102,6 @@ pub struct SwapSaga<'a, S> {
     state_data: S,
 }
 
-/// Controls how balance is verified during swap setup.
-enum BalanceCheck {
-    /// Full balance verification (input >= output + fees)
-    Full,
-    /// Unit-equality only — caller already validated amounts (CTF split/merge)
-    #[cfg(feature = "conditional-tokens")]
-    UnitEqualityOnly,
-}
-
 impl<'a> SwapSaga<'a, Initial> {
     pub fn new(mint: &'a super::Mint, db: DynMintDatabase, pubsub: Arc<PubSubManager>) -> Self {
         let operation_id = uuid::Uuid::now_v7();
@@ -197,54 +189,21 @@ impl<'a> SwapSaga<'a, Initial> {
         input_verification: crate::mint::Verification,
         balance_check: BalanceCheck,
     ) -> Result<SwapSaga<'a, SetupComplete>, Error> {
-        let output_verification = self.mint.verify_outputs(blinded_messages).map_err(|err| {
-            tracing::debug!("Output verification failed: {:?}", err);
-            err
-        })?;
-
-        match balance_check {
-            BalanceCheck::Full => {
-                self.mint
-                    .verify_transaction_balanced(
-                        input_verification.clone(),
-                        output_verification.clone(),
-                        input_proofs,
-                    )
-                    .await?;
-            }
-            #[cfg(feature = "conditional-tokens")]
-            BalanceCheck::UnitEqualityOnly => {
-                if output_verification.amount.unit() != input_verification.amount.unit() {
-                    tracing::debug!(
-                        "Unbalanced swap unit mismatch: input {:?}, output {:?}",
-                        input_verification.amount.unit(),
-                        output_verification.amount.unit()
-                    );
-                    return Err(Error::UnitMismatch);
-                }
-            }
-        }
-
-        let total_redeemed = input_verification.amount;
-        let total_issued = output_verification.amount;
-
-        let fee_breakdown = self.mint.get_proofs_fee(input_proofs).await?;
-
-        let operation = Operation::new(
+        let prepared = prepare_swap(
+            self.mint,
             self.state_data.operation_id,
-            cdk_common::mint::OperationKind::Swap,
-            total_issued.clone().into(),
-            total_redeemed.clone().into(),
-            fee_breakdown.total,
-            None,
-            None,
-        );
+            input_proofs,
+            blinded_messages,
+            input_verification,
+            balance_check,
+        )
+        .await?;
 
         let mut tx = self.db.begin_transaction().await?;
 
         // Add input proofs to DB
         let mut new_proofs = match tx
-            .add_proofs(input_proofs.clone(), quote_id.clone(), &operation)
+            .add_proofs(input_proofs.clone(), quote_id.clone(), &prepared.operation)
             .await
         {
             Ok(proofs) => proofs,
@@ -271,7 +230,7 @@ impl<'a> SwapSaga<'a, Initial> {
 
         // Add output blinded messages
         if let Err(err) = tx
-            .add_blinded_messages(quote_id.as_ref(), blinded_messages, &operation)
+            .add_blinded_messages(quote_id.as_ref(), blinded_messages, &prepared.operation)
             .await
         {
             tx.rollback().await?;
@@ -317,8 +276,8 @@ impl<'a> SwapSaga<'a, Initial> {
             state_data: SetupComplete {
                 blinded_messages: blinded_messages_vec,
                 ys,
-                operation,
-                fee_breakdown,
+                operation: prepared.operation,
+                fee_breakdown: prepared.fee_breakdown,
             },
         })
     }
@@ -420,44 +379,6 @@ impl SwapSaga<'_, Signed> {
             .collect();
 
         let mut tx = self.db.begin_transaction().await?;
-
-        // Add blind signatures to outputs
-        // TODO: WE should move the should fail to the db so the there is not this extra rollback.
-        // This would allow the error to be from the same place in test and prod
-        #[cfg(test)]
-        {
-            if crate::test_helpers::mint::should_fail_for("ADD_SIGNATURES") {
-                tx.rollback().await?;
-                self.compensate_all().await?;
-                return Err(Error::Database(database::Error::Database(
-                    "Test failure: ADD_SIGNATURES".into(),
-                )));
-            }
-        }
-
-        if let Err(err) = tx
-            .add_blind_signatures(&blinded_secrets, &self.state_data.signatures, None)
-            .await
-        {
-            tx.rollback().await?;
-            self.compensate_all().await?;
-            return Err(err.into());
-        }
-
-        // Mark input proofs as spent
-        // TODO: WE should move the should fail to the db so the there is not this extra rollback.
-        // This would allow the error to be from the same place in test and prod
-        #[cfg(test)]
-        {
-            if crate::test_helpers::mint::should_fail_for("UPDATE_PROOFS") {
-                tx.rollback().await?;
-                self.compensate_all().await?;
-                return Err(Error::Database(database::Error::Database(
-                    "Test failure: UPDATE_PROOFS".into(),
-                )));
-            }
-        }
-
         let mut proofs = match tx.get_proofs(&self.state_data.ys).await {
             Ok(proofs) => proofs,
             Err(err) => {
@@ -467,22 +388,19 @@ impl SwapSaga<'_, Signed> {
             }
         };
 
-        if let Err(err) = Mint::update_proofs_state(&mut tx, &mut proofs, State::Spent).await {
-            tx.rollback().await?;
-            self.compensate_all().await?;
-            return Err(err);
-        }
-
-        if let Err(err) = tx
-            .add_completed_operation(
-                &self.state_data.operation,
-                &self.state_data.fee_breakdown.per_keyset,
-            )
-            .await
+        if let Err(err) = persist_swap_completion(
+            &mut tx,
+            &mut proofs,
+            &blinded_secrets,
+            &self.state_data.signatures,
+            &self.state_data.operation,
+            &self.state_data.fee_breakdown,
+        )
+        .await
         {
             tx.rollback().await?;
             self.compensate_all().await?;
-            return Err(err.into());
+            return Err(err);
         }
 
         // Delete saga - swap completed successfully (best-effort, atomic with TX2)

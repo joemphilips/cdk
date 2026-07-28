@@ -635,6 +635,12 @@ pub trait ConditionsTransaction {
     /// Conditions transaction error
     type Err: Into<Error> + From<Error>;
 
+    /// Get a condition and lock it for update for the lifetime of this transaction.
+    async fn get_condition_for_update(
+        &mut self,
+        condition_id: &str,
+    ) -> Result<Option<Acquired<StoredCondition>>, Self::Err>;
+
     /// Add a stored condition in the current transaction.
     async fn add_condition(&mut self, condition: StoredCondition) -> Result<(), Self::Err>;
 

@@ -1,7 +1,11 @@
 //! Cashu Mint
 
 use std::collections::HashMap;
+#[cfg(feature = "conditional-tokens")]
+use std::collections::HashSet;
 use std::sync::Arc;
+#[cfg(feature = "conditional-tokens")]
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -93,6 +97,15 @@ pub struct Mint {
     /// Maximum number of outcomes allowed per conditional-token condition
     #[cfg(feature = "conditional-tokens")]
     max_outcomes_per_condition: usize,
+    /// Inputs currently being prepared for atomic CTF conversion.
+    #[cfg(feature = "conditional-tokens")]
+    ctf_input_reservations: Arc<StdMutex<HashSet<PublicKey>>>,
+    /// Deterministic pre-transaction pause for atomic CTF race tests.
+    #[cfg(all(test, feature = "conditional-tokens"))]
+    atomic_ctf_test_pause: Arc<swap::atomic::AtomicCtfTestPause>,
+    /// Number of blind-signing calls made by this mint in tests.
+    #[cfg(test)]
+    blind_sign_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for Mint {
@@ -288,6 +301,12 @@ impl Mint {
             max_outputs,
             #[cfg(feature = "conditional-tokens")]
             max_outcomes_per_condition,
+            #[cfg(feature = "conditional-tokens")]
+            ctf_input_reservations: Arc::new(StdMutex::new(HashSet::new())),
+            #[cfg(all(test, feature = "conditional-tokens"))]
+            atomic_ctf_test_pause: Arc::new(swap::atomic::AtomicCtfTestPause::default()),
+            #[cfg(test)]
+            blind_sign_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -1236,6 +1255,10 @@ impl Mint {
         blinded_message: Vec<BlindedMessage>,
     ) -> Result<Vec<BlindSignature>, Error> {
         #[cfg(test)]
+        self.blind_sign_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        #[cfg(test)]
         {
             if crate::test_helpers::mint::should_fail_in_test() {
                 return Err(Error::SignatureMissingOrInvalid);
@@ -1253,6 +1276,13 @@ impl Mint {
         }
 
         result
+    }
+
+    #[cfg(test)]
+    /// Return the number of blind-signing calls made by this mint.
+    pub(crate) fn blind_sign_attempts(&self) -> usize {
+        self.blind_sign_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Verify [`Proof`] meets conditions and is signed
