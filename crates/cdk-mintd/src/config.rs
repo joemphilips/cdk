@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bitcoin::hashes::{sha256, Hash};
@@ -1094,76 +1093,6 @@ fn default_blind() -> AuthType {
     AuthType::Blind
 }
 
-/// Optional fiat rate-quote processor configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RateQuoter {
-    /// Fiat units exposed through the rate-converting decorator.
-    #[serde(default)]
-    pub units: Vec<CurrencyUnit>,
-    /// Mint-favoring buffer in basis points.
-    #[serde(default)]
-    pub buffer_bps: u64,
-    /// Per-unit quote TTL, independent of the global mint TTL.
-    #[serde(default = "default_rate_quoter_ttl_secs")]
-    pub ttl_secs: u64,
-    /// Oracle provider identifiers. Supported values are `coinbase`, `kraken`,
-    /// and `bitstamp` (case-insensitive); endpoints are fixed by the
-    /// implementation.
-    #[serde(default)]
-    pub sources: Vec<String>,
-    /// Maximum acceptable source staleness in seconds.
-    #[serde(default = "default_rate_quoter_staleness_secs")]
-    pub staleness_secs: u64,
-    /// Minimum number of sources that must be fetched fresh for a snapshot
-    /// (`quorum` is accepted as a legacy alias).
-    #[serde(default = "default_rate_quoter_min_fetched", alias = "quorum")]
-    pub min_fetched: usize,
-    /// Minimum number of sources that must survive deviation trimming.
-    #[serde(default = "default_rate_quoter_min_survived")]
-    pub min_survived: usize,
-    /// Per-unit issuance caps over outstanding plus pending quotes. A cap of
-    /// 0 (or an unconfigured unit) refuses all new mint quotes (fail-closed);
-    /// it never means unlimited.
-    #[serde(default)]
-    pub per_unit_caps: HashMap<CurrencyUnit, u64>,
-    /// Allow volatile in-memory rate-quote control storage. This is suitable
-    /// only for ephemeral development and tests.
-    #[serde(default)]
-    pub allow_in_memory_store: bool,
-}
-
-impl Default for RateQuoter {
-    fn default() -> Self {
-        Self {
-            units: Vec::new(),
-            buffer_bps: 0,
-            ttl_secs: default_rate_quoter_ttl_secs(),
-            sources: Vec::new(),
-            staleness_secs: default_rate_quoter_staleness_secs(),
-            min_fetched: default_rate_quoter_min_fetched(),
-            min_survived: default_rate_quoter_min_survived(),
-            per_unit_caps: HashMap::new(),
-            allow_in_memory_store: false,
-        }
-    }
-}
-
-fn default_rate_quoter_ttl_secs() -> u64 {
-    cdk_exchange_rate::DEFAULT_RATE_QUOTE_TTL_SECS
-}
-
-fn default_rate_quoter_staleness_secs() -> u64 {
-    30
-}
-
-fn default_rate_quoter_min_fetched() -> usize {
-    3
-}
-
-fn default_rate_quoter_min_survived() -> usize {
-    2
-}
-
 /// CDK settings, derived from `config.toml`
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -1195,7 +1124,6 @@ pub struct Settings {
     #[cfg(feature = "management-rpc")]
     pub mint_management_rpc: Option<MintManagementRpc>,
     pub auth: Option<Auth>,
-    pub rate_quoter: Option<RateQuoter>,
     #[cfg(feature = "prometheus")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prometheus: Option<Prometheus>,
@@ -1438,55 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rate_quoter_config_parse() {
-        use std::{env, fs};
-
-        let temp_dir = env::temp_dir().join("cdk_test_rate_quoter_config");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let config_path = temp_dir.join("config.toml");
-        let config_content = r#"
-[rate_quoter]
-units = ["usd"]
-buffer_bps = 75
-ttl_secs = 90
-sources = ["Coinbase", "KRAKEN", "bitstamp"]
-staleness_secs = 45
-min_fetched = 3
-min_survived = 2
-per_unit_caps = { usd = 1000 }
-"#;
-        fs::write(&config_path, config_content).expect("write config");
-
-        let settings = Settings::try_new(Some(&config_path)).expect("settings should load");
-        let rate_quoter = settings.rate_quoter.expect("rate quoter config");
-
-        assert_eq!(rate_quoter.units, vec![CurrencyUnit::Usd]);
-        assert_eq!(rate_quoter.buffer_bps, 75);
-        assert_eq!(rate_quoter.ttl_secs, 90);
-        assert_eq!(rate_quoter.sources.len(), 3);
-        assert_eq!(rate_quoter.staleness_secs, 45);
-        assert_eq!(rate_quoter.min_fetched, 3);
-        assert_eq!(rate_quoter.min_survived, 2);
-        assert!(!rate_quoter.allow_in_memory_store);
-        assert_eq!(
-            rate_quoter.per_unit_caps.get(&CurrencyUnit::Usd),
-            Some(&1000)
-        );
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_rate_quoter_split_quorum_defaults() {
-        // Split quorum: at least 3 sources fetched AND at least 2 surviving
-        // trimming are independent knobs with independent defaults.
-        let rate_quoter = RateQuoter::default();
-        assert_eq!(rate_quoter.min_fetched, 3);
-        assert_eq!(rate_quoter.min_survived, 2);
-    }
-
     #[cfg(feature = "conditional-tokens")]
-    #[test]
     fn test_ctf_registration_fee_config_requires_base() {
         let config_content = r#"
 [[mint_info.ctf_registration_fees]]

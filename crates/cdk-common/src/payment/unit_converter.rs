@@ -1,20 +1,107 @@
-//! Fixed msat/sat [`MintPayment`](cdk_common::payment::MintPayment) decorator.
+//! Fixed msat/sat [`MintPayment`](crate::payment::MintPayment) decorator.
 
 use std::pin::Pin;
 use std::str::FromStr;
 
-use async_trait::async_trait;
-use cdk_common::amount::MSAT_IN_SAT;
-use cdk_common::nuts::CurrencyUnit;
-use cdk_common::payment::{
+use crate::amount::MSAT_IN_SAT;
+use crate::nuts::CurrencyUnit;
+use crate::payment::{
     CreateIncomingPaymentResponse, DynMintPayment, Event, IncomingPaymentOptions,
     MakePaymentResponse, MintPayment, OutgoingPaymentOptions, PaymentIdentifier,
     PaymentQuoteResponse, SettingsResponse, WaitPaymentResponse,
 };
-use cdk_common::Amount;
+use crate::Amount;
+use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 
-use crate::payment::SharedMintPayment;
+#[derive(Clone)]
+struct SharedMintPayment {
+    inner: DynMintPayment,
+}
+
+impl std::fmt::Debug for SharedMintPayment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedMintPayment")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedMintPayment {
+    fn new(inner: DynMintPayment) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl MintPayment for SharedMintPayment {
+    type Err = crate::payment::Error;
+
+    async fn start(&self) -> Result<(), Self::Err> {
+        self.inner.start().await
+    }
+
+    async fn stop(&self) -> Result<(), Self::Err> {
+        self.inner.stop().await
+    }
+
+    async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
+        self.inner.get_settings().await
+    }
+
+    async fn create_incoming_payment_request(
+        &self,
+        options: IncomingPaymentOptions,
+    ) -> Result<CreateIncomingPaymentResponse, Self::Err> {
+        self.inner.create_incoming_payment_request(options).await
+    }
+
+    async fn get_payment_quote(
+        &self,
+        unit: &CurrencyUnit,
+        options: OutgoingPaymentOptions,
+    ) -> Result<PaymentQuoteResponse, Self::Err> {
+        self.inner.get_payment_quote(unit, options).await
+    }
+
+    async fn make_payment(
+        &self,
+        unit: &CurrencyUnit,
+        options: OutgoingPaymentOptions,
+    ) -> Result<MakePaymentResponse, Self::Err> {
+        self.inner.make_payment(unit, options).await
+    }
+
+    async fn wait_payment_event(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Event> + Send>>, Self::Err> {
+        self.inner.wait_payment_event().await
+    }
+
+    fn is_payment_event_stream_active(&self) -> bool {
+        self.inner.is_payment_event_stream_active()
+    }
+
+    fn cancel_payment_event_stream(&self) {
+        self.inner.cancel_payment_event_stream();
+    }
+
+    async fn check_incoming_payment_status(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
+        self.inner
+            .check_incoming_payment_status(payment_identifier)
+            .await
+    }
+
+    async fn check_outgoing_payment(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<MakePaymentResponse, Self::Err> {
+        self.inner.check_outgoing_payment(payment_identifier).await
+    }
+}
 
 /// Exact native-unit and fixed-ratio SAT/MSAT views over one Lightning backend.
 pub struct SatMsatBackends {
@@ -35,13 +122,10 @@ impl std::fmt::Debug for SatMsatBackends {
 /// Build SAT and MSAT routes without converting the backend's native unit twice.
 pub async fn sat_msat_backends(
     backend: DynMintPayment,
-) -> Result<SatMsatBackends, cdk_common::payment::Error> {
+) -> Result<SatMsatBackends, crate::payment::Error> {
     let settings = backend.get_settings().await?;
     let unit = CurrencyUnit::from_str(&settings.unit).map_err(|_| {
-        cdk_common::payment::Error::Custom(format!(
-            "invalid payment backend unit `{}`",
-            settings.unit
-        ))
+        crate::payment::Error::Custom(format!("invalid payment backend unit `{}`", settings.unit))
     })?;
 
     match unit {
@@ -55,7 +139,7 @@ pub async fn sat_msat_backends(
             ))),
             msat: backend,
         }),
-        _ => Err(cdk_common::payment::Error::UnsupportedUnit),
+        _ => Err(crate::payment::Error::UnsupportedUnit),
     }
 }
 
@@ -75,9 +159,9 @@ impl<T> MsatSatConverter<T> {
 #[async_trait]
 impl<T> MintPayment for MsatSatConverter<T>
 where
-    T: MintPayment<Err = cdk_common::payment::Error> + Send + Sync,
+    T: MintPayment<Err = crate::payment::Error> + Send + Sync,
 {
-    type Err = cdk_common::payment::Error;
+    type Err = crate::payment::Error;
 
     #[tracing::instrument(skip_all)]
     async fn start(&self) -> Result<(), Self::Err> {
@@ -232,9 +316,9 @@ impl<T> SatMsatConverter<T> {
 #[async_trait]
 impl<T> MintPayment for SatMsatConverter<T>
 where
-    T: MintPayment<Err = cdk_common::payment::Error> + Send + Sync,
+    T: MintPayment<Err = crate::payment::Error> + Send + Sync,
 {
-    type Err = cdk_common::payment::Error;
+    type Err = crate::payment::Error;
 
     #[tracing::instrument(skip_all)]
     async fn start(&self) -> Result<(), Self::Err> {
@@ -369,33 +453,30 @@ where
     }
 }
 
-fn ensure_settings_unit(
-    unit: &str,
-    expected: &CurrencyUnit,
-) -> Result<(), cdk_common::payment::Error> {
+fn ensure_settings_unit(unit: &str, expected: &CurrencyUnit) -> Result<(), crate::payment::Error> {
     let unit = CurrencyUnit::from_str(unit).map_err(|_| {
-        cdk_common::payment::Error::Custom(format!("invalid payment backend unit `{unit}`"))
+        crate::payment::Error::Custom(format!("invalid payment backend unit `{unit}`"))
     })?;
     if &unit == expected {
         Ok(())
     } else {
-        Err(cdk_common::payment::Error::UnsupportedUnit)
+        Err(crate::payment::Error::UnsupportedUnit)
     }
 }
 
-fn ensure_msat_unit(unit: &CurrencyUnit) -> Result<(), cdk_common::payment::Error> {
+fn ensure_msat_unit(unit: &CurrencyUnit) -> Result<(), crate::payment::Error> {
     if unit == &CurrencyUnit::Msat {
         Ok(())
     } else {
-        Err(cdk_common::payment::Error::UnsupportedUnit)
+        Err(crate::payment::Error::UnsupportedUnit)
     }
 }
 
-fn ensure_sat_unit(unit: &CurrencyUnit) -> Result<(), cdk_common::payment::Error> {
+fn ensure_sat_unit(unit: &CurrencyUnit) -> Result<(), crate::payment::Error> {
     if unit == &CurrencyUnit::Sat {
         Ok(())
     } else {
-        Err(cdk_common::payment::Error::UnsupportedUnit)
+        Err(crate::payment::Error::UnsupportedUnit)
     }
 }
 
@@ -405,7 +486,7 @@ pub fn validate_incoming_responses(
     payments: &[WaitPaymentResponse],
     requested: &PaymentIdentifier,
     native_unit: &CurrencyUnit,
-) -> Result<(), cdk_common::payment::Error> {
+) -> Result<(), crate::payment::Error> {
     for payment in payments {
         if &payment.payment_identifier != requested {
             return Err(correlation_error(
@@ -431,7 +512,7 @@ pub fn validate_outgoing_response(
     response: &MakePaymentResponse,
     requested: Option<&PaymentIdentifier>,
     native_unit: &CurrencyUnit,
-) -> Result<(), cdk_common::payment::Error> {
+) -> Result<(), crate::payment::Error> {
     if let Some(requested) = requested {
         if &response.payment_lookup_id != requested {
             return Err(correlation_error(
@@ -455,8 +536,8 @@ fn correlation_error(
     direction: &str,
     expected: &PaymentIdentifier,
     actual: &PaymentIdentifier,
-) -> cdk_common::payment::Error {
-    cdk_common::payment::Error::Custom(format!(
+) -> crate::payment::Error {
+    crate::payment::Error::Custom(format!(
         "{direction} payment correlation mismatch: expected {expected}, got {actual}"
     ))
 }
@@ -465,17 +546,17 @@ fn unit_error(
     direction: &str,
     expected: &CurrencyUnit,
     actual: &CurrencyUnit,
-) -> cdk_common::payment::Error {
-    cdk_common::payment::Error::Custom(format!(
+) -> crate::payment::Error {
+    crate::payment::Error::Custom(format!(
         "{direction} physical payment unit mismatch: expected {expected}, got {actual}"
     ))
 }
 
 fn msats_to_sats(
     amount: Amount<CurrencyUnit>,
-) -> Result<Amount<CurrencyUnit>, cdk_common::payment::Error> {
+) -> Result<Amount<CurrencyUnit>, crate::payment::Error> {
     if amount.unit() != &CurrencyUnit::Msat {
-        return Err(cdk_common::payment::Error::UnsupportedUnit);
+        return Err(crate::payment::Error::UnsupportedUnit);
     }
     Ok(Amount::new(
         div_ceil(amount.value(), MSAT_IN_SAT),
@@ -485,30 +566,31 @@ fn msats_to_sats(
 
 fn msats_to_sats_floor(
     amount: Amount<CurrencyUnit>,
-) -> Result<Amount<CurrencyUnit>, cdk_common::payment::Error> {
+) -> Result<Amount<CurrencyUnit>, crate::payment::Error> {
     if amount.unit() != &CurrencyUnit::Msat {
-        return Err(cdk_common::payment::Error::UnsupportedUnit);
+        return Err(crate::payment::Error::UnsupportedUnit);
     }
     Ok(Amount::new(amount.value() / MSAT_IN_SAT, CurrencyUnit::Sat))
 }
 
 fn sats_to_msats(
     amount: Amount<CurrencyUnit>,
-) -> Result<Amount<CurrencyUnit>, cdk_common::payment::Error> {
+) -> Result<Amount<CurrencyUnit>, crate::payment::Error> {
     if amount.unit() != &CurrencyUnit::Sat {
-        return Err(cdk_common::payment::Error::UnsupportedUnit);
+        return Err(crate::payment::Error::UnsupportedUnit);
     }
     Ok(Amount::new(
-        amount.value().checked_mul(MSAT_IN_SAT).ok_or_else(|| {
-            cdk_common::payment::Error::Custom("msat amount overflow".to_string())
-        })?,
+        amount
+            .value()
+            .checked_mul(MSAT_IN_SAT)
+            .ok_or_else(|| crate::payment::Error::Custom("msat amount overflow".to_string()))?,
         CurrencyUnit::Msat,
     ))
 }
 
 fn convert_incoming_options_to_sat(
     options: IncomingPaymentOptions,
-) -> Result<IncomingPaymentOptions, cdk_common::payment::Error> {
+) -> Result<IncomingPaymentOptions, crate::payment::Error> {
     match options {
         IncomingPaymentOptions::Bolt11(mut options) => {
             options.amount = msats_to_sats(options.amount)?;
@@ -526,15 +608,13 @@ fn convert_incoming_options_to_sat(
             }
             Ok(IncomingPaymentOptions::Custom(options))
         }
-        IncomingPaymentOptions::Onchain(_) => {
-            Err(cdk_common::payment::Error::UnsupportedPaymentOption)
-        }
+        IncomingPaymentOptions::Onchain(_) => Err(crate::payment::Error::UnsupportedPaymentOption),
     }
 }
 
 fn convert_outgoing_options_to_sat(
     options: OutgoingPaymentOptions,
-) -> Result<OutgoingPaymentOptions, cdk_common::payment::Error> {
+) -> Result<OutgoingPaymentOptions, crate::payment::Error> {
     match options {
         OutgoingPaymentOptions::Bolt11(mut options) => {
             if let Some(amount) = options.max_fee_amount {
@@ -557,15 +637,13 @@ fn convert_outgoing_options_to_sat(
             }
             Ok(OutgoingPaymentOptions::Custom(options))
         }
-        OutgoingPaymentOptions::Onchain(_) => {
-            Err(cdk_common::payment::Error::UnsupportedPaymentOption)
-        }
+        OutgoingPaymentOptions::Onchain(_) => Err(crate::payment::Error::UnsupportedPaymentOption),
     }
 }
 
 fn convert_incoming_options_to_msat(
     options: IncomingPaymentOptions,
-) -> Result<IncomingPaymentOptions, cdk_common::payment::Error> {
+) -> Result<IncomingPaymentOptions, crate::payment::Error> {
     match options {
         IncomingPaymentOptions::Bolt11(mut options) => {
             options.amount = sats_to_msats(options.amount)?;
@@ -583,15 +661,13 @@ fn convert_incoming_options_to_msat(
             }
             Ok(IncomingPaymentOptions::Custom(options))
         }
-        IncomingPaymentOptions::Onchain(_) => {
-            Err(cdk_common::payment::Error::UnsupportedPaymentOption)
-        }
+        IncomingPaymentOptions::Onchain(_) => Err(crate::payment::Error::UnsupportedPaymentOption),
     }
 }
 
 fn convert_outgoing_options_to_msat(
     options: OutgoingPaymentOptions,
-) -> Result<OutgoingPaymentOptions, cdk_common::payment::Error> {
+) -> Result<OutgoingPaymentOptions, crate::payment::Error> {
     match options {
         OutgoingPaymentOptions::Bolt11(mut options) => {
             if let Some(amount) = options.max_fee_amount {
@@ -614,13 +690,11 @@ fn convert_outgoing_options_to_msat(
             }
             Ok(OutgoingPaymentOptions::Custom(options))
         }
-        OutgoingPaymentOptions::Onchain(_) => {
-            Err(cdk_common::payment::Error::UnsupportedPaymentOption)
-        }
+        OutgoingPaymentOptions::Onchain(_) => Err(crate::payment::Error::UnsupportedPaymentOption),
     }
 }
 
-fn convert_event_to_msat(event: Event) -> Result<Event, cdk_common::payment::Error> {
+fn convert_event_to_msat(event: Event) -> Result<Event, crate::payment::Error> {
     match event {
         Event::PaymentReceived(payment) => Ok(Event::PaymentReceived(
             convert_wait_payment_response_to_msat(payment)?,
@@ -633,7 +707,7 @@ fn convert_event_to_msat(event: Event) -> Result<Event, cdk_common::payment::Err
     }
 }
 
-fn convert_event_to_sat(event: Event) -> Result<Event, cdk_common::payment::Error> {
+fn convert_event_to_sat(event: Event) -> Result<Event, crate::payment::Error> {
     match event {
         Event::PaymentReceived(payment) => Ok(Event::PaymentReceived(
             convert_wait_payment_response_to_sat(payment)?,
@@ -648,7 +722,7 @@ fn convert_event_to_sat(event: Event) -> Result<Event, cdk_common::payment::Erro
 
 fn convert_wait_payment_response_to_msat(
     payment: WaitPaymentResponse,
-) -> Result<WaitPaymentResponse, cdk_common::payment::Error> {
+) -> Result<WaitPaymentResponse, crate::payment::Error> {
     Ok(WaitPaymentResponse {
         payment_identifier: payment.payment_identifier,
         payment_amount: sats_to_msats(payment.payment_amount)?,
@@ -658,7 +732,7 @@ fn convert_wait_payment_response_to_msat(
 
 fn convert_make_payment_response_to_msat(
     response: MakePaymentResponse,
-) -> Result<MakePaymentResponse, cdk_common::payment::Error> {
+) -> Result<MakePaymentResponse, crate::payment::Error> {
     Ok(MakePaymentResponse {
         payment_lookup_id: response.payment_lookup_id,
         payment_proof: response.payment_proof,
@@ -669,7 +743,7 @@ fn convert_make_payment_response_to_msat(
 
 fn convert_wait_payment_response_to_sat(
     payment: WaitPaymentResponse,
-) -> Result<WaitPaymentResponse, cdk_common::payment::Error> {
+) -> Result<WaitPaymentResponse, crate::payment::Error> {
     Ok(WaitPaymentResponse {
         payment_identifier: payment.payment_identifier,
         payment_amount: msats_to_sats_floor(payment.payment_amount)?,
@@ -679,7 +753,7 @@ fn convert_wait_payment_response_to_sat(
 
 fn convert_make_payment_response_to_sat(
     response: MakePaymentResponse,
-) -> Result<MakePaymentResponse, cdk_common::payment::Error> {
+) -> Result<MakePaymentResponse, crate::payment::Error> {
     Ok(MakePaymentResponse {
         payment_lookup_id: response.payment_lookup_id,
         payment_proof: response.payment_proof,
@@ -694,11 +768,11 @@ fn convert_make_payment_response_to_sat(
 /// returned unchanged.
 pub fn convert_incoming_response_to_sat(
     payment: WaitPaymentResponse,
-) -> Result<WaitPaymentResponse, cdk_common::payment::Error> {
+) -> Result<WaitPaymentResponse, crate::payment::Error> {
     match payment.payment_amount.unit() {
         CurrencyUnit::Sat => Ok(payment),
         CurrencyUnit::Msat => convert_wait_payment_response_to_sat(payment),
-        _ => Err(cdk_common::payment::Error::UnsupportedUnit),
+        _ => Err(crate::payment::Error::UnsupportedUnit),
     }
 }
 
@@ -709,12 +783,12 @@ pub fn convert_incoming_response_to_sat(
 pub fn convert_outgoing_response_to_unit(
     response: MakePaymentResponse,
     target_unit: &CurrencyUnit,
-) -> Result<MakePaymentResponse, cdk_common::payment::Error> {
+) -> Result<MakePaymentResponse, crate::payment::Error> {
     match (response.total_spent.unit(), target_unit) {
         (source, target) if source == target => Ok(response),
         (CurrencyUnit::Msat, CurrencyUnit::Sat) => convert_make_payment_response_to_sat(response),
         (CurrencyUnit::Sat, CurrencyUnit::Msat) => convert_make_payment_response_to_msat(response),
-        _ => Err(cdk_common::payment::Error::UnsupportedUnit),
+        _ => Err(crate::payment::Error::UnsupportedUnit),
     }
 }
 
@@ -726,12 +800,12 @@ fn div_ceil(numerator: u64, denominator: u64) -> u64 {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use cdk_common::nuts::MeltQuoteState;
-    use cdk_common::payment::{
+    use crate::nuts::MeltQuoteState;
+    use crate::payment::{
         Bolt11IncomingPaymentOptions, CustomOutgoingPaymentOptions, OnchainIncomingPaymentOptions,
         OnchainOutgoingPaymentOptions,
     };
-    use cdk_common::QuoteId;
+    use crate::QuoteId;
     use futures::stream;
 
     use super::*;
@@ -751,7 +825,7 @@ mod tests {
 
     #[async_trait]
     impl MintPayment for MockSatPayment {
-        type Err = cdk_common::payment::Error;
+        type Err = crate::payment::Error;
 
         async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
             Ok(SettingsResponse {
@@ -768,10 +842,10 @@ mod tests {
             options: IncomingPaymentOptions,
         ) -> Result<CreateIncomingPaymentResponse, Self::Err> {
             let IncomingPaymentOptions::Bolt11(options) = options else {
-                return Err(cdk_common::payment::Error::UnsupportedPaymentOption);
+                return Err(crate::payment::Error::UnsupportedPaymentOption);
             };
             if options.amount.unit() != &self.unit {
-                return Err(cdk_common::payment::Error::UnsupportedUnit);
+                return Err(crate::payment::Error::UnsupportedUnit);
             }
             self.incoming_amounts
                 .lock()
@@ -791,7 +865,7 @@ mod tests {
             options: OutgoingPaymentOptions,
         ) -> Result<PaymentQuoteResponse, Self::Err> {
             if unit != &self.unit {
-                return Err(cdk_common::payment::Error::UnsupportedUnit);
+                return Err(crate::payment::Error::UnsupportedUnit);
             }
             self.quote_options
                 .lock()
@@ -801,7 +875,7 @@ mod tests {
                 .lock()
                 .expect("quote mutex should not be poisoned")
                 .clone()
-                .ok_or_else(|| cdk_common::payment::Error::Custom("missing quote".to_string()))
+                .ok_or_else(|| crate::payment::Error::Custom("missing quote".to_string()))
         }
 
         async fn make_payment(
@@ -810,7 +884,7 @@ mod tests {
             options: OutgoingPaymentOptions,
         ) -> Result<MakePaymentResponse, Self::Err> {
             if unit != &self.unit {
-                return Err(cdk_common::payment::Error::UnsupportedUnit);
+                return Err(crate::payment::Error::UnsupportedUnit);
             }
             self.make_options
                 .lock()
@@ -820,7 +894,7 @@ mod tests {
                 .lock()
                 .expect("make response mutex should not be poisoned")
                 .clone()
-                .ok_or_else(|| cdk_common::payment::Error::Custom("missing response".to_string()))
+                .ok_or_else(|| crate::payment::Error::Custom("missing response".to_string()))
         }
 
         async fn wait_payment_event(
@@ -859,7 +933,7 @@ mod tests {
                 .lock()
                 .expect("check response mutex should not be poisoned")
                 .clone()
-                .ok_or_else(|| cdk_common::payment::Error::Custom("missing response".to_string()))
+                .ok_or_else(|| crate::payment::Error::Custom("missing response".to_string()))
         }
     }
 

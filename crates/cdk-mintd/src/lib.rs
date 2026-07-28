@@ -39,17 +39,12 @@ use cdk_common::common::QuoteTTL;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::Amount;
 // internal crate modules
+use cdk_common::payment::unit_converter::sat_msat_backends;
 #[cfg(feature = "prometheus")]
 use cdk_common::payment::MetricsMintPayment;
 use cdk_common::payment::{DynMintPayment, MintPayment};
-use cdk_exchange_rate::sources::{BitstampRateSource, CoinbaseRateSource, KrakenRateSource};
-use cdk_exchange_rate::{
-    AggregatingRateOracle, AggregatorConfig, DynRateQuoteStore, InMemoryRateQuoteStore,
-    MsatSatConverter, PaymentErrorAdapter, RateConvertingPayment, RateConvertingPaymentConfig,
-    RateOracle, RateQuoteControlHandle, RateSource, SharedMintPayment,
-};
 #[cfg(feature = "postgres")]
-use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig, PostgresRateQuoteStore};
+use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig};
 #[cfg(feature = "sqlite")]
 use cdk_sqlite::mint::MintSqliteAuthDatabase;
 #[cfg(feature = "sqlite")]
@@ -73,9 +68,7 @@ pub mod setup;
 
 mod canonical_payment_event_owner;
 
-use canonical_payment_event_owner::{
-    canonical_sat_msat_backends, CallStatusOnlyPayment, CanonicalPaymentEventOwner,
-};
+use canonical_payment_event_owner::{canonical_sat_msat_backends, CanonicalPaymentEventOwner};
 
 #[cfg(test)]
 pub(crate) mod test_utils {
@@ -338,7 +331,6 @@ fn validate_settings(settings: &config::Settings) -> Result<()> {
     validate_listen_config(settings)?;
     validate_signing_config(settings)?;
     validate_lightning_config(settings)?;
-    validate_rate_quoter_settings(settings)?;
     validate_onchain_config(settings)?;
     validate_database_config(settings)?;
     validate_auth_config(settings)?;
@@ -713,7 +705,12 @@ async fn setup_database(
             }
 
             #[cfg(feature = "postgres")]
-            let db_config = resolved_postgres_config(pg_config);
+            let db_config = PgConfig::new(
+                pg_config.url.as_str(),
+                pg_config.tls_mode.as_deref(),
+                pg_config.max_connections,
+                pg_config.connection_timeout_seconds,
+            );
             #[cfg(feature = "postgres")]
             let pg_db = Arc::new(MintPgDatabase::new(db_config).await?);
             tracing::info!("PostgreSQL database connection established");
@@ -777,7 +774,7 @@ async fn configure_mint_builder(
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     work_dir: &Path,
     kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
-) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
+) -> Result<MintBuilder> {
     settings
         .validate_backend_pairing()
         .map_err(anyhow::Error::msg)?;
@@ -808,7 +805,7 @@ async fn configure_mint_builder(
     }
 
     // Configure lightning backend
-    let (mint_builder, rate_quote_control) = configure_lightning_backend(
+    let mint_builder = configure_lightning_backend(
         settings,
         mint_builder,
         localstore,
@@ -851,7 +848,7 @@ async fn configure_mint_builder(
         bail!("At least one payment backend (Lightning or On-chain) must be configured");
     }
 
-    Ok((mint_builder, rate_quote_control))
+    Ok(mint_builder)
 }
 
 /// Configures basic mint information (name, contact info, descriptions, etc.)
@@ -952,15 +949,14 @@ async fn configure_lightning_backend(
     _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     work_dir: &Path,
     _kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
-) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
+) -> Result<MintBuilder> {
     if settings.ln.is_empty() {
         tracing::info!("No Lightning backend configured");
-        return Ok((mint_builder, None));
+        return Ok(mint_builder);
     }
 
     #[cfg(feature = "fakewallet")]
     let mut configure_fake_wallet_keyset_rotations = false;
-    let mut rate_quote_control = None;
 
     for ln_entry in &settings.ln {
         let mint_melt_limits = MintMeltLimits {
@@ -994,17 +990,15 @@ async fn configure_lightning_backend(
                 #[cfg(feature = "prometheus")]
                 let cln = MetricsMintPayment::new(cln);
 
-                let configured = configure_backend_and_rate_quoter_for_unit(
+                mint_builder = configure_lightning_backend_for_unit(
                     settings,
                     mint_builder,
-                    localstore.clone(),
                     ln_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(cln),
+                    localstore.clone(),
                 )
                 .await?;
-                mint_builder = configured.0;
-                rate_quote_control = rate_quote_control.or(configured.1);
             }
             #[cfg(feature = "lnbits")]
             LnBackend::LNbits => {
@@ -1017,17 +1011,15 @@ async fn configure_lightning_backend(
                 #[cfg(feature = "prometheus")]
                 let lnbits = MetricsMintPayment::new(lnbits);
 
-                let configured = configure_backend_and_rate_quoter_for_unit(
+                mint_builder = configure_lightning_backend_for_unit(
                     settings,
                     mint_builder,
-                    localstore.clone(),
                     ln_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(lnbits),
+                    localstore.clone(),
                 )
                 .await?;
-                mint_builder = configured.0;
-                rate_quote_control = rate_quote_control.or(configured.1);
             }
             #[cfg(feature = "lnd")]
             LnBackend::Lnd => {
@@ -1046,17 +1038,15 @@ async fn configure_lightning_backend(
                 #[cfg(feature = "prometheus")]
                 let lnd = MetricsMintPayment::new(lnd);
 
-                let configured = configure_backend_and_rate_quoter_for_unit(
+                mint_builder = configure_lightning_backend_for_unit(
                     settings,
                     mint_builder,
-                    localstore.clone(),
                     ln_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(lnd),
+                    localstore.clone(),
                 )
                 .await?;
-                mint_builder = configured.0;
-                rate_quote_control = rate_quote_control.or(configured.1);
             }
             #[cfg(feature = "fakewallet")]
             LnBackend::FakeWallet => {
@@ -1079,18 +1069,16 @@ async fn configure_lightning_backend(
                 #[cfg(feature = "prometheus")]
                 let fake = MetricsMintPayment::new(fake);
 
-                let backend = Arc::new(fake);
-                let configured = configure_backend_and_rate_quoter_for_unit(
+                mint_builder = configure_lightning_backend_for_unit(
                     settings,
                     mint_builder,
-                    localstore.clone(),
                     ln_entry.unit.clone(),
                     mint_melt_limits,
-                    backend,
+                    Arc::new(fake),
+                    localstore.clone(),
                 )
                 .await?;
-                mint_builder = configured.0;
-                rate_quote_control = rate_quote_control.or(configured.1);
+
                 configure_fake_wallet_keyset_rotations = true;
             }
             #[cfg(feature = "grpc-processor")]
@@ -1113,18 +1101,15 @@ async fn configure_lightning_backend(
                 #[cfg(feature = "prometheus")]
                 let processor = MetricsMintPayment::new(processor);
 
-                let backend = Arc::new(processor);
-                let configured = configure_backend_and_rate_quoter_for_unit(
+                mint_builder = configure_lightning_backend_for_unit(
                     settings,
                     mint_builder,
-                    localstore.clone(),
                     ln_entry.unit.clone(),
                     mint_melt_limits,
-                    backend,
+                    Arc::new(processor),
+                    localstore.clone(),
                 )
                 .await?;
-                mint_builder = configured.0;
-                rate_quote_control = rate_quote_control.or(configured.1);
             }
             #[cfg(feature = "ldk-node")]
             LnBackend::LdkNode => {
@@ -1143,17 +1128,15 @@ async fn configure_lightning_backend(
                     )
                     .await?;
 
-                let configured = configure_backend_and_rate_quoter_for_unit(
+                mint_builder = configure_lightning_backend_for_unit(
                     settings,
                     mint_builder,
-                    localstore.clone(),
                     ln_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(ldk_node),
+                    localstore.clone(),
                 )
                 .await?;
-                mint_builder = configured.0;
-                rate_quote_control = rate_quote_control.or(configured.1);
             }
             LnBackend::None => {
                 tracing::info!(
@@ -1172,7 +1155,7 @@ async fn configure_lightning_backend(
         mint_builder = configure_fake_wallet_keyset_rotations_once(mint_builder, fake_wallet);
     }
 
-    Ok((mint_builder, rate_quote_control))
+    Ok(mint_builder)
 }
 
 #[cfg(feature = "fakewallet")]
@@ -1301,446 +1284,73 @@ async fn configure_onchain_backend(
     Ok(mint_builder)
 }
 
-async fn configure_backend_and_rate_quoter_for_unit(
+async fn configure_lightning_backend_for_unit(
     settings: &config::Settings,
     mint_builder: MintBuilder,
-    localstore: DynMintDatabase,
     unit: CurrencyUnit,
     mint_melt_limits: MintMeltLimits,
     backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
-) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
+    localstore: DynMintDatabase,
+) -> Result<MintBuilder> {
     if unit != CurrencyUnit::Sat {
-        return configure_non_sat_backend(
-            settings,
-            mint_builder,
-            localstore,
-            unit,
-            mint_melt_limits,
-            backend,
-        )
-        .await;
+        let owner = canonical_non_sat_backend(unit.clone(), backend, localstore).await?;
+        return configure_backend_for_unit(settings, mint_builder, unit, mint_melt_limits, owner)
+            .await;
     }
 
-    let (owner, backends) = canonical_sat_msat_backends(backend, localstore).await?;
+    let backends = canonical_sat_msat_backends(backend, localstore).await?;
     let mut mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
         CurrencyUnit::Sat,
         mint_melt_limits,
-        backends.sat.clone(),
+        backends.sat,
     )
     .await?;
-
+    let msat_mint_melt_limits = MintMeltLimits {
+        mint_min: Amount::from(mint_melt_limits.mint_min.to_u64().saturating_mul(1000)),
+        mint_max: Amount::from(mint_melt_limits.mint_max.to_u64().saturating_mul(1000)),
+        melt_min: Amount::from(mint_melt_limits.melt_min.to_u64().saturating_mul(1000)),
+        melt_max: Amount::from(mint_melt_limits.melt_max.to_u64().saturating_mul(1000)),
+    };
     mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
         CurrencyUnit::Msat,
-        msat_limits(mint_melt_limits),
+        msat_mint_melt_limits,
         backends.msat,
     )
     .await?;
 
-    configure_rate_quoter_for_sat_backend(
-        settings,
-        mint_builder,
-        mint_melt_limits,
-        backends.sat,
-        owner,
-    )
-    .await
+    Ok(mint_builder)
 }
 
-fn msat_limits(sat_limits: MintMeltLimits) -> MintMeltLimits {
-    // The MSAT route exposes the same economic limits in millisatoshis:
-    // 1 sat = 1000 msat.
-    MintMeltLimits {
-        mint_min: Amount::from(sat_limits.mint_min.to_u64().saturating_mul(1000)),
-        mint_max: Amount::from(sat_limits.mint_max.to_u64().saturating_mul(1000)),
-        melt_min: Amount::from(sat_limits.melt_min.to_u64().saturating_mul(1000)),
-        melt_max: Amount::from(sat_limits.melt_max.to_u64().saturating_mul(1000)),
-    }
-}
-
-async fn configure_non_sat_backend(
-    settings: &config::Settings,
-    mint_builder: MintBuilder,
-    localstore: DynMintDatabase,
+async fn canonical_non_sat_backend(
     unit: CurrencyUnit,
-    mint_melt_limits: MintMeltLimits,
     backend: DynMintPayment,
-) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
+    localstore: DynMintDatabase,
+) -> Result<DynMintPayment> {
     let backend = normalize_non_sat_backend_unit(unit.clone(), backend).await?;
-    let owner: DynMintPayment = Arc::new(CanonicalPaymentEventOwner::new(
-        backend,
-        localstore,
-        unit.clone(),
-    ));
-    let mint_builder =
-        configure_backend_for_unit(settings, mint_builder, unit, mint_melt_limits, owner).await?;
-    Ok((mint_builder, None))
+    Ok(Arc::new(CanonicalPaymentEventOwner::new(
+        backend, localstore, unit,
+    )))
 }
 
 async fn normalize_non_sat_backend_unit(
     configured_unit: CurrencyUnit,
-    backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
-) -> Result<Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>> {
+    backend: DynMintPayment,
+) -> Result<DynMintPayment> {
     let settings = backend.get_settings().await?;
     let backend_unit = CurrencyUnit::from_str(&settings.unit)
         .with_context(|| format!("Payment backend returned invalid unit `{}`", settings.unit))?;
 
     match (&backend_unit, &configured_unit) {
         (backend_unit, configured_unit) if backend_unit == configured_unit => Ok(backend),
-        (CurrencyUnit::Sat, CurrencyUnit::Msat) => Ok(Arc::new(MsatSatConverter::new(
-            SharedMintPayment::new(backend),
-        ))),
+        (CurrencyUnit::Sat, CurrencyUnit::Msat) => Ok(sat_msat_backends(backend).await?.msat),
         _ => bail!(
             "Payment backend reports unit {backend_unit} but config registers unit {configured_unit}; only matching units or sat/msat conversions are supported"
         ),
     }
-}
-
-fn validate_rate_quoter_sat_backend_count(settings: &config::Settings) -> Result<()> {
-    let Some(rate_quoter) = &settings.rate_quoter else {
-        return Ok(());
-    };
-    if rate_quoter_units(rate_quoter).is_empty() {
-        return Ok(());
-    }
-
-    let sat_backend_count = settings
-        .ln
-        .iter()
-        .filter(|ln| ln.ln_backend != LnBackend::None && ln.unit == CurrencyUnit::Sat)
-        .count();
-    if sat_backend_count != 1 {
-        bail!("rate_quoter requires exactly one SAT Lightning backend; found {sat_backend_count}");
-    }
-
-    Ok(())
-}
-
-async fn configure_rate_quoter_for_sat_backend(
-    settings: &config::Settings,
-    mut mint_builder: MintBuilder,
-    mint_melt_limits: MintMeltLimits,
-    sat_backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
-    event_owner: Arc<CanonicalPaymentEventOwner>,
-) -> Result<(MintBuilder, Option<RateQuoteControlHandle>)> {
-    let Some(rate_quoter) = validate_rate_quoter_settings(settings)? else {
-        if settings.rate_quoter.is_some() {
-            tracing::warn!("rate_quoter configured without units; no fiat processors registered");
-        }
-        return Ok((mint_builder, None));
-    };
-    let (oracle, store, control) = rate_quoter_runtime(settings, &rate_quoter).await?;
-    event_owner.install_rate_context(store.clone(), control.clone())?;
-
-    for fiat_unit in rate_quoter.units {
-        let config = RateConvertingPaymentConfig::new(
-            fiat_unit.clone(),
-            rate_quoter.config.buffer_bps,
-            rate_quoter.config.ttl_secs,
-        );
-        let processor = rate_converting_call_status_processor(
-            sat_backend.clone(),
-            oracle.clone(),
-            store.clone(),
-            config,
-            control.clone(),
-        );
-        mint_builder = configure_backend_for_unit(
-            settings,
-            mint_builder,
-            fiat_unit,
-            mint_melt_limits,
-            processor,
-        )
-        .await?;
-    }
-
-    Ok((mint_builder, Some(control)))
-}
-
-fn rate_converting_call_status_processor(
-    sat_backend: DynMintPayment,
-    oracle: Arc<dyn RateOracle>,
-    store: DynRateQuoteStore,
-    config: RateConvertingPaymentConfig,
-    control: RateQuoteControlHandle,
-) -> DynMintPayment {
-    let processor = RateConvertingPayment::with_control(
-        SharedMintPayment::new(sat_backend),
-        oracle,
-        store,
-        config,
-        control,
-    );
-    let processor: DynMintPayment = Arc::new(PaymentErrorAdapter::new(processor));
-    Arc::new(CallStatusOnlyPayment::new(processor))
-}
-
-struct ValidatedRateQuoter {
-    config: config::RateQuoter,
-    units: Vec<CurrencyUnit>,
-    providers: Vec<RateOracleProvider>,
-}
-
-fn validate_rate_quoter_settings(
-    settings: &config::Settings,
-) -> Result<Option<ValidatedRateQuoter>> {
-    let Some(rate_quoter) = settings.rate_quoter.clone() else {
-        return Ok(None);
-    };
-    let units = rate_quoter_units(&rate_quoter);
-    if units.is_empty() {
-        return Ok(None);
-    }
-    // Quotes priced from one snapshot must expire before it can become
-    // materially stale.
-    if !(60..=120).contains(&rate_quoter.ttl_secs) {
-        bail!(
-            "rate_quoter.ttl_secs must be between 60 and 120 seconds, got {}",
-            rate_quoter.ttl_secs
-        );
-    }
-    let providers = configured_rate_oracle_providers(&rate_quoter.sources)?;
-    validate_rate_quoter_quorum(&rate_quoter, providers.len())?;
-    validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)?;
-    validate_rate_quoter_sat_backend_count(settings)?;
-    Ok(Some(ValidatedRateQuoter {
-        config: rate_quoter,
-        units,
-        providers,
-    }))
-}
-
-async fn rate_quoter_runtime(
-    settings: &config::Settings,
-    validated: &ValidatedRateQuoter,
-) -> Result<(
-    Arc<AggregatingRateOracle>,
-    DynRateQuoteStore,
-    RateQuoteControlHandle,
-)> {
-    let rate_quoter = &validated.config;
-    let oracle = Arc::new(AggregatingRateOracle::with_config(
-        rate_quoter_sources(&validated.providers),
-        AggregatorConfig {
-            min_sources: rate_quoter.min_fetched,
-            min_survived: rate_quoter.min_survived,
-            max_clock_offset_secs: rate_quoter.staleness_secs,
-            ..AggregatorConfig::default()
-        },
-    ));
-    let store = rate_quote_store(settings, rate_quoter).await?;
-    // Persisted pause/cap/outstanding values take precedence; configuration
-    // seeds only units without an existing control record.
-    let control =
-        RateQuoteControlHandle::with_store_and_buffer_bps(store.clone(), rate_quoter.buffer_bps);
-    let persisted_units = control.load_persisted().await?;
-    validate_persisted_rate_quoter_caps_require_buffer(rate_quoter, &validated.units, &control)
-        .await?;
-    for (unit, cap) in &rate_quoter.per_unit_caps {
-        if !persisted_units.contains(unit) {
-            control.set_unit_issuance_cap(unit.clone(), *cap).await?;
-        }
-    }
-    Ok((oracle, store, control))
-}
-
-fn rate_quoter_units(rate_quoter: &config::RateQuoter) -> Vec<CurrencyUnit> {
-    let mut units = rate_quoter.units.clone();
-    for unit in rate_quoter.per_unit_caps.keys() {
-        if !units.contains(unit) {
-            units.push(unit.clone());
-        }
-    }
-    units
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum RateOracleProvider {
-    Coinbase,
-    Kraken,
-    Bitstamp,
-}
-
-impl RateOracleProvider {
-    const ALL: [Self; 3] = [Self::Coinbase, Self::Kraken, Self::Bitstamp];
-
-    fn alias(self) -> &'static str {
-        match self {
-            Self::Coinbase => "coinbase",
-            Self::Kraken => "kraken",
-            Self::Bitstamp => "bitstamp",
-        }
-    }
-
-    fn source(self) -> Box<dyn RateSource> {
-        match self {
-            Self::Coinbase => Box::new(CoinbaseRateSource::new()),
-            Self::Kraken => Box::new(KrakenRateSource::new()),
-            Self::Bitstamp => Box::new(BitstampRateSource::new()),
-        }
-    }
-}
-
-fn parse_rate_oracle_provider(configured: &str) -> Result<RateOracleProvider> {
-    if configured.trim() != configured {
-        bail!("rate_quoter source must not contain surrounding whitespace: {configured:?}");
-    }
-    if configured.contains("://") {
-        bail!(
-            "rate_quoter source URLs are not supported; endpoints are fixed by the implementation"
-        );
-    }
-
-    let lowered = configured.to_ascii_lowercase();
-    let mentioned = RateOracleProvider::ALL
-        .into_iter()
-        .filter(|provider| lowered.contains(provider.alias()))
-        .collect::<Vec<_>>();
-    if mentioned.len() > 1 {
-        bail!("Ambiguous rate_quoter source identifies multiple providers: {configured}");
-    }
-    RateOracleProvider::ALL
-        .into_iter()
-        .find(|provider| configured.eq_ignore_ascii_case(provider.alias()))
-        .ok_or_else(|| anyhow!("Unsupported rate_quoter source: {configured}"))
-}
-
-fn configured_rate_oracle_providers(source_configs: &[String]) -> Result<Vec<RateOracleProvider>> {
-    let providers = if source_configs.is_empty() {
-        RateOracleProvider::ALL.to_vec()
-    } else {
-        source_configs
-            .iter()
-            .map(|source| parse_rate_oracle_provider(source))
-            .collect::<Result<Vec<_>>>()?
-    };
-    let mut distinct = HashSet::with_capacity(providers.len());
-    for provider in &providers {
-        if !distinct.insert(*provider) {
-            bail!(
-                "Duplicate rate_quoter provider configured through alias: {}",
-                provider.alias()
-            );
-        }
-    }
-    Ok(providers)
-}
-
-fn validate_rate_quoter_quorum(
-    rate_quoter: &config::RateQuoter,
-    provider_count: usize,
-) -> Result<()> {
-    if rate_quoter.min_survived == 0 || rate_quoter.min_fetched == 0 {
-        bail!("rate_quoter quorum values must both be at least 1");
-    }
-    if rate_quoter.min_survived > rate_quoter.min_fetched {
-        bail!(
-            "rate_quoter.min_survived ({}) cannot exceed rate_quoter.min_fetched ({})",
-            rate_quoter.min_survived,
-            rate_quoter.min_fetched
-        );
-    }
-    if rate_quoter.min_fetched > provider_count {
-        bail!(
-            "rate_quoter.min_fetched ({}) cannot exceed the distinct provider count ({provider_count})",
-            rate_quoter.min_fetched
-        );
-    }
-    Ok(())
-}
-
-fn rate_quoter_sources(providers: &[RateOracleProvider]) -> Vec<Box<dyn RateSource>> {
-    providers
-        .iter()
-        .copied()
-        .map(RateOracleProvider::source)
-        .collect()
-}
-
-fn validate_configured_rate_quoter_caps_require_buffer(
-    rate_quoter: &config::RateQuoter,
-    units: &[CurrencyUnit],
-) -> Result<()> {
-    if rate_quoter.buffer_bps != 0 {
-        return Ok(());
-    }
-
-    for unit in units {
-        let configured_cap = rate_quoter
-            .per_unit_caps
-            .get(unit)
-            .copied()
-            .unwrap_or_default();
-        if configured_cap != 0 {
-            bail!(
-                "rate_quoter.buffer_bps must be nonzero when unit {unit} has a nonzero issuance cap"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-async fn validate_persisted_rate_quoter_caps_require_buffer(
-    rate_quoter: &config::RateQuoter,
-    units: &[CurrencyUnit],
-    control: &RateQuoteControlHandle,
-) -> Result<()> {
-    if rate_quoter.buffer_bps != 0 {
-        return Ok(());
-    }
-
-    for unit in units {
-        let persisted_cap = control.unit_issuance_cap(unit).await;
-        if persisted_cap != 0 {
-            bail!(
-                "rate_quoter.buffer_bps must be nonzero when unit {unit} has a nonzero issuance cap"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-async fn rate_quote_store(
-    settings: &config::Settings,
-    rate_quoter: &config::RateQuoter,
-) -> Result<DynRateQuoteStore> {
-    match settings.database.engine {
-        #[cfg(feature = "postgres")]
-        DatabaseEngine::Postgres => {
-            let postgres = settings
-                .database
-                .postgres
-                .as_ref()
-                .ok_or_else(|| anyhow!("Postgres rate_quoter requires database.postgres"))?;
-            Ok(Arc::new(
-                PostgresRateQuoteStore::with_config(resolved_postgres_config(postgres)).await?,
-            ))
-        }
-        #[cfg(not(feature = "postgres"))]
-        DatabaseEngine::Postgres => {
-            bail!("Postgres rate_quoter requires the postgres feature")
-        }
-        _ if rate_quoter.allow_in_memory_store => Ok(Arc::new(InMemoryRateQuoteStore::new())),
-        _ => bail!(
-            "rate_quoter with fiat units requires a durable Postgres rate quote store; set rate_quoter.allow_in_memory_store only for ephemeral development or tests"
-        ),
-    }
-}
-
-#[cfg(feature = "postgres")]
-fn resolved_postgres_config(postgres: &config::PostgresConfig) -> PgConfig {
-    PgConfig::new(
-        postgres.url.as_str(),
-        postgres.tls_mode.as_deref(),
-        postgres.max_connections,
-        postgres.connection_timeout_seconds,
-    )
 }
 
 /// Helper function to configure a mint builder with a lightning backend for a specific currency unit
@@ -2104,20 +1714,14 @@ async fn build_mint(
     }
 }
 
-struct ServiceStartupExtras {
-    routers: Vec<Router>,
-    auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
-    #[cfg(feature = "management-rpc")]
-    rate_quote_control: Option<RateQuoteControlHandle>,
-}
-
 async fn start_services_with_shutdown(
     mint: Arc<cdk::mint::Mint>,
     settings: &config::Settings,
     _work_dir: &Path,
     mint_builder_info: cdk::nuts::MintInfo,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
-    extras: ServiceStartupExtras,
+    routers: Vec<Router>,
+    auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
 ) -> Result<()> {
     let listen_addr = settings.info.listen_host.clone();
     let listen_port = settings.info.listen_port;
@@ -2138,29 +1742,11 @@ async fn start_services_with_shutdown(
                 let addr = rpc_settings.address.unwrap_or("127.0.0.1".to_string());
                 let port = rpc_settings.port.unwrap_or(8086);
                 let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(&addr, port, mint.clone())?;
-                if let Some(control) = extras.rate_quote_control.clone() {
-                    mint_rpc = mint_rpc.with_rate_quote_control(control);
-                }
 
                 let tls_dir = rpc_settings.tls_dir.unwrap_or(_work_dir.join("tls"));
 
                 let tls_dir = if tls_dir.exists() {
                     Some(tls_dir)
-                } else if extras.rate_quote_control.is_some() {
-                    // Fail closed: the management RPC controls fiat pause and
-                    // issuance-cap state. Running it unencrypted while fiat
-                    // rate-quoted units are enabled would let anyone who can
-                    // reach the port alter live fiat issuance controls. A
-                    // startup failure is preferable to fiat issuance on an
-                    // unsecured management plane.
-                    bail!(
-                        "management RPC TLS directory does not exist: {}. Refusing to start: \
-                         fiat rate-quoted units are enabled and their pause/cap controls must \
-                         not ride an unencrypted management RPC. Provision TLS certificates \
-                         (mint_management_rpc.tls_dir), disable the management RPC, or \
-                         disable the rate_quoter",
-                        tls_dir.display()
-                    );
                 } else if rpc_settings.allow_insecure {
                     tracing::warn!(
                         "TLS directory does not exist: {}. Starting RPC server in INSECURE mode without TLS encryption because allow_insecure is true",
@@ -2266,7 +1852,7 @@ async fn start_services_with_shutdown(
     tracing::info!("Payment methods: {:?}", custom_methods);
 
     // Configure auth for custom payment methods if auth is enabled
-    if let (Some(ref auth_settings), Some(auth_db)) = (&settings.auth, &extras.auth_localstore) {
+    if let (Some(ref auth_settings), Some(auth_db)) = (&settings.auth, &auth_localstore) {
         if auth_settings.auth_enabled {
             use std::collections::HashMap;
 
@@ -2432,7 +2018,7 @@ async fn start_services_with_shutdown(
         )
         .layer(TraceLayer::new_for_http());
 
-    for router in extras.routers {
+    for router in routers {
         mint_service = mint_service.merge(router);
     }
 
@@ -2632,7 +2218,7 @@ pub async fn run_mintd_with_shutdown(
         }
     };
 
-    let (mint_builder, rate_quote_control) = configure_mint_builder(
+    let mint_builder = configure_mint_builder(
         settings,
         maybe_mint_builder,
         localstore,
@@ -2641,9 +2227,6 @@ pub async fn run_mintd_with_shutdown(
         Some(kv),
     )
     .await?;
-    #[cfg(not(feature = "management-rpc"))]
-    let _ = rate_quote_control;
-
     let (mint_builder, auth_localstore) =
         setup_authentication(settings, work_dir, mint_builder, db_password).await?;
 
@@ -2661,19 +2244,14 @@ pub async fn run_mintd_with_shutdown(
         work_dir,
         config_mint_info,
         shutdown_signal,
-        ServiceStartupExtras {
-            routers,
-            auth_localstore,
-            #[cfg(feature = "management-rpc")]
-            rate_quote_control,
-        },
+        routers,
+        auth_localstore,
     )
     .await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
 
@@ -2732,6 +2310,35 @@ mod tests {
         );
 
         let _ = fs::remove_file(&seed_file);
+    }
+
+    #[tokio::test]
+    async fn custom_shutdown_entrypoint_validates_before_initial_setup() {
+        let work_dir = temp_seed_file("invalid_startup");
+        let _ = fs::remove_dir_all(&work_dir);
+        let settings = config::Settings {
+            info: config::Info {
+                listen_host: "not-an-ip-address".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = run_mintd_with_shutdown(
+            &work_dir,
+            &settings,
+            std::future::ready(()),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect_err("invalid settings must fail before startup");
+        let work_dir_created = work_dir.exists();
+        let _ = fs::remove_dir_all(&work_dir);
+
+        assert!(error.to_string().contains("Invalid mint listen address"));
+        assert!(!work_dir_created, "validation must precede database setup");
     }
 
     #[cfg(feature = "bdk")]
@@ -2888,7 +2495,7 @@ ln_backend = "fakewallet"
 
         let localstore = Arc::new(memory::empty().await.unwrap());
         let builder = MintBuilder::new(localstore.clone());
-        let (builder, _) = configure_lightning_backend(
+        let builder = configure_lightning_backend(
             &settings,
             builder,
             localstore,
@@ -2930,10 +2537,48 @@ ln_backend = "fakewallet"
             .expect("msat/sat compatible units should pass");
     }
 
+    #[cfg(feature = "fakewallet")]
+    #[tokio::test]
+    async fn non_sat_backend_normalization_converts_native_sat_to_msat() {
+        use crate::config::{FakeWallet, Ln, LnBackend};
+
+        let settings = config::Settings {
+            ln: vec![Ln {
+                ln_backend: LnBackend::FakeWallet,
+                unit: CurrencyUnit::Sat,
+                ..Default::default()
+            }],
+            fake_wallet: Some(FakeWallet::default()),
+            ..Default::default()
+        };
+        let fake = settings
+            .fake_wallet
+            .clone()
+            .expect("fake wallet config")
+            .setup(
+                &settings,
+                CurrencyUnit::Sat,
+                None,
+                &std::env::temp_dir(),
+                None,
+            )
+            .await
+            .expect("native sat backend");
+
+        let normalized = normalize_non_sat_backend_unit(CurrencyUnit::Msat, Arc::new(fake))
+            .await
+            .expect("sat backend should be adapted to msat");
+
+        assert_eq!(
+            normalized.get_settings().await.expect("settings").unit,
+            CurrencyUnit::Msat.to_string()
+        );
+    }
+
     #[test]
     fn backend_unit_validation_rejects_unsupported_conversion() {
-        let err = validate_backend_unit(&CurrencyUnit::Eur, "SAT")
-            .expect_err("sat backend should not advertise eur");
+        let err = validate_backend_unit(&CurrencyUnit::Usd, "SAT")
+            .expect_err("a native sat backend must not become a USD issuer");
 
         assert!(
             err.to_string().contains("only matching units"),
@@ -2998,120 +2643,6 @@ ln_backend = "fakewallet"
         assert!(err.to_string().contains("Duplicate payment processor"));
     }
 
-    #[cfg(feature = "fakewallet")]
-    #[test]
-    fn rate_quoter_requires_exactly_one_configured_sat_backend() {
-        use crate::config::{Ln, LnBackend, RateQuoter};
-
-        let rate_quoter = RateQuoter {
-            units: vec![CurrencyUnit::Usd],
-            ..Default::default()
-        };
-        let no_lightning = config::Settings {
-            rate_quoter: Some(rate_quoter.clone()),
-            ..Default::default()
-        };
-        let msat_only = config::Settings {
-            ln: vec![Ln {
-                ln_backend: LnBackend::FakeWallet,
-                unit: CurrencyUnit::Msat,
-                ..Default::default()
-            }],
-            rate_quoter: Some(rate_quoter.clone()),
-            ..Default::default()
-        };
-        let one_sat = config::Settings {
-            ln: vec![Ln {
-                ln_backend: LnBackend::FakeWallet,
-                unit: CurrencyUnit::Sat,
-                ..Default::default()
-            }],
-            rate_quoter: Some(rate_quoter.clone()),
-            ..Default::default()
-        };
-        let multiple_sat = config::Settings {
-            ln: vec![
-                Ln {
-                    ln_backend: LnBackend::FakeWallet,
-                    unit: CurrencyUnit::Sat,
-                    ..Default::default()
-                },
-                Ln {
-                    ln_backend: LnBackend::FakeWallet,
-                    unit: CurrencyUnit::Sat,
-                    ..Default::default()
-                },
-            ],
-            rate_quoter: Some(rate_quoter),
-            ..Default::default()
-        };
-
-        let no_lightning_error = validate_rate_quoter_sat_backend_count(&no_lightning)
-            .expect_err("an active rate quoter must reject an empty Lightning config");
-        let msat_only_error = validate_rate_quoter_sat_backend_count(&msat_only)
-            .expect_err("an active rate quoter must reject an MSAT-only Lightning config");
-        validate_rate_quoter_sat_backend_count(&one_sat)
-            .expect("one configured SAT backend should be accepted");
-        let multiple_sat_error = validate_rate_quoter_sat_backend_count(&multiple_sat)
-            .expect_err("multiple SAT backends must fail closed with rate quoting");
-
-        assert!(no_lightning_error.to_string().contains("found 0"));
-        assert!(msat_only_error.to_string().contains("found 0"));
-        assert!(multiple_sat_error.to_string().contains("found 2"));
-    }
-
-    #[cfg(feature = "fakewallet")]
-    #[test]
-    fn empty_rate_quoter_section_is_a_no_op() {
-        use crate::config::{Ln, LnBackend, RateQuoter};
-
-        let settings = config::Settings {
-            ln: vec![
-                Ln {
-                    ln_backend: LnBackend::FakeWallet,
-                    unit: CurrencyUnit::Sat,
-                    ..Default::default()
-                },
-                Ln {
-                    ln_backend: LnBackend::FakeWallet,
-                    unit: CurrencyUnit::Sat,
-                    ..Default::default()
-                },
-            ],
-            rate_quoter: Some(RateQuoter::default()),
-            ..Default::default()
-        };
-
-        validate_rate_quoter_sat_backend_count(&settings)
-            .expect("a rate-quoter section without units should remain a no-op");
-    }
-
-    #[cfg(feature = "fakewallet")]
-    #[test]
-    fn multiple_sat_backends_are_not_rejected_without_rate_quoter() {
-        use crate::config::{Ln, LnBackend};
-
-        let settings = config::Settings {
-            ln: vec![
-                Ln {
-                    ln_backend: LnBackend::FakeWallet,
-                    unit: CurrencyUnit::Sat,
-                    ..Default::default()
-                },
-                Ln {
-                    ln_backend: LnBackend::FakeWallet,
-                    unit: CurrencyUnit::Sat,
-                    ..Default::default()
-                },
-            ],
-            rate_quoter: None,
-            ..Default::default()
-        };
-
-        validate_rate_quoter_sat_backend_count(&settings)
-            .expect("non-rate-quoter multi-backend behavior should remain unchanged");
-    }
-
     #[cfg(all(feature = "fakewallet", feature = "sqlite"))]
     #[tokio::test]
     async fn empty_ln_vec_returns_unchanged_builder() {
@@ -3125,7 +2656,7 @@ ln_backend = "fakewallet"
 
         let localstore = Arc::new(memory::empty().await.unwrap());
         let builder = MintBuilder::new(localstore.clone());
-        let (builder, _) = configure_lightning_backend(
+        let builder = configure_lightning_backend(
             &settings,
             builder,
             localstore,
@@ -3162,7 +2693,7 @@ ln_backend = "fakewallet"
 
         let localstore = Arc::new(memory::empty().await.unwrap());
         let builder = MintBuilder::new(localstore.clone());
-        let (builder, _) = configure_lightning_backend(
+        let builder = configure_lightning_backend(
             &settings,
             builder,
             localstore,
@@ -3197,7 +2728,7 @@ ln_backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let builder =
             configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
                 .await
@@ -3232,7 +2763,7 @@ ln_backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let builder =
             configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
                 .await
@@ -3274,7 +2805,7 @@ ln_backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let err = configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
             .await
             .expect_err("fakewallet onchain with real LN should bail");
@@ -3387,7 +2918,7 @@ ln_backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
 
         let fake_wallet = settings.fake_wallet.clone().expect("fake wallet config");
         let fake = fake_wallet
@@ -3453,7 +2984,7 @@ ln_backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let builder =
             configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
                 .await
@@ -3489,7 +3020,7 @@ ln_backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let err = configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
             .await
             .expect_err("missing fake_wallet config should bail");
@@ -4570,217 +4101,5 @@ ln_backend = "fakewallet"
         .expect("config with env port override should load");
 
         assert_eq!(settings.info.listen_port, 9090);
-    }
-
-    fn configured_sources(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
-    }
-
-    #[cfg(feature = "fakewallet")]
-    fn active_rate_quoter_settings() -> config::Settings {
-        use crate::config::{FakeWallet, Ln, LnBackend};
-
-        config::Settings {
-            info: config::Info {
-                mnemonic: Some(TEST_MNEMONIC.to_string()),
-                ..Default::default()
-            },
-            ln: vec![Ln {
-                ln_backend: LnBackend::FakeWallet,
-                unit: CurrencyUnit::Sat,
-                ..Default::default()
-            }],
-            fake_wallet: Some(FakeWallet::default()),
-            rate_quoter: Some(config::RateQuoter {
-                units: vec![CurrencyUnit::Usd],
-                buffer_bps: 100,
-                per_unit_caps: HashMap::from([(CurrencyUnit::Usd, 100)]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[cfg(feature = "fakewallet")]
-    #[test]
-    fn validate_settings_rejects_invalid_active_rate_source() {
-        let mut settings = active_rate_quoter_settings();
-        settings.rate_quoter.as_mut().expect("rate quoter").sources =
-            configured_sources(&["coinbase-pro"]);
-
-        let error = validate_settings(&settings)
-            .expect_err("static provider validation must run before mint startup");
-
-        assert!(error.to_string().contains("Unsupported rate_quoter source"));
-    }
-
-    #[cfg(feature = "fakewallet")]
-    #[test]
-    fn validate_settings_rejects_invalid_active_rate_quorum() {
-        let mut settings = active_rate_quoter_settings();
-        let rate_quoter = settings.rate_quoter.as_mut().expect("rate quoter");
-        rate_quoter.sources = configured_sources(&["coinbase", "kraken"]);
-        rate_quoter.min_fetched = 3;
-
-        let error = validate_settings(&settings)
-            .expect_err("static quorum validation must run before mint startup");
-
-        assert!(error
-            .to_string()
-            .contains("cannot exceed the distinct provider count"));
-    }
-
-    #[test]
-    fn rate_quoter_canonicalizes_supported_provider_aliases() {
-        let providers = configured_rate_oracle_providers(&configured_sources(&[
-            "Coinbase", "KRAKEN", "bitstamp",
-        ]))
-        .expect("mixed-case aliases");
-
-        assert_eq!(providers, RateOracleProvider::ALL);
-        assert_eq!(
-            configured_rate_oracle_providers(&[]).expect("default providers"),
-            RateOracleProvider::ALL
-        );
-    }
-
-    #[test]
-    fn rate_quoter_rejects_urls_duplicates_ambiguous_and_inexact_sources() {
-        for (sources, expected) in [
-            (
-                configured_sources(&["https://api.coinbase.com"]),
-                "URLs are not supported",
-            ),
-            (
-                configured_sources(&["coinbase", "CoinBase"]),
-                "Duplicate rate_quoter provider",
-            ),
-            (
-                configured_sources(&["coinbase-kraken"]),
-                "Ambiguous rate_quoter source",
-            ),
-            (configured_sources(&[" coinbase"]), "surrounding whitespace"),
-            (
-                configured_sources(&["coinbase-pro"]),
-                "Unsupported rate_quoter source",
-            ),
-        ] {
-            let error = configured_rate_oracle_providers(&sources)
-                .expect_err("invalid provider configuration must fail");
-            assert!(
-                error.to_string().contains(expected),
-                "expected {expected:?} in {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn rate_quoter_quorum_must_fit_distinct_provider_count() {
-        for (min_fetched, min_survived, expected) in [
-            (0, 0, "at least 1"),
-            (3, 0, "at least 1"),
-            (2, 3, "cannot exceed rate_quoter.min_fetched"),
-            (4, 3, "cannot exceed the distinct provider count"),
-        ] {
-            let rate_quoter = config::RateQuoter {
-                min_fetched,
-                min_survived,
-                ..Default::default()
-            };
-            let error =
-                validate_rate_quoter_quorum(&rate_quoter, 3).expect_err("invalid quorum must fail");
-            assert!(
-                error.to_string().contains(expected),
-                "expected {expected:?} in {error}"
-            );
-        }
-
-        validate_rate_quoter_quorum(&config::RateQuoter::default(), 3)
-            .expect("default 3/2 quorum over three providers");
-    }
-
-    fn rate_quoter_with_usd_cap(buffer_bps: u64, cap: u64) -> config::RateQuoter {
-        config::RateQuoter {
-            units: vec![CurrencyUnit::Usd],
-            buffer_bps,
-            per_unit_caps: HashMap::from([(CurrencyUnit::Usd, cap)]),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn rate_quoter_rejects_nonzero_cap_with_omitted_buffer() {
-        let rate_quoter = config::RateQuoter {
-            units: vec![CurrencyUnit::Usd],
-            per_unit_caps: HashMap::from([(CurrencyUnit::Usd, 100)]),
-            ..Default::default()
-        };
-        let units = rate_quoter_units(&rate_quoter);
-
-        let error = validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
-            .expect_err("omitted buffer defaults to zero and must reject nonzero caps");
-        assert!(error.to_string().contains("buffer_bps must be nonzero"));
-    }
-
-    #[tokio::test]
-    async fn rate_quoter_rejects_nonzero_cap_with_zero_buffer() {
-        let rate_quoter = rate_quoter_with_usd_cap(0, 100);
-        let units = rate_quoter_units(&rate_quoter);
-
-        let error = validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
-            .expect_err("explicit zero buffer must reject nonzero caps");
-        assert!(error.to_string().contains("buffer_bps must be nonzero"));
-    }
-
-    #[tokio::test]
-    async fn rate_quoter_allows_nonzero_cap_with_nonzero_buffer() {
-        let rate_quoter = rate_quoter_with_usd_cap(100, 100);
-        let units = rate_quoter_units(&rate_quoter);
-
-        validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
-            .expect("nonzero buffer allows nonzero caps");
-    }
-
-    #[tokio::test]
-    async fn rate_quoter_rejects_persisted_nonzero_cap_with_zero_buffer() {
-        let store: DynRateQuoteStore = Arc::new(InMemoryRateQuoteStore::new());
-        let seed_control = RateQuoteControlHandle::with_store_and_buffer_bps(store.clone(), 100);
-        seed_control
-            .set_unit_issuance_cap(CurrencyUnit::Usd, 100)
-            .await
-            .expect("seed persisted cap");
-
-        let rate_quoter = config::RateQuoter {
-            units: vec![CurrencyUnit::Usd],
-            buffer_bps: 0,
-            ..Default::default()
-        };
-        let control = RateQuoteControlHandle::with_store_and_buffer_bps(store, 0);
-        control.load_persisted().await.expect("load persisted cap");
-        let units = rate_quoter_units(&rate_quoter);
-
-        let error =
-            validate_persisted_rate_quoter_caps_require_buffer(&rate_quoter, &units, &control)
-                .await
-                .expect_err("persisted nonzero cap with zero buffer must reject startup");
-        assert!(error.to_string().contains("buffer_bps must be nonzero"));
-    }
-
-    #[tokio::test]
-    async fn rate_quoter_rejects_volatile_store_without_opt_in() {
-        let settings = config::Settings::default();
-        let rate_quoter = config::RateQuoter {
-            units: vec![CurrencyUnit::Usd],
-            allow_in_memory_store: false,
-            ..Default::default()
-        };
-
-        let error = match rate_quote_store(&settings, &rate_quoter).await {
-            Ok(_) => panic!("sqlite must not silently fall back to volatile rate quote store"),
-            Err(error) => error,
-        };
-        assert!(error
-            .to_string()
-            .contains("durable Postgres rate quote store"));
     }
 }
