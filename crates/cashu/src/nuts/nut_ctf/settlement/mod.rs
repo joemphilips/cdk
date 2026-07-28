@@ -6,12 +6,17 @@
 mod canonical;
 mod condition;
 mod manifest;
+mod refund;
 mod request;
 mod settings;
 
 pub use canonical::{ctf_receive_commitment, CanonicalHash};
 pub use condition::{PayToUnlockAuthorization, PayToUnlockCondition, PayToUnlockMode, PoolPolicy};
 pub use manifest::{PoolEntry, PoolEntryRole, PoolManifest, SelectionBitmap};
+pub use refund::{
+    pay_to_unlock_refund_digest, reject_pay_to_unlock_inputs, sign_pay_to_unlock_refund,
+    verify_pay_to_unlock_refund,
+};
 pub use request::{
     CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits, CtfSettlementParticipant,
     CtfSettlementRequest, ParticipantMode,
@@ -119,6 +124,15 @@ pub enum Error {
     /// A participating keyset could not be resolved.
     #[error("participating keyset is unknown")]
     UnknownKeyset,
+    /// A settlement request arrived at or after its authorization expiry.
+    #[error("settlement authorization has expired")]
+    SettlementAfterExpiry,
+    /// A refund request arrived before its authorization expiry.
+    #[error("PAY_TO_UNLOCK refund is not yet available")]
+    RefundBeforeExpiry,
+    /// A refund witness was missing, malformed, or invalid.
+    #[error("PAY_TO_UNLOCK refund witness is missing or invalid")]
+    RefundWitnessMissingOrInvalid,
     /// JSON decoding failed.
     #[error("invalid settlement JSON: {0}")]
     Json(String),

@@ -53,6 +53,7 @@ impl Mint {
         let mut conservation = OutcomeConservation::new(&outcomes);
         let all_input_proofs =
             collect_inputs(&resolver, &request.inputs, &mut conservation).await?;
+        super::reject_pay_to_unlock_spend(&all_input_proofs)?;
         let collected_outputs =
             collect_outputs(&resolver, &request.outputs, &mut conservation).await?;
 

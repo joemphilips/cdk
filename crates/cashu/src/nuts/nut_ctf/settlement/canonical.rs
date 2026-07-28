@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
 use super::Error;
 use crate::nuts::nut00::BlindedMessage;
@@ -99,6 +100,43 @@ pub(crate) fn canonical_output_entry(output: &BlindedMessage) -> Vec<u8> {
         output.keyset_id
     )
     .into_bytes()
+}
+
+pub(super) fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Error> {
+    match value {
+        Value::Null => output.extend_from_slice(b"null"),
+        Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
+        Value::Number(number) => output.extend_from_slice(number.to_string().as_bytes()),
+        Value::String(string) => serde_json::to_writer(output, string)?,
+        Value::Array(values) => write_canonical_array(values, output)?,
+        Value::Object(values) => {
+            output.push(b'{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key)?;
+                output.push(b':');
+                write_canonical_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+fn write_canonical_array(values: &[Value], output: &mut Vec<u8>) -> Result<(), Error> {
+    output.push(b'[');
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            output.push(b',');
+        }
+        write_canonical_json(value, output)?;
+    }
+    output.push(b']');
+    Ok(())
 }
 
 /// Compute the CTF-specific commitment for one declared output bundle.

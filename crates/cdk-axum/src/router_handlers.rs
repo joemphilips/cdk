@@ -1346,7 +1346,10 @@ fn ctf_settlement_error_response(error: cdk::nuts::nut_ctf::settlement::Error) -
         SettlementError::InvalidPoolPolicy(_) | SettlementError::ArithmeticOverflow => {
             ErrorCode::Unknown(15014)
         }
-        _ => ErrorCode::Unknown(15001),
+        SettlementError::SettlementAfterExpiry => ErrorCode::SettlementAfterExpiry,
+        SettlementError::RefundBeforeExpiry => ErrorCode::RefundBeforeExpiry,
+        SettlementError::RefundWitnessMissingOrInvalid => ErrorCode::RefundWitnessMissingOrInvalid,
+        _ => ErrorCode::PayToUnlockInvalidCondition,
     };
     (
         StatusCode::BAD_REQUEST,
@@ -1360,7 +1363,7 @@ fn multi_party_unavailable_response() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(ErrorResponse::new(
-            ErrorCode::Unknown(15001),
+            ErrorCode::PayToUnlockInvalidCondition,
             "multi-party CTF settlement is not enabled".to_string(),
         )),
     )
@@ -1690,7 +1693,7 @@ mod ctf_convert_admission_tests {
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
         let error = decode_error(response).await;
-        assert_eq!(error.code, ErrorCode::Unknown(15001));
+        assert_eq!(error.code, ErrorCode::PayToUnlockInvalidCondition);
     }
 
     #[tokio::test]
@@ -1712,7 +1715,10 @@ mod ctf_convert_admission_tests {
                 SettlementError::InvalidManifest("role"),
                 ErrorCode::Unknown(15013),
             ),
-            (SettlementError::ZeroFeeKeyset, ErrorCode::Unknown(15001)),
+            (
+                SettlementError::ZeroFeeKeyset,
+                ErrorCode::PayToUnlockInvalidCondition,
+            ),
         ];
 
         for (failure, expected) in cases {

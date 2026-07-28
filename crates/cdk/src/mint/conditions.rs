@@ -409,6 +409,7 @@ impl Mint {
         if fee.is_empty() {
             return Err(Error::RegistrationFeeInsufficient);
         }
+        super::reject_pay_to_unlock_spend(fee)?;
 
         let collateral_unit = cdk_common::CurrencyUnit::from_str(collateral)
             .map_err(|_| Error::Custom(format!("Invalid collateral unit: {}", collateral)))?;
