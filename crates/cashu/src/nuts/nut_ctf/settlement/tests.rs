@@ -34,7 +34,7 @@ fn receive_commitment_has_stable_ctf_vector() {
 }
 
 #[test]
-fn condition_parser_enforces_closed_tags_and_minimal_numbers() {
+fn condition_parser_accepts_reduced_pool_policy() {
     let valid_condition = condition(
         "01",
         &"11".repeat(32),
@@ -57,7 +57,10 @@ fn condition_parser_enforces_closed_tags_and_minimal_numbers() {
             max_debit: 100,
         })
     ));
+}
 
+#[test]
+fn condition_parser_rejects_invalid_pool_numbers() {
     let partial = condition("02", &"22".repeat(32), KEYSET_A, &[("rate_n", "5")]);
     assert_eq!(
         PayToUnlockCondition::parse(&partial),
@@ -80,67 +83,6 @@ fn condition_parser_enforces_closed_tags_and_minimal_numbers() {
         Err(Error::InvalidDecimal { field: "rate_n" })
     );
 
-    let unknown = Secret::new(
-        json!([
-            "PAY_TO_UNLOCK",
-            {
-                "nonce": "04".repeat(32),
-                "data": "44".repeat(32),
-                "tags": [
-                    ["offer_keyset", KEYSET_A],
-                    ["expiry", "100"],
-                    ["refund", REFUND_KEY],
-                    ["allow_change"]
-                ]
-            }
-        ])
-        .to_string(),
-    );
-    assert_eq!(
-        PayToUnlockCondition::parse(&unknown),
-        Err(Error::UnknownTag)
-    );
-
-    let missing = Secret::new(
-        json!([
-            "PAY_TO_UNLOCK",
-            {
-                "nonce": "05".repeat(32),
-                "data": "55".repeat(32),
-                "tags": [
-                    ["offer_keyset", KEYSET_A],
-                    ["expiry", "100"]
-                ]
-            }
-        ])
-        .to_string(),
-    );
-    assert_eq!(
-        PayToUnlockCondition::parse(&missing),
-        Err(Error::MissingTag("refund"))
-    );
-
-    let duplicate = Secret::new(
-        json!([
-            "PAY_TO_UNLOCK",
-            {
-                "nonce": "06".repeat(32),
-                "data": "66".repeat(32),
-                "tags": [
-                    ["offer_keyset", KEYSET_A],
-                    ["expiry", "100"],
-                    ["expiry", "101"],
-                    ["refund", REFUND_KEY]
-                ]
-            }
-        ])
-        .to_string(),
-    );
-    assert_eq!(
-        PayToUnlockCondition::parse(&duplicate),
-        Err(Error::DuplicateTag)
-    );
-
     let unreduced = condition(
         "07",
         &"77".repeat(32),
@@ -158,6 +100,49 @@ fn condition_parser_enforces_closed_tags_and_minimal_numbers() {
             "rate_n/rate_d must be a reduced fraction"
         ))
     );
+}
+
+#[test]
+fn condition_parser_rejects_closed_tag_violations() {
+    let cases = [
+        (
+            json!([
+                ["offer_keyset", KEYSET_A],
+                ["expiry", "100"],
+                ["refund", REFUND_KEY],
+                ["allow_change"]
+            ]),
+            Error::UnknownTag,
+        ),
+        (
+            json!([["offer_keyset", KEYSET_A], ["expiry", "100"]]),
+            Error::MissingTag("refund"),
+        ),
+        (
+            json!([
+                ["offer_keyset", KEYSET_A],
+                ["expiry", "100"],
+                ["expiry", "101"],
+                ["refund", REFUND_KEY]
+            ]),
+            Error::DuplicateTag,
+        ),
+    ];
+
+    for (index, (tags, expected)) in cases.into_iter().enumerate() {
+        let secret = Secret::new(
+            json!([
+                "PAY_TO_UNLOCK",
+                {
+                    "nonce": format!("{:02x}", index + 4).repeat(32),
+                    "data": "44".repeat(32),
+                    "tags": tags
+                }
+            ])
+            .to_string(),
+        );
+        assert_eq!(PayToUnlockCondition::parse(&secret), Err(expected));
+    }
 }
 
 #[test]
@@ -397,6 +382,60 @@ fn admission_preserves_legacy_convert_wire_decode() {
 }
 
 #[test]
+fn admission_counts_exact_raw_bytes_per_convert_mode() {
+    let multi = serde_json::to_vec(&json!({
+        "condition_id": "11".repeat(32),
+        "participants": [
+            {"inputs": [], "outputs": []},
+            {"inputs": [], "outputs": []}
+        ]
+    }))
+    .expect("serializable request");
+    let legacy = serde_json::to_vec(&json!({
+        "condition_id": "11".repeat(32),
+        "inputs": {},
+        "outputs": {}
+    }))
+    .expect("serializable request");
+    let limits = CtfSettlementLimits {
+        max_request_bytes: 1024,
+        ..limits()
+    };
+
+    let padded_multi = left_pad_json(multi, 1025);
+    assert!(matches!(
+        CtfConvertAdmission::preflight_convert(&padded_multi, limits, 2048),
+        Err(Error::LimitExceeded("request bytes"))
+    ));
+
+    let padded_legacy = left_pad_json(legacy, 1025);
+    let admission = CtfConvertAdmission::preflight_convert(&padded_legacy, limits, 2048)
+        .expect("legacy retains its larger transport limit");
+    assert_eq!(admission.mode(), CtfConvertMode::SingleParty);
+    admission
+        .decode_single_party()
+        .expect("whitespace-padded legacy request");
+}
+
+#[test]
+fn legacy_admission_bounds_counts_before_typed_key_parsing() {
+    let malformed_inputs = (0..17)
+        .map(|_| json!({"id": "not-a-key"}))
+        .collect::<Vec<_>>();
+    let legacy = serde_json::to_vec(&json!({
+        "condition_id": "11".repeat(32),
+        "inputs": {"*": malformed_inputs},
+        "outputs": {}
+    }))
+    .expect("serializable request");
+
+    assert!(matches!(
+        CtfConvertAdmission::preflight_convert(&legacy, limits(), 16 * 1024),
+        Err(Error::LimitExceeded("inputs"))
+    ));
+}
+
+#[test]
 fn standard_request_round_trips_and_validates() {
     let request = valid_standard_request();
     let encoded = serde_json::to_vec(&request).expect("serializable request");
@@ -621,6 +660,12 @@ fn limits() -> CtfSettlementLimits {
         max_outputs: 16,
         max_pool_entries: 32,
     }
+}
+
+fn left_pad_json(mut json: Vec<u8>, target_len: usize) -> Vec<u8> {
+    let mut padded = vec![b' '; target_len.saturating_sub(json.len())];
+    padded.append(&mut json);
+    padded
 }
 
 fn valid_standard_request() -> CtfSettlementRequest {

@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,6 +26,42 @@ pub enum AuthHeader {
     None,
 }
 
+impl AuthHeader {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Result<Self, (StatusCode, String)> {
+        if let Some(bat) = headers.get(BLIND_AUTH_KEY) {
+            let token = bat
+                .to_str()
+                .map_err(|_| invalid_blind_auth_header())?
+                .to_string();
+            return BlindAuthToken::from_str(&token)
+                .map(Self::Blind)
+                .map_err(|_| invalid_blind_auth_header());
+        }
+
+        if let Some(cat) = headers.get(CLEAR_AUTH_KEY) {
+            let token = cat
+                .to_str()
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Invalid Clear-auth header value".to_string(),
+                    )
+                })?
+                .to_string();
+            return Ok(Self::Clear(token));
+        }
+
+        Ok(Self::None)
+    }
+}
+
+fn invalid_blind_auth_header() -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        "Invalid Blind-auth header value".to_string(),
+    )
+}
+
 impl From<AuthHeader> for Option<AuthToken> {
     fn from(value: AuthHeader) -> Option<AuthToken> {
         match value {
@@ -43,44 +79,7 @@ where
     type Rejection = (StatusCode, String);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Check for Blind-auth header
-        if let Some(bat) = parts.headers.get(BLIND_AUTH_KEY) {
-            let token = bat
-                .to_str()
-                .map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "Invalid Blind-auth header value".to_string(),
-                    )
-                })?
-                .to_string();
-
-            let token = BlindAuthToken::from_str(&token).map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Invalid Blind-auth header value".to_string(),
-                )
-            })?;
-
-            return Ok(AuthHeader::Blind(token));
-        }
-
-        // Check for Clear-auth header
-        if let Some(cat) = parts.headers.get(CLEAR_AUTH_KEY) {
-            let token = cat
-                .to_str()
-                .map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "Invalid Clear-auth header value".to_string(),
-                    )
-                })?
-                .to_string();
-            return Ok(AuthHeader::Clear(token));
-        }
-
-        // No authentication headers found - this is now valid
-        Ok(AuthHeader::None)
+        Self::from_headers(&parts.headers)
     }
 }
 

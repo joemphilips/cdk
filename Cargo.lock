@@ -1256,6 +1256,7 @@ dependencies = [
  "cdk-sqlite",
  "futures",
  "maud",
+ "mime",
  "moka",
  "paste",
  "redis",
