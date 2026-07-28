@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
@@ -42,10 +43,19 @@ pub enum CtfConvertMode {
 }
 
 /// A request that passed raw byte and cheap structural admission.
-#[derive(Debug)]
 pub struct CtfConvertAdmission<'a> {
     bytes: &'a [u8],
     mode: CtfConvertMode,
+}
+
+impl fmt::Debug for CtfConvertAdmission<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CtfConvertAdmission")
+            .field("request_bytes", &self.bytes.len())
+            .field("mode", &self.mode)
+            .finish()
+    }
 }
 
 impl<'a> CtfConvertAdmission<'a> {
@@ -96,9 +106,9 @@ impl CtfSettlementLimits {
                 "request bytes must be positive and max_participants at least two",
             ));
         }
-        if self.max_inputs == 0 || self.max_outputs == 0 || self.max_pool_entries < 2 {
+        if self.max_inputs < 2 || self.max_outputs < 2 || self.max_pool_entries < 2 {
             return Err(Error::InvalidStructure(
-                "input, output, and pool limits must be positive",
+                "input, output, and pool limits must be at least two",
             ));
         }
         Ok(())
@@ -106,7 +116,7 @@ impl CtfSettlementLimits {
 }
 
 /// Closed standard or pool participant representation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ParticipantMode {
     /// Exact standard output bundle.
     Standard,
@@ -119,8 +129,17 @@ pub enum ParticipantMode {
     },
 }
 
+impl fmt::Debug for ParticipantMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Standard => "Standard",
+            Self::Pool { .. } => "Pool { .. }",
+        })
+    }
+}
+
 /// One participant in an atomic multi-party CTF convert.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CtfSettlementParticipant {
     /// Fixed proof inputs.
     pub inputs: Proofs,
@@ -128,6 +147,21 @@ pub struct CtfSettlementParticipant {
     pub outputs: Vec<BlindedMessage>,
     /// Closed standard or pool representation.
     pub mode: ParticipantMode,
+}
+
+impl fmt::Debug for CtfSettlementParticipant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mode = match &self.mode {
+            ParticipantMode::Standard => "standard",
+            ParticipantMode::Pool { .. } => "pool",
+        };
+        formatter
+            .debug_struct("CtfSettlementParticipant")
+            .field("input_count", &self.inputs.len())
+            .field("output_count", &self.outputs.len())
+            .field("mode", &mode)
+            .finish()
+    }
 }
 
 impl CtfSettlementParticipant {
@@ -170,7 +204,7 @@ impl CtfSettlementParticipant {
 }
 
 /// Strict multi-party request for `POST /v1/ctf/convert`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CtfSettlementRequest {
     /// Shared condition identifier.
     pub condition_id: CanonicalHash,
@@ -178,6 +212,15 @@ pub struct CtfSettlementRequest {
     pub parent_collection_id: CanonicalHash,
     /// Canonically ordered standard and pool participants.
     pub participants: Vec<CtfSettlementParticipant>,
+}
+
+impl fmt::Debug for CtfSettlementRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CtfSettlementRequest")
+            .field("participant_count", &self.participants.len())
+            .finish()
+    }
 }
 
 impl CtfSettlementRequest {
@@ -392,23 +435,23 @@ impl Serialize for ParticipantRef<'_> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettlementRequestWire {
     condition_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present")]
     parent_collection_id: Option<String>,
     participants: Vec<ParticipantWire>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ParticipantWire {
     inputs: Vec<ProofWire>,
     outputs: Vec<OutputWire>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present")]
     pool_manifest: Option<Vec<PoolEntry>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present")]
     pool_selection: Option<String>,
 }
 
@@ -450,7 +493,7 @@ impl TryFrom<ParticipantWire> for CtfSettlementParticipant {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProofWire {
     amount: Amount,
@@ -486,7 +529,7 @@ impl TryFrom<ProofWire> for Proof {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OutputWire {
     amount: Amount,
@@ -494,6 +537,14 @@ struct OutputWire {
     keyset_id: String,
     #[serde(rename = "B_")]
     blinded_secret: String,
+}
+
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl TryFrom<OutputWire> for BlindedMessage {

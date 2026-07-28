@@ -30,14 +30,14 @@ impl NutCtfSettlementSettings {
                 "max_participants must be at least two",
             ));
         }
-        if max_inputs == 0
-            || max_outputs == 0
-            || max_request_bytes == 0
-            || max_expiry_seconds == 0
-            || max_pool_entries == 0
-        {
+        if max_inputs < 2 || max_outputs < 2 || max_pool_entries < 2 {
             return Err(NutCtfSettlementSettingsError::InvalidLimit(
-                "all settlement limits must be positive",
+                "input, output, and pool-entry limits must be at least two",
+            ));
+        }
+        if max_request_bytes == 0 || max_expiry_seconds == 0 {
+            return Err(NutCtfSettlementSettingsError::InvalidLimit(
+                "request-byte and expiry limits must be positive",
             ));
         }
         Ok(Self {
