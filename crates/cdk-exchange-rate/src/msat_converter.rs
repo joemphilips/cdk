@@ -606,6 +606,36 @@ fn convert_make_payment_response_to_sat(
     })
 }
 
+/// Convert an incoming payment result to SAT without overstating credit.
+///
+/// Native MSAT credit rounds down when represented as SAT. A SAT response is
+/// returned unchanged.
+pub fn convert_incoming_response_to_sat(
+    payment: WaitPaymentResponse,
+) -> Result<WaitPaymentResponse, cdk_common::payment::Error> {
+    match payment.payment_amount.unit() {
+        CurrencyUnit::Sat => Ok(payment),
+        CurrencyUnit::Msat => convert_wait_payment_response_to_sat(payment),
+        _ => Err(cdk_common::payment::Error::UnsupportedUnit),
+    }
+}
+
+/// Convert an outgoing payment result to the quote unit.
+///
+/// Native MSAT costs round up when represented as SAT so the mint never
+/// understates its Lightning expense. SAT to MSAT conversion is exact.
+pub fn convert_outgoing_response_to_unit(
+    response: MakePaymentResponse,
+    target_unit: &CurrencyUnit,
+) -> Result<MakePaymentResponse, cdk_common::payment::Error> {
+    match (response.total_spent.unit(), target_unit) {
+        (source, target) if source == target => Ok(response),
+        (CurrencyUnit::Msat, CurrencyUnit::Sat) => convert_make_payment_response_to_sat(response),
+        (CurrencyUnit::Sat, CurrencyUnit::Msat) => convert_make_payment_response_to_msat(response),
+        _ => Err(cdk_common::payment::Error::UnsupportedUnit),
+    }
+}
+
 fn div_ceil(numerator: u64, denominator: u64) -> u64 {
     numerator / denominator + u64::from(numerator % denominator != 0)
 }
@@ -628,6 +658,8 @@ mod tests {
     struct MockSatPayment {
         unit: CurrencyUnit,
         incoming_amounts: Arc<Mutex<Vec<Amount<CurrencyUnit>>>>,
+        quote_options: Arc<Mutex<Vec<OutgoingPaymentOptions>>>,
+        make_options: Arc<Mutex<Vec<OutgoingPaymentOptions>>>,
         quote: Arc<Mutex<Option<PaymentQuoteResponse>>>,
         incoming_status: Arc<Mutex<Vec<WaitPaymentResponse>>>,
         make_response: Arc<Mutex<Option<MakePaymentResponse>>>,
@@ -674,11 +706,15 @@ mod tests {
         async fn get_payment_quote(
             &self,
             unit: &CurrencyUnit,
-            _options: OutgoingPaymentOptions,
+            options: OutgoingPaymentOptions,
         ) -> Result<PaymentQuoteResponse, Self::Err> {
             if unit != &self.unit {
                 return Err(cdk_common::payment::Error::UnsupportedUnit);
             }
+            self.quote_options
+                .lock()
+                .expect("quote options mutex should not be poisoned")
+                .push(options);
             self.quote
                 .lock()
                 .expect("quote mutex should not be poisoned")
@@ -689,11 +725,15 @@ mod tests {
         async fn make_payment(
             &self,
             unit: &CurrencyUnit,
-            _options: OutgoingPaymentOptions,
+            options: OutgoingPaymentOptions,
         ) -> Result<MakePaymentResponse, Self::Err> {
             if unit != &self.unit {
                 return Err(cdk_common::payment::Error::UnsupportedUnit);
             }
+            self.make_options
+                .lock()
+                .expect("make options mutex should not be poisoned")
+                .push(options);
             self.make_response
                 .lock()
                 .expect("make response mutex should not be poisoned")
@@ -810,6 +850,50 @@ mod tests {
                 },
             ]);
         backend
+    }
+
+    fn native_sat_backend() -> MockSatPayment {
+        let backend = MockSatPayment {
+            unit: CurrencyUnit::Sat,
+            ..Default::default()
+        };
+        *backend
+            .quote
+            .lock()
+            .expect("quote mutex should not be poisoned") = Some(PaymentQuoteResponse {
+            request_lookup_id: Some(PaymentIdentifier::CustomId("quote".to_string())),
+            amount: Amount::new(2, CurrencyUnit::Sat),
+            fee: Amount::new(2, CurrencyUnit::Sat),
+            state: MeltQuoteState::Unpaid,
+            extra_json: None,
+            estimated_blocks: None,
+            fee_options: None,
+        });
+        *backend
+            .make_response
+            .lock()
+            .expect("make response mutex should not be poisoned") = Some(MakePaymentResponse {
+            payment_lookup_id: PaymentIdentifier::CustomId("paid".to_string()),
+            payment_proof: Some("proof".to_string()),
+            status: MeltQuoteState::Paid,
+            total_spent: Amount::new(2, CurrencyUnit::Sat),
+        });
+        backend
+    }
+
+    fn custom_outgoing_with_amounts(
+        amount: u64,
+        max_fee_amount: u64,
+        unit: CurrencyUnit,
+    ) -> OutgoingPaymentOptions {
+        OutgoingPaymentOptions::Custom(Box::new(CustomOutgoingPaymentOptions {
+            amount: Some(Amount::new(amount, unit.clone())),
+            max_fee_amount: Some(Amount::new(max_fee_amount, unit)),
+            ..match custom_outgoing_options() {
+                OutgoingPaymentOptions::Custom(options) => *options,
+                _ => unreachable!("helper always returns custom options"),
+            }
+        }))
     }
 
     #[tokio::test]
@@ -1095,6 +1179,68 @@ mod tests {
             panic!("expected payment successful event");
         };
         assert_eq!(details.total_spent, Amount::new(2, CurrencyUnit::Sat));
+    }
+
+    #[tokio::test]
+    async fn native_sat_factory_keeps_sat_exact_and_converts_msat_options() {
+        let backend = native_sat_backend();
+        let routes = sat_msat_backends(Arc::new(backend.clone()))
+            .await
+            .expect("native SAT backend should be routed");
+
+        let native = routes
+            .sat
+            .get_payment_quote(
+                &CurrencyUnit::Sat,
+                custom_outgoing_with_amounts(1_001, 1_501, CurrencyUnit::Sat),
+            )
+            .await
+            .expect("native SAT quote");
+        routes
+            .msat
+            .get_payment_quote(
+                &CurrencyUnit::Msat,
+                custom_outgoing_with_amounts(1_001, 1_501, CurrencyUnit::Msat),
+            )
+            .await
+            .expect("MSAT facade quote");
+        routes
+            .msat
+            .make_payment(
+                &CurrencyUnit::Msat,
+                custom_outgoing_with_amounts(1_001, 1_501, CurrencyUnit::Msat),
+            )
+            .await
+            .expect("MSAT facade payment");
+
+        assert_eq!(native.amount, Amount::new(2, CurrencyUnit::Sat));
+        let quote_options = backend
+            .quote_options
+            .lock()
+            .expect("quote options mutex should not be poisoned");
+        assert_custom_amounts(&quote_options[0], 1_001, 1_501, CurrencyUnit::Sat);
+        assert_custom_amounts(&quote_options[1], 2, 2, CurrencyUnit::Sat);
+        let make_options = backend
+            .make_options
+            .lock()
+            .expect("make options mutex should not be poisoned");
+        assert_custom_amounts(&make_options[0], 2, 2, CurrencyUnit::Sat);
+    }
+
+    fn assert_custom_amounts(
+        options: &OutgoingPaymentOptions,
+        amount: u64,
+        max_fee_amount: u64,
+        unit: CurrencyUnit,
+    ) {
+        let OutgoingPaymentOptions::Custom(options) = options else {
+            panic!("expected custom options");
+        };
+        assert_eq!(options.amount, Some(Amount::new(amount, unit.clone())));
+        assert_eq!(
+            options.max_fee_amount,
+            Some(Amount::new(max_fee_amount, unit))
+        );
     }
 
     #[test]
