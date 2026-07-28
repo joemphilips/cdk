@@ -404,12 +404,12 @@ fn admission_counts_exact_raw_bytes_per_convert_mode() {
 
     let padded_multi = left_pad_json(multi, 1025);
     assert!(matches!(
-        CtfConvertAdmission::preflight_convert(&padded_multi, limits, 2048),
+        CtfConvertAdmission::preflight_convert(&padded_multi, limits, 2048, 16, 16),
         Err(Error::LimitExceeded("request bytes"))
     ));
 
     let padded_legacy = left_pad_json(legacy, 1025);
-    let admission = CtfConvertAdmission::preflight_convert(&padded_legacy, limits, 2048)
+    let admission = CtfConvertAdmission::preflight_convert(&padded_legacy, limits, 2048, 16, 16)
         .expect("legacy retains its larger transport limit");
     assert_eq!(admission.mode(), CtfConvertMode::SingleParty);
     admission
@@ -430,7 +430,7 @@ fn legacy_admission_bounds_counts_before_typed_key_parsing() {
     .expect("serializable request");
 
     assert!(matches!(
-        CtfConvertAdmission::preflight_convert(&legacy, limits(), 16 * 1024),
+        CtfConvertAdmission::preflight_convert(&legacy, limits(), 16 * 1024, 16, 16),
         Err(Error::LimitExceeded("inputs"))
     ));
 }
