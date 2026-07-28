@@ -40,7 +40,7 @@ use cdk_common::Amount;
 // internal crate modules
 #[cfg(feature = "prometheus")]
 use cdk_common::payment::MetricsMintPayment;
-use cdk_common::payment::MintPayment;
+use cdk_common::payment::{DynMintPayment, MintPayment};
 use cdk_exchange_rate::{sat_msat_backends, MsatSatConverter, SharedMintPayment};
 #[cfg(feature = "postgres")]
 use cdk_postgres::{MintPgAuthDatabase, MintPgDatabase, PgConfig};
@@ -71,6 +71,9 @@ pub mod setup;
 
 pub use config_migration::{migrate_legacy_configuration, MigrationOutcome};
 pub use config_service::{ApplyOutcome, RollbackOutcome};
+mod canonical_payment_event_owner;
+
+use canonical_payment_event_owner::{CallStatusOnlyPayment, CanonicalPaymentEventOwner};
 
 #[cfg(test)]
 pub(crate) mod test_utils {
@@ -1060,6 +1063,7 @@ async fn setup_sqlite_database(
 async fn configure_mint_builder_with_wallet_info(
     settings: &config::Settings,
     mint_builder: MintBuilder,
+    localstore: DynMintDatabase,
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     work_dir: &Path,
     kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
@@ -1097,6 +1101,7 @@ async fn configure_mint_builder_with_wallet_info(
     let mint_builder = configure_payment_backends(
         settings,
         mint_builder,
+        localstore,
         runtime.clone(),
         work_dir,
         kv_store.clone(),
@@ -1149,21 +1154,21 @@ async fn configure_mint_builder_with_wallet_info(
 async fn configure_mint_builder(
     settings: &config::Settings,
     mint_builder: MintBuilder,
+    localstore: DynMintDatabase,
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     work_dir: &Path,
     kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
 ) -> Result<MintBuilder> {
-    Ok(
-        configure_mint_builder_with_wallet_info(
-            settings,
-            mint_builder,
-            runtime,
-            work_dir,
-            kv_store,
-        )
-        .await?
-        .0,
+    Ok(configure_mint_builder_with_wallet_info(
+        settings,
+        mint_builder,
+        localstore,
+        runtime,
+        work_dir,
+        kv_store,
     )
+    .await?
+    .0)
 }
 
 /// Configures basic mint information (name, contact info, descriptions, etc.)
@@ -1260,6 +1265,7 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
 async fn configure_payment_backends(
     settings: &config::Settings,
     mut mint_builder: MintBuilder,
+    localstore: DynMintDatabase,
     _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     work_dir: &Path,
     _kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
@@ -1307,6 +1313,7 @@ async fn configure_payment_backends(
                 mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
+                    localstore.clone(),
                     backend_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(cln),
@@ -1333,6 +1340,7 @@ async fn configure_payment_backends(
                 mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
+                    localstore.clone(),
                     backend_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(lnd),
@@ -1363,6 +1371,7 @@ async fn configure_payment_backends(
                 mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
+                    localstore.clone(),
                     backend_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(fake),
@@ -1394,6 +1403,7 @@ async fn configure_payment_backends(
                 mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
+                    localstore.clone(),
                     backend_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(processor),
@@ -1420,6 +1430,7 @@ async fn configure_payment_backends(
                 mint_builder = configure_sat_msat_backend_for_unit(
                     settings,
                     mint_builder,
+                    localstore.clone(),
                     backend_entry.unit.clone(),
                     mint_melt_limits,
                     Arc::new(ldk_node),
@@ -1613,19 +1624,49 @@ async fn configure_onchain_backend(
 async fn configure_sat_msat_backend_for_unit(
     settings: &config::Settings,
     mint_builder: MintBuilder,
+    localstore: DynMintDatabase,
     unit: CurrencyUnit,
     mint_melt_limits: MintMeltLimits,
     backend: Arc<dyn MintPayment<Err = cdk_common::payment::Error> + Send + Sync>,
 ) -> Result<MintBuilder> {
     if unit != CurrencyUnit::Sat {
         let backend = normalize_non_sat_backend_unit(unit.clone(), backend).await?;
+        let owner: DynMintPayment = Arc::new(CanonicalPaymentEventOwner::new(
+            backend,
+            localstore,
+            unit.clone(),
+        ));
         let mint_builder =
-            configure_backend_for_unit(settings, mint_builder, unit, mint_melt_limits, backend)
+            configure_backend_for_unit(settings, mint_builder, unit, mint_melt_limits, owner)
                 .await?;
         return Ok(mint_builder);
     }
 
-    let backends = sat_msat_backends(backend).await?;
+    let backend_settings = backend.get_settings().await?;
+    let native_unit = CurrencyUnit::from_str(&backend_settings.unit).with_context(|| {
+        format!(
+            "Payment backend returned invalid unit `{}`",
+            backend_settings.unit
+        )
+    })?;
+    let owner = Arc::new(CanonicalPaymentEventOwner::new(
+        backend,
+        localstore,
+        native_unit.clone(),
+    ));
+    let owner_backend: DynMintPayment = owner.clone();
+    let raw_backends = sat_msat_backends(owner_backend).await?;
+    let backends = match native_unit {
+        CurrencyUnit::Sat => cdk_exchange_rate::SatMsatBackends {
+            sat: owner.clone(),
+            msat: Arc::new(CallStatusOnlyPayment::new(raw_backends.msat)),
+        },
+        CurrencyUnit::Msat => cdk_exchange_rate::SatMsatBackends {
+            sat: Arc::new(CallStatusOnlyPayment::new(raw_backends.sat)),
+            msat: owner.clone(),
+        },
+        _ => bail!("SAT rate routing requires a native SAT or MSAT backend"),
+    };
     let mut mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
@@ -2724,7 +2765,7 @@ async fn run_mintd_with_database_and_shutdown(
     activation: Option<ConfigurationActivation>,
     validated_signing_source: Option<ValidatedSigningSource>,
 ) -> Result<()> {
-    let mint_builder = MintBuilder::new(localstore);
+    let mint_builder = MintBuilder::new(localstore.clone());
 
     // If RPC is enabled and DB contains mint_info already, initialize the builder from DB.
     // This ensures subsequent builder modifications (like version injection) can respect stored values.
@@ -2760,6 +2801,7 @@ async fn run_mintd_with_database_and_shutdown(
     let (mint_builder, wallet_info_provider) = configure_mint_builder_with_wallet_info(
         settings,
         maybe_mint_builder,
+        localstore,
         runtime,
         work_dir,
         Some(kv),
@@ -3821,11 +3863,17 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
-        let builder =
-            configure_payment_backends(&settings, builder, None, &std::env::temp_dir(), None)
-                .await
-                .expect("dispatcher should succeed");
+        let builder = MintBuilder::new(localstore.clone());
+        let builder = configure_payment_backends(
+            &settings,
+            builder,
+            localstore,
+            None,
+            &std::env::temp_dir(),
+            None,
+        )
+        .await
+        .expect("dispatcher should succeed");
 
         let mint_info = builder.current_mint_info();
         let units: Vec<_> = mint_info
@@ -3911,10 +3959,17 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
-        let err = configure_payment_backends(&settings, builder, None, &std::env::temp_dir(), None)
-            .await
-            .expect_err("duplicate unit/method pair should be rejected");
+        let builder = MintBuilder::new(localstore.clone());
+        let err = configure_payment_backends(
+            &settings,
+            builder,
+            localstore,
+            None,
+            &std::env::temp_dir(),
+            None,
+        )
+        .await
+        .expect_err("duplicate unit/method pair should be rejected");
 
         assert!(err.to_string().contains("Duplicate payment processor"));
     }
@@ -4045,11 +4100,17 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
-        let builder =
-            configure_payment_backends(&settings, builder, None, &std::env::temp_dir(), None)
-                .await
-                .expect("empty payment_backend should succeed");
+        let builder = MintBuilder::new(localstore.clone());
+        let builder = configure_payment_backends(
+            &settings,
+            builder,
+            localstore,
+            None,
+            &std::env::temp_dir(),
+            None,
+        )
+        .await
+        .expect("empty payment_backend should succeed");
 
         let mint_info = builder.current_mint_info();
         assert!(
@@ -4076,11 +4137,17 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
-        let builder =
-            configure_payment_backends(&settings, builder, None, &std::env::temp_dir(), None)
-                .await
-                .expect("PaymentBackendType::None should succeed");
+        let builder = MintBuilder::new(localstore.clone());
+        let builder = configure_payment_backends(
+            &settings,
+            builder,
+            localstore,
+            None,
+            &std::env::temp_dir(),
+            None,
+        )
+        .await
+        .expect("PaymentBackendType::None should succeed");
 
         let mint_info = builder.current_mint_info();
         assert!(
@@ -4106,7 +4173,7 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let builder =
             configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
                 .await
@@ -4143,7 +4210,7 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let builder =
             configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
                 .await
@@ -4185,7 +4252,7 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let err = configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
             .await
             .expect_err("fakewallet onchain with real payment backend should bail");
@@ -4213,10 +4280,17 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
-        let err = configure_mint_builder(&settings, builder, None, &std::env::temp_dir(), None)
-            .await
-            .expect_err("no payment backends should bail");
+        let builder = MintBuilder::new(localstore.clone());
+        let err = configure_mint_builder(
+            &settings,
+            builder,
+            localstore,
+            None,
+            &std::env::temp_dir(),
+            None,
+        )
+        .await
+        .expect_err("no payment backends should bail");
 
         assert!(
             err.to_string().contains("At least one payment backend"),
@@ -4252,10 +4326,17 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
-        let err = configure_mint_builder(&settings, builder, None, &std::env::temp_dir(), None)
-            .await
-            .expect_err("fake wallet with BDK onchain should bail");
+        let builder = MintBuilder::new(localstore.clone());
+        let err = configure_mint_builder(
+            &settings,
+            builder,
+            localstore,
+            None,
+            &std::env::temp_dir(),
+            None,
+        )
+        .await
+        .expect_err("fake wallet with BDK onchain should bail");
 
         assert!(
             err.to_string().contains("fakewallet") && err.to_string().contains("bdk"),
@@ -4366,7 +4447,7 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
 
         let fake_wallet = settings.fake_wallet.clone().expect("fake wallet config");
         let fake = fake_wallet
@@ -4434,7 +4515,7 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let builder = configure_onchain_backend(
             &settings,
             builder,
@@ -4475,7 +4556,7 @@ backend = "fakewallet"
         };
 
         let localstore = Arc::new(memory::empty().await.unwrap());
-        let builder = MintBuilder::new(localstore);
+        let builder = MintBuilder::new(localstore.clone());
         let err = configure_onchain_backend(&settings, builder, None, &std::env::temp_dir(), None)
             .await
             .expect_err("missing fake_wallet config should bail");

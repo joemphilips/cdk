@@ -708,50 +708,6 @@ impl<T> RateConvertingPayment<T> {
         )?;
         Ok((snapshot, sats))
     }
-
-    /// Book a completed melt against the outstanding issued counter exactly
-    /// once. Settlement persistence is fail-closed: if the settled flag and
-    /// counter update cannot commit together, the payment is parked for
-    /// operator reconciliation and the in-memory counter is left unchanged.
-    async fn settle_melt(&self, record: &RateQuoteRecord, response: &MakePaymentResponse) {
-        if response.status != MeltQuoteState::Paid {
-            return;
-        }
-        let settlement = RateQuoteSettlement::Melt {
-            fiat_subunits: record_total_fiat_subunits(record),
-        };
-        match self
-            .store
-            .settle_quote_and_commit_unit_control(
-                &response.payment_lookup_id,
-                &record.fiat_unit,
-                settlement,
-            )
-            .await
-        {
-            Ok(true) => {
-                self.control
-                    .commit_melted(&record.fiat_unit, record_total_fiat_subunits(record))
-                    .await;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                park_settlement_failure(
-                    &self.store,
-                    ParkedPaymentRecord {
-                        payment_lookup_id: response.payment_lookup_id.clone(),
-                        bolt11_payment_hash: response.payment_lookup_id.to_string(),
-                        received_sats: record.sats_invoiced,
-                        observed_at: unix_time(),
-                        resolution_status: "settlement_failed".to_string(),
-                    },
-                    error,
-                    "melt",
-                )
-                .await;
-            }
-        }
-    }
 }
 
 type SelfError = RateConvertingPaymentError;
@@ -956,22 +912,13 @@ where
         }
 
         let response = self.inner.make_payment(&CurrencyUnit::Sat, options).await?;
-        let Some(record) = self
-            .store
-            .get_by_lookup_id(&response.payment_lookup_id)
-            .await?
-        else {
-            return Ok(response);
-        };
-        ensure_rate_record(&record, RateQuoteSide::Melt, &self.config.fiat_unit)?;
-        self.settle_melt(&record, &response).await;
-
-        Ok(MakePaymentResponse {
-            payment_lookup_id: response.payment_lookup_id,
-            payment_proof: response.payment_proof,
-            status: response.status,
-            total_spent: Amount::new(record_total_fiat_subunits(&record), record.fiat_unit),
-        })
+        Ok(convert_irreversible_rate_melt_response(
+            Arc::clone(&self.store),
+            self.control.clone(),
+            self.config.fiat_unit.clone(),
+            response,
+        )
+        .await)
     }
 
     async fn wait_payment_event(
@@ -989,7 +936,9 @@ where
             async move {
                 match event {
                     Event::PaymentReceived(payment) => {
-                        convert_payment_event(store, control, fiat_unit, payment).await
+                        convert_rate_mint_payment(store, control, fiat_unit, payment)
+                            .await
+                            .map(Event::PaymentReceived)
                     }
                     other => Some(other),
                 }
@@ -1015,7 +964,7 @@ where
             .await?;
         let mut converted = Vec::new();
         for payment in payments {
-            if let Some(Event::PaymentReceived(payment)) = convert_payment_event(
+            if let Some(payment) = convert_rate_mint_payment(
                 Arc::clone(&self.store),
                 self.control.clone(),
                 self.config.fiat_unit.clone(),
@@ -1037,31 +986,34 @@ where
             .inner
             .check_outgoing_payment(payment_identifier)
             .await?;
-        let Some(record) = self
-            .store
-            .get_by_lookup_id(&response.payment_lookup_id)
-            .await?
-        else {
-            return Ok(response);
-        };
-        ensure_rate_record(&record, RateQuoteSide::Melt, &self.config.fiat_unit)?;
-        self.settle_melt(&record, &response).await;
-
-        Ok(MakePaymentResponse {
-            payment_lookup_id: response.payment_lookup_id,
-            payment_proof: response.payment_proof,
-            status: response.status,
-            total_spent: Amount::new(record_total_fiat_subunits(&record), record.fiat_unit),
-        })
+        convert_completed_rate_melt_response(
+            Arc::clone(&self.store),
+            self.control.clone(),
+            self.config.fiat_unit.clone(),
+            response,
+        )
+        .await
+        .map_err(Into::into)
     }
 }
 
-async fn convert_payment_event(
+/// Settle and convert one incoming native payment using immutable rate terms.
+pub async fn convert_rate_mint_payment(
     store: DynRateQuoteStore,
     control: RateQuoteControlHandle,
     fiat_unit: CurrencyUnit,
     payment: WaitPaymentResponse,
-) -> Option<Event> {
+) -> Option<WaitPaymentResponse> {
+    let payment = match crate::convert_incoming_response_to_sat(payment) {
+        Ok(payment) => payment,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "suppressing rate-converted payment with unsupported physical unit"
+            );
+            return None;
+        }
+    };
     let parked = ParkedPaymentRecord {
         payment_lookup_id: payment.payment_identifier.clone(),
         bolt11_payment_hash: payment.payment_id.clone(),
@@ -1095,11 +1047,11 @@ async fn convert_payment_event(
                 return None;
             }
 
-            Some(Event::PaymentReceived(WaitPaymentResponse {
+            Some(WaitPaymentResponse {
                 payment_identifier: payment.payment_identifier,
                 payment_amount: Amount::new(record.fiat_subunits, record.fiat_unit),
                 payment_id: payment.payment_id,
-            }))
+            })
         }
         Ok(None) => {
             PARKED_PAYMENT_EVENTS.fetch_add(1, Ordering::Relaxed);
@@ -1119,6 +1071,85 @@ async fn convert_payment_event(
             );
             None
         }
+    }
+}
+
+/// Settle and convert one outgoing native payment using immutable rate terms.
+pub async fn convert_rate_melt_response(
+    store: DynRateQuoteStore,
+    control: RateQuoteControlHandle,
+    fiat_unit: CurrencyUnit,
+    response: MakePaymentResponse,
+) -> Result<MakePaymentResponse, RateQuoteStoreError> {
+    let record = load_rate_melt_record(&store, &fiat_unit, &response).await?;
+    settle_rate_melt(&store, &control, &record, &response).await?;
+    Ok(converted_rate_melt_response(record, response))
+}
+
+async fn convert_completed_rate_melt_response(
+    store: DynRateQuoteStore,
+    control: RateQuoteControlHandle,
+    fiat_unit: CurrencyUnit,
+    response: MakePaymentResponse,
+) -> Result<MakePaymentResponse, RateQuoteStoreError> {
+    let record = load_rate_melt_record(&store, &fiat_unit, &response).await?;
+    // The Lightning payment has already completed. Settlement failure is
+    // durably parked, but returning an error could make the caller retry the
+    // irreversible external payment.
+    let _ = settle_rate_melt(&store, &control, &record, &response).await;
+    Ok(converted_rate_melt_response(record, response))
+}
+
+async fn convert_irreversible_rate_melt_response(
+    store: DynRateQuoteStore,
+    control: RateQuoteControlHandle,
+    fiat_unit: CurrencyUnit,
+    response: MakePaymentResponse,
+) -> MakePaymentResponse {
+    let record = match load_rate_melt_record(&store, &fiat_unit, &response).await {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::error!(
+                payment_lookup_id = %response.payment_lookup_id,
+                %error,
+                "preserving paid backend evidence because immutable rate terms could not be loaded"
+            );
+            return response;
+        }
+    };
+    // The external payment is irreversible. Settlement failure is durably
+    // parked; returning an error here could cause a duplicate payment.
+    let _ = settle_rate_melt(&store, &control, &record, &response).await;
+    converted_rate_melt_response(record, response)
+}
+
+async fn load_rate_melt_record(
+    store: &DynRateQuoteStore,
+    fiat_unit: &CurrencyUnit,
+    response: &MakePaymentResponse,
+) -> Result<RateQuoteRecord, RateQuoteStoreError> {
+    let record = store
+        .get_by_lookup_id(&response.payment_lookup_id)
+        .await?
+        .ok_or_else(|| {
+            RateQuoteStoreError::InvalidSettlement(format!(
+                "missing melt quote terms for {}",
+                response.payment_lookup_id
+            ))
+        })?;
+    ensure_rate_record(&record, RateQuoteSide::Melt, fiat_unit)?;
+    Ok(record)
+}
+
+fn converted_rate_melt_response(
+    record: RateQuoteRecord,
+    response: MakePaymentResponse,
+) -> MakePaymentResponse {
+    MakePaymentResponse {
+        payment_lookup_id: response.payment_lookup_id,
+        payment_proof: response.payment_proof,
+        status: response.status,
+        total_spent: Amount::new(record_total_fiat_subunits(&record), record.fiat_unit),
     }
 }
 
@@ -1191,8 +1222,53 @@ async fn settle_mint_credit(
         Err(error) => {
             let mut parked = parked;
             parked.resolution_status = "settlement_failed".to_string();
-            park_settlement_failure(store, parked, error, "mint").await;
+            park_settlement_failure(store, parked, &error, "mint").await;
             false
+        }
+    }
+}
+
+async fn settle_rate_melt(
+    store: &DynRateQuoteStore,
+    control: &RateQuoteControlHandle,
+    record: &RateQuoteRecord,
+    response: &MakePaymentResponse,
+) -> Result<(), RateQuoteStoreError> {
+    if response.status != MeltQuoteState::Paid {
+        return Ok(());
+    }
+    let fiat_subunits = record_total_fiat_subunits(record);
+    let settlement = RateQuoteSettlement::Melt { fiat_subunits };
+    match store
+        .settle_quote_and_commit_unit_control(
+            &response.payment_lookup_id,
+            &record.fiat_unit,
+            settlement,
+        )
+        .await
+    {
+        Ok(true) => {
+            control
+                .commit_melted(&record.fiat_unit, fiat_subunits)
+                .await;
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(error) => {
+            park_settlement_failure(
+                store,
+                ParkedPaymentRecord {
+                    payment_lookup_id: response.payment_lookup_id.clone(),
+                    bolt11_payment_hash: response.payment_lookup_id.to_string(),
+                    received_sats: record.sats_invoiced,
+                    observed_at: unix_time(),
+                    resolution_status: "settlement_failed".to_string(),
+                },
+                &error,
+                "melt",
+            )
+            .await;
+            Err(error)
         }
     }
 }
@@ -1200,7 +1276,7 @@ async fn settle_mint_credit(
 async fn park_settlement_failure(
     store: &DynRateQuoteStore,
     parked: ParkedPaymentRecord,
-    error: RateQuoteStoreError,
+    error: &RateQuoteStoreError,
     side: &'static str,
 ) {
     let payment_lookup_id = parked.payment_lookup_id.clone();
