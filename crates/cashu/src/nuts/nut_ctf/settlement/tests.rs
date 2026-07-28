@@ -301,16 +301,53 @@ fn preflight_rejects_bytes_and_counts_before_key_parsing() {
     let encoded = serde_json::to_vec(&malformed_keys).expect("serializable request");
     let mut strict_limits = limits();
     strict_limits.max_participants = 2;
-    assert_eq!(
-        CtfSettlementRequest::decode(&encoded, strict_limits),
+    assert!(matches!(
+        CtfConvertAdmission::preflight(&encoded, strict_limits),
         Err(Error::LimitExceeded("participants"))
-    );
+    ));
 
     strict_limits = limits();
     strict_limits.max_request_bytes = encoded.len() - 1;
-    assert_eq!(
-        CtfSettlementRequest::decode(&encoded, strict_limits),
+    assert!(matches!(
+        CtfConvertAdmission::preflight(&encoded, strict_limits),
         Err(Error::LimitExceeded("request bytes"))
+    ));
+}
+
+#[test]
+fn admission_defers_typed_key_parsing() {
+    let malformed_multi = json!({
+        "condition_id": "11".repeat(32),
+        "participants": [
+            {"inputs": [{"id": "not-a-key"}], "outputs": []},
+            {"inputs": [], "outputs": []}
+        ]
+    });
+    let encoded = serde_json::to_vec(&malformed_multi).expect("serializable request");
+    let admission =
+        CtfConvertAdmission::preflight(&encoded, limits()).expect("cheap admission succeeds");
+    assert_eq!(admission.mode(), CtfConvertMode::MultiParty);
+    assert!(admission.decode_multi_party().is_err());
+}
+
+#[test]
+fn admission_preserves_legacy_convert_wire_decode() {
+    let legacy = json!({
+        "condition_id": "11".repeat(32),
+        "inputs": {},
+        "outputs": {}
+    });
+    let encoded = serde_json::to_vec(&legacy).expect("serializable request");
+    let direct: crate::nuts::nut_ctf::CtfConvertRequest =
+        serde_json::from_slice(&encoded).expect("legacy request");
+    let admission =
+        CtfConvertAdmission::preflight(&encoded, limits()).expect("cheap admission succeeds");
+
+    assert_eq!(admission.mode(), CtfConvertMode::SingleParty);
+    assert_eq!(
+        serde_json::to_value(admission.decode_single_party().expect("legacy request"))
+            .expect("serializable request"),
+        serde_json::to_value(direct).expect("serializable request")
     );
 }
 
@@ -354,7 +391,7 @@ fn request_rejects_duplicates_and_noncanonical_order() {
         duplicate_output.participants[0].outputs[0].clone();
     assert_eq!(
         duplicate_output.validate(limits()),
-        Err(Error::InvalidStructure("duplicate output"))
+        Err(Error::DuplicateOutput)
     );
 
     let mut noncanonical = valid_standard_request();

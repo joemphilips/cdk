@@ -13,7 +13,8 @@ pub use canonical::{ctf_receive_commitment, CanonicalHash};
 pub use condition::{PayToUnlockCondition, PayToUnlockMode, PoolPolicy};
 pub use manifest::{PoolEntry, PoolEntryRole, PoolManifest, SelectionBitmap};
 pub use request::{
-    CtfSettlementLimits, CtfSettlementParticipant, CtfSettlementRequest, ParticipantMode,
+    CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits, CtfSettlementParticipant,
+    CtfSettlementRequest, ParticipantMode,
 };
 pub use settings::{
     NutCtfSettlementSettings, NutCtfSettlementSettingsError, NutCtfSplitMergeSettings,
@@ -94,12 +95,18 @@ pub enum Error {
     /// An input did not use the keyset named by its condition.
     #[error("input keyset does not match offer_keyset")]
     OfferKeysetMismatch,
+    /// Standard outputs did not use one non-offer receive keyset.
+    #[error("standard outputs must share one non-offer receive keyset")]
+    OfferReceiveKeysetMismatch,
     /// Inputs in one participant did not share the same authorization.
     #[error("participant inputs do not share one authorization")]
     InconsistentAuthorization,
     /// A proof or authorization nonce was repeated.
     #[error("duplicate proof or authorization nonce")]
     DuplicateInput,
+    /// A blinded output was repeated.
+    #[error("duplicate blinded output")]
+    DuplicateOutput,
     /// Participants were not in canonical order.
     #[error("participants are not in canonical order")]
     NonCanonicalParticipantOrder,
@@ -115,6 +122,9 @@ pub enum Error {
     /// JSON decoding failed.
     #[error("invalid settlement JSON: {0}")]
     Json(String),
+    /// An admitted request was decoded as the wrong convert mode.
+    #[error("CTF convert request mode does not match the requested decoder")]
+    WrongRequestMode,
 }
 
 impl From<serde_json::Error> for Error {
