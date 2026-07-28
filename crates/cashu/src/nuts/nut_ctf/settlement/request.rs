@@ -13,6 +13,7 @@ use crate::nuts::nut00::{BlindedMessage, Proof, Proofs, Witness};
 use crate::nuts::nut01::PublicKey;
 use crate::nuts::nut02::Id;
 use crate::nuts::nut12::ProofDleq;
+use crate::nuts::nut_ctf::CtfConvertRequest;
 use crate::secret::Secret;
 use crate::Amount;
 
@@ -29,6 +30,63 @@ pub struct CtfSettlementLimits {
     pub max_outputs: usize,
     /// Maximum manifest entries in any one pool participant.
     pub max_pool_entries: usize,
+}
+
+/// Wire mode selected by the presence of the top-level `participants` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtfConvertMode {
+    /// Existing single-party split/merge request.
+    SingleParty,
+    /// Multi-party standard/pool settlement request.
+    MultiParty,
+}
+
+/// A request that passed raw byte and cheap structural admission.
+#[derive(Debug)]
+pub struct CtfConvertAdmission<'a> {
+    bytes: &'a [u8],
+    mode: CtfConvertMode,
+}
+
+impl<'a> CtfConvertAdmission<'a> {
+    /// Classify a convert request and apply cheap multi-party count limits.
+    ///
+    /// This does not parse proofs, public keys, signatures, or conditions.
+    pub fn preflight(bytes: &'a [u8], limits: CtfSettlementLimits) -> Result<Self, Error> {
+        limits.validate()?;
+        if bytes.len() > limits.max_request_bytes {
+            return Err(Error::LimitExceeded("request bytes"));
+        }
+        let value: Value = serde_json::from_slice(bytes)?;
+        let mode = if value.get("participants").is_some() {
+            preflight_multi_party_value(&value, limits)?;
+            CtfConvertMode::MultiParty
+        } else {
+            CtfConvertMode::SingleParty
+        };
+        Ok(Self { bytes, mode })
+    }
+
+    /// Return the admitted wire mode.
+    pub const fn mode(&self) -> CtfConvertMode {
+        self.mode
+    }
+
+    /// Strictly decode an admitted multi-party request.
+    pub fn decode_multi_party(self) -> Result<CtfSettlementRequest, Error> {
+        if self.mode != CtfConvertMode::MultiParty {
+            return Err(Error::WrongRequestMode);
+        }
+        CtfSettlementRequest::decode_admitted(self.bytes)
+    }
+
+    /// Decode an admitted legacy single-party request without changing its wire.
+    pub fn decode_single_party(self) -> Result<CtfConvertRequest, Error> {
+        if self.mode != CtfConvertMode::SingleParty {
+            return Err(Error::WrongRequestMode);
+        }
+        Ok(serde_json::from_slice(self.bytes)?)
+    }
 }
 
 impl CtfSettlementLimits {
@@ -125,8 +183,10 @@ pub struct CtfSettlementRequest {
 impl CtfSettlementRequest {
     /// Bound raw JSON structure before strictly decoding keys and proofs.
     pub fn decode(bytes: &[u8], limits: CtfSettlementLimits) -> Result<Self, Error> {
-        limits.validate()?;
-        preflight_structure(bytes, limits)?;
+        CtfConvertAdmission::preflight(bytes, limits)?.decode_multi_party()
+    }
+
+    fn decode_admitted(bytes: &[u8]) -> Result<Self, Error> {
         let wire: SettlementRequestWire = serde_json::from_slice(bytes)?;
         let condition_id = CanonicalHash::parse(&wire.condition_id, "condition_id")?;
         let parent_collection_id = match wire.parent_collection_id {
@@ -222,11 +282,7 @@ impl CtfSettlementRequest {
     }
 }
 
-fn preflight_structure(bytes: &[u8], limits: CtfSettlementLimits) -> Result<(), Error> {
-    if bytes.len() > limits.max_request_bytes {
-        return Err(Error::LimitExceeded("request bytes"));
-    }
-    let value: Value = serde_json::from_slice(bytes)?;
+fn preflight_multi_party_value(value: &Value, limits: CtfSettlementLimits) -> Result<(), Error> {
     let participants = value
         .get("participants")
         .and_then(Value::as_array)
@@ -485,7 +541,7 @@ fn validate_unique_outputs(
             ));
         }
         if !output_points.insert(output.blinded_secret) {
-            return Err(Error::InvalidStructure("duplicate output"));
+            return Err(Error::DuplicateOutput);
         }
     }
     Ok(())
@@ -583,9 +639,7 @@ fn validate_standard_output_keyset(
             .iter()
             .any(|output| output.keyset_id != receive_keyset)
     {
-        return Err(Error::InvalidStructure(
-            "standard outputs must share one non-offer keyset",
-        ));
+        return Err(Error::OfferReceiveKeysetMismatch);
     }
     Ok(())
 }

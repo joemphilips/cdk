@@ -5,19 +5,37 @@ use axum::extract::Query;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+#[cfg(feature = "conditional-tokens")]
+use cdk::error::ErrorCode;
 use cdk::error::ErrorResponse;
 use cdk::nuts::nut21::{Method, ProtectedEndpoint, RoutePath};
+#[cfg(feature = "conditional-tokens")]
+use cdk::nuts::nut_ctf::settlement::{CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits};
 use cdk::nuts::{
     CheckStateRequest, CheckStateResponse, Id, KeysResponse, KeysetResponse, MintInfo,
     RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
 use cdk::util::unix_time;
 use paste::paste;
+#[cfg(feature = "conditional-tokens")]
+use serde_json::value::RawValue;
 use tracing::instrument;
 
 use crate::auth::AuthHeader;
 use crate::ws::main_websocket;
 use crate::MintState;
+
+#[cfg(feature = "conditional-tokens")]
+pub(crate) const MAX_CTF_CONVERT_REQUEST_BYTES: usize = 1024 * 1024;
+
+#[cfg(feature = "conditional-tokens")]
+const UNADVERTISED_MULTI_PARTY_LIMITS: CtfSettlementLimits = CtfSettlementLimits {
+    max_request_bytes: MAX_CTF_CONVERT_REQUEST_BYTES,
+    max_participants: 64,
+    max_inputs: 4096,
+    max_outputs: 8192,
+    max_pool_entries: 256,
+};
 
 /// Macro to add cache to endpoint
 #[macro_export]
@@ -1241,8 +1259,11 @@ pub(crate) async fn get_conditional_keysets(
 pub(crate) async fn post_ctf_convert(
     auth: AuthHeader,
     State(state): State<MintState>,
-    Json(payload): Json<cdk::nuts::nut_ctf::CtfConvertRequest>,
-) -> Result<Json<cdk::nuts::nut_ctf::CtfConvertResponse>, Response> {
+    Json(payload): Json<Box<RawValue>>,
+) -> Result<Response, Response> {
+    let admission =
+        CtfConvertAdmission::preflight(payload.get().as_bytes(), UNADVERTISED_MULTI_PARTY_LIMITS)
+            .map_err(ctf_settlement_error_response)?;
     state
         .mint
         .verify_auth(
@@ -1252,15 +1273,73 @@ pub(crate) async fn post_ctf_convert(
         .await
         .map_err(into_response)?;
 
-    let response = state
-        .mint
-        .process_ctf_convert(payload)
-        .await
-        .map_err(|err| {
-            tracing::error!("Could not process CTF convert: {}", err);
-            into_response(err)
-        })?;
-    Ok(Json(response))
+    match admission.mode() {
+        CtfConvertMode::SingleParty => {
+            let payload = admission
+                .decode_single_party()
+                .map_err(ctf_settlement_error_response)?;
+            let response = state
+                .mint
+                .process_ctf_convert(payload)
+                .await
+                .map_err(|err| {
+                    tracing::error!("Could not process CTF convert: {}", err);
+                    into_response(err)
+                })?;
+            Ok(Json(response).into_response())
+        }
+        CtfConvertMode::MultiParty => {
+            let request = admission
+                .decode_multi_party()
+                .map_err(ctf_settlement_error_response)?;
+            request
+                .validate(UNADVERTISED_MULTI_PARTY_LIMITS)
+                .map_err(ctf_settlement_error_response)?;
+            Err(multi_party_unavailable_response())
+        }
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn ctf_settlement_error_response(error: cdk::nuts::nut_ctf::settlement::Error) -> Response {
+    use cdk::nuts::nut_ctf::settlement::Error as SettlementError;
+
+    let code = match &error {
+        SettlementError::DuplicateInput => ErrorCode::DuplicateInputs,
+        SettlementError::DuplicateOutput => ErrorCode::DuplicateOutputs,
+        SettlementError::UnknownKeyset => ErrorCode::KeysetNotFound,
+        SettlementError::LimitExceeded(_) => ErrorCode::Unknown(15009),
+        SettlementError::OutputCommitmentMismatch => ErrorCode::Unknown(15003),
+        SettlementError::OfferKeysetMismatch | SettlementError::OfferReceiveKeysetMismatch => {
+            ErrorCode::Unknown(15004)
+        }
+        SettlementError::ManifestCommitmentMismatch => ErrorCode::Unknown(15011),
+        SettlementError::InvalidSelection(_) | SettlementError::SelectionMismatch => {
+            ErrorCode::Unknown(15012)
+        }
+        SettlementError::InvalidManifest(_) => ErrorCode::Unknown(15013),
+        SettlementError::InvalidPoolPolicy(_) | SettlementError::ArithmeticOverflow => {
+            ErrorCode::Unknown(15014)
+        }
+        _ => ErrorCode::Unknown(15001),
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(code, error.to_string())),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn multi_party_unavailable_response() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse::new(
+            ErrorCode::Unknown(15001),
+            "multi-party CTF settlement is not enabled".to_string(),
+        )),
+    )
+        .into_response()
 }
 
 /// POST /v1/redeem_outcome - Redeem conditional tokens
@@ -1289,4 +1368,111 @@ pub(crate) async fn post_redeem_outcome(
             into_response(err)
         })?;
     Ok(Json(response))
+}
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod ctf_convert_admission_tests {
+    use axum::body::{to_bytes, Body};
+    use axum::extract::DefaultBodyLimit;
+    use axum::http::Request;
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    async fn accept_json(Json(_): Json<Box<RawValue>>) -> StatusCode {
+        StatusCode::OK
+    }
+
+    fn admission_router() -> Router {
+        Router::new()
+            .route("/", post(accept_json))
+            .layer(DefaultBodyLimit::max(MAX_CTF_CONVERT_REQUEST_BYTES))
+    }
+
+    async fn decode_error(response: Response) -> ErrorResponse {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        serde_json::from_slice(&body).expect("error response")
+    }
+
+    #[tokio::test]
+    async fn route_rejects_oversized_body_before_json_decode() {
+        let response = admission_router()
+            .oneshot(
+                Request::post("/")
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![b' '; MAX_CTF_CONVERT_REQUEST_BYTES + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn route_preserves_json_content_type_contract() {
+        for content_type in [None, Some("text/plain")] {
+            let mut request = Request::post("/");
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let response = admission_router()
+                .oneshot(request.body(Body::from("{}")).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+
+        let response = admission_router()
+            .oneshot(
+                Request::post("/")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unavailable_multi_party_uses_defined_protocol_error() {
+        let response = multi_party_unavailable_response();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let error = decode_error(response).await;
+        assert_eq!(error.code, ErrorCode::Unknown(15001));
+    }
+
+    #[tokio::test]
+    async fn settlement_failures_use_existing_protocol_codes() {
+        use cdk::nuts::nut_ctf::settlement::Error as SettlementError;
+
+        let cases = [
+            (SettlementError::DuplicateInput, ErrorCode::DuplicateInputs),
+            (
+                SettlementError::DuplicateOutput,
+                ErrorCode::DuplicateOutputs,
+            ),
+            (SettlementError::UnknownKeyset, ErrorCode::KeysetNotFound),
+            (
+                SettlementError::OfferReceiveKeysetMismatch,
+                ErrorCode::Unknown(15004),
+            ),
+            (
+                SettlementError::InvalidManifest("role"),
+                ErrorCode::Unknown(15013),
+            ),
+            (SettlementError::ZeroFeeKeyset, ErrorCode::Unknown(15001)),
+        ];
+
+        for (failure, expected) in cases {
+            let error = decode_error(ctf_settlement_error_response(failure)).await;
+            assert_eq!(error.code, expected);
+        }
+    }
 }

@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use auth::create_auth_router;
+#[cfg(feature = "conditional-tokens")]
+use axum::extract::DefaultBodyLimit;
 use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -116,7 +118,11 @@ pub async fn create_mint_router_with_custom_cache(
         .route("/conditions/{condition_id}", get(get_condition))
         .route("/conditional_keysets", get(get_conditional_keysets))
         .route("/redeem_outcome", post(post_redeem_outcome))
-        .route("/ctf/convert", post(post_ctf_convert));
+        .merge(
+            Router::new()
+                .route("/ctf/convert", post(post_ctf_convert))
+                .layer(DefaultBodyLimit::max(MAX_CTF_CONVERT_REQUEST_BYTES)),
+        );
 
     let mut mint_router = Router::new().nest("/v1", v1_router);
 
