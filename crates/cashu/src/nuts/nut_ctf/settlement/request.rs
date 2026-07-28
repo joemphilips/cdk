@@ -63,23 +63,31 @@ impl<'a> CtfConvertAdmission<'a> {
     ///
     /// This does not parse proofs, public keys, signatures, or conditions.
     pub fn preflight(bytes: &'a [u8], limits: CtfSettlementLimits) -> Result<Self, Error> {
-        Self::preflight_convert(bytes, limits, limits.max_request_bytes)
+        Self::preflight_convert(
+            bytes,
+            limits,
+            limits.max_request_bytes,
+            limits.max_inputs,
+            limits.max_outputs,
+        )
     }
 
-    /// Classify a convert request with a separate legacy request-size limit.
+    /// Classify a convert request with separate legacy request limits.
     ///
     /// Multi-party requests use the advertised settlement byte and count
-    /// limits. Legacy requests retain their transport byte limit while sharing
-    /// the cheap input/output count bounds.
+    /// limits. Legacy requests retain their mint-configured byte and transaction
+    /// limits.
     pub fn preflight_convert(
         bytes: &'a [u8],
         limits: CtfSettlementLimits,
         legacy_max_request_bytes: usize,
+        legacy_max_inputs: usize,
+        legacy_max_outputs: usize,
     ) -> Result<Self, Error> {
         limits.validate()?;
-        if legacy_max_request_bytes == 0 {
+        if legacy_max_request_bytes == 0 || legacy_max_inputs == 0 || legacy_max_outputs == 0 {
             return Err(Error::InvalidStructure(
-                "legacy request bytes must be positive",
+                "legacy request limits must be positive",
             ));
         }
         enforce_request_bytes(
@@ -93,7 +101,7 @@ impl<'a> CtfConvertAdmission<'a> {
             CtfConvertMode::MultiParty
         } else {
             enforce_request_bytes(bytes, legacy_max_request_bytes)?;
-            preflight_legacy_value(&value, limits)?;
+            preflight_legacy_value(&value, legacy_max_inputs, legacy_max_outputs)?;
             CtfConvertMode::SingleParty
         };
         Ok(Self { bytes, mode })
@@ -354,16 +362,20 @@ fn enforce_request_bytes(bytes: &[u8], maximum: usize) -> Result<(), Error> {
     Ok(())
 }
 
-fn preflight_legacy_value(value: &Value, limits: CtfSettlementLimits) -> Result<(), Error> {
+fn preflight_legacy_value(
+    value: &Value,
+    max_inputs: usize,
+    max_outputs: usize,
+) -> Result<(), Error> {
     let request = value
         .as_object()
         .ok_or(Error::InvalidStructure("request must be an object"))?;
     let input_count = checked_legacy_count(request, "inputs")?;
     let output_count = checked_legacy_count(request, "outputs")?;
-    if input_count > limits.max_inputs {
+    if input_count > max_inputs {
         return Err(Error::LimitExceeded("inputs"));
     }
-    if output_count > limits.max_outputs {
+    if output_count > max_outputs {
         return Err(Error::LimitExceeded("outputs"));
     }
     Ok(())
