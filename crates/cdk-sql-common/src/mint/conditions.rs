@@ -301,10 +301,10 @@ impl<RM> SQLMintDatabase<RM>
 where
     RM: DatabasePool + 'static,
 {
-    /// Query the `conditional_keyset` table with optional cursor pagination
-    /// (`since` is strictly greater than), `limit`, and active filter. This
-    /// is the shared path for both the public NUT-CTF listing endpoint and
-    /// the internal `reload_keys_from_db` bootstrap.
+    /// Query the `conditional_keyset` table with optional inclusive cursor
+    /// pagination, `limit`, and active filter. The inclusive boundary replays
+    /// same-timestamp rows so clients can deduplicate without omissions. This is
+    /// the shared path for the public listing and key-reload bootstrap.
     pub(crate) async fn query_conditional_keysets(
         &self,
         since: Option<u64>,
@@ -323,8 +323,8 @@ where
         );
 
         if since.is_some() {
-            // Cursor pagination: strictly greater than the last-seen timestamp.
-            sql.push_str(" AND created_at > :since");
+            // Replay the boundary timestamp; clients deduplicate returned rows.
+            sql.push_str(" AND created_at >= :since");
         }
 
         if active.is_some() {
@@ -454,9 +454,9 @@ where
         );
 
         if since.is_some() {
-            // Cursor pagination: strictly greater, so callers can pass the
-            // last-seen `created_at` without re-receiving the boundary row.
-            sql.push_str(" AND created_at > :since");
+            // Replay the boundary timestamp to avoid omitting same-second rows;
+            // clients deduplicate returned conditions.
+            sql.push_str(" AND created_at >= :since");
         }
 
         if !status.is_empty() {

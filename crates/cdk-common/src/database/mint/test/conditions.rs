@@ -262,6 +262,39 @@ where
     assert_eq!(active.get("YES"), Some(&new_id));
 }
 
+/// Test inclusive conditional-keyset cursor replay below the requested limit.
+pub async fn get_conditional_keysets_since_inclusive_boundary<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let cond = test_condition(&"f1".repeat(32));
+    db.add_condition(cond.clone()).await.unwrap();
+    let first = Id::from_str("001711afb1de20cb").unwrap();
+    let second = Id::from_str("001711afb1de20cc").unwrap();
+    let later = Id::from_str("001711afb1de20cd").unwrap();
+    let keysets = [
+        (first, "YES", "f2".repeat(32), 2000),
+        (second, "NO", "f3".repeat(32), 2000),
+        (later, "DRAW", "f4".repeat(32), 3000),
+    ];
+    for (id, outcome, outcome_id, registered_at) in keysets {
+        let info = test_conditional_keyset_info(id, &cond.condition_id, outcome, &outcome_id);
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info, registered_at)
+            .await
+            .unwrap();
+    }
+
+    let returned = db
+        .get_all_conditional_keyset_infos(Some(2000), Some(10), None)
+        .await
+        .unwrap();
+    assert_eq!(returned.len(), 3);
+    assert!(returned.iter().all(|keyset| keyset.registered_at >= 2000));
+    for id in [first, second, later] {
+        assert!(returned.iter().any(|keyset| keyset.id == id));
+    }
+}
+
 /// Test get_condition_for_keyset lookup by keyset_id
 pub async fn get_condition_for_keyset<DB>(db: DB)
 where

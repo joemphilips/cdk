@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS conditional_keyset_condition_id_idx
 CREATE INDEX IF NOT EXISTS conditional_keyset_outcome_collection_id_idx
     ON conditional_keyset(outcome_collection_id);
 
--- Listing and cursor-pagination queries all ORDER BY created_at ASC and
--- filter on `created_at > :since`.
+-- Listing and cursor-pagination queries all ORDER BY created_at ASC and use an
+-- inclusive `created_at >= :since` boundary; clients deduplicate replayed rows.
 CREATE INDEX IF NOT EXISTS conditional_keyset_created_at_idx
     ON conditional_keyset(created_at);
