@@ -35,6 +35,8 @@ mod builder;
 mod check_spendable;
 #[cfg(feature = "conditional-tokens")]
 mod conditions;
+#[cfg(feature = "conditional-tokens")]
+mod ctf_conservation;
 mod issue;
 mod keysets;
 mod ln;
