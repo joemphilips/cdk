@@ -539,15 +539,40 @@ fn unix_time() -> u64 {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::time::SystemTime;
 
     use cdk_common::mint::{MeltPaymentRequest, MeltQuote, MintQuote};
     use cdk_common::Amount;
     use cdk_exchange_rate::{
-        InMemoryRateQuoteStore, RateQuoteRecord, RateQuoteSide, RateQuoteStore,
+        AggregationMeta, InMemoryRateQuoteStore, PaymentErrorAdapter, RateConvertingPayment,
+        RateConvertingPaymentConfig, RateOracle, RateOracleError, RateQuoteRecord, RateQuoteSide,
+        RateQuoteStore, RateSnapshot, SharedMintPayment,
     };
     use futures::stream;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct FixedRateOracle;
+
+    #[async_trait]
+    impl RateOracle for FixedRateOracle {
+        async fn snapshot(&self, fiat: &CurrencyUnit) -> Result<RateSnapshot, RateOracleError> {
+            Ok(RateSnapshot {
+                fiat: fiat.clone(),
+                aggregated_rate: 1_000,
+                source_readings: Vec::new(),
+                aggregation_meta: AggregationMeta {
+                    sources_fetched: 1,
+                    sources_trimmed: 0,
+                    sources_survived: 1,
+                    median_before_trim: 1_000,
+                    deviation_threshold_bps: 0,
+                },
+                created_at: SystemTime::now(),
+            })
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct CountingPayment {
@@ -581,6 +606,13 @@ mod tests {
 
         fn unsupported<T>() -> Result<T, cdk_common::payment::Error> {
             Err(cdk_common::payment::Error::UnsupportedPaymentOption)
+        }
+
+        fn assert_single_lifecycle_owner(&self) {
+            assert_eq!(self.starts.load(Ordering::Relaxed), 1);
+            assert_eq!(self.stops.load(Ordering::Relaxed), 1);
+            assert_eq!(self.waits.load(Ordering::Relaxed), 1);
+            assert_eq!(self.cancels.load(Ordering::Relaxed), 1);
         }
     }
 
@@ -754,6 +786,27 @@ mod tests {
         transaction.commit().await.expect("commit melt quote");
     }
 
+    async fn add_rate_melt_quote(
+        database: &DynMintDatabase,
+        store: &InMemoryRateQuoteStore,
+        lookup_id: &str,
+        fiat_subunits: u64,
+    ) -> cdk_common::QuoteId {
+        let quote_id = cdk_common::QuoteId::new();
+        add_melt_quote(
+            database,
+            quote_id.clone(),
+            Some(PaymentIdentifier::CustomId(lookup_id.to_string())),
+            CurrencyUnit::Usd,
+        )
+        .await;
+        store
+            .insert(rate_record(lookup_id, RateQuoteSide::Melt, fiat_subunits))
+            .await
+            .expect("rate terms");
+        quote_id
+    }
+
     fn rate_record(id: &str, side: RateQuoteSide, fiat_subunits: u64) -> RateQuoteRecord {
         RateQuoteRecord {
             payment_lookup_id: PaymentIdentifier::CustomId(id.to_string()),
@@ -790,6 +843,91 @@ mod tests {
                 quote_id,
             },
         ))
+    }
+
+    fn fiat_status_facade(
+        sat_backend: DynMintPayment,
+        store: Arc<InMemoryRateQuoteStore>,
+        control: RateQuoteControlHandle,
+    ) -> DynMintPayment {
+        let processor = RateConvertingPayment::with_control(
+            SharedMintPayment::new(sat_backend),
+            Arc::new(FixedRateOracle),
+            store,
+            RateConvertingPaymentConfig::new(CurrencyUnit::Usd, 100, 120),
+            control,
+        );
+        let processor: DynMintPayment = Arc::new(PaymentErrorAdapter::new(processor));
+        Arc::new(CallStatusOnlyPayment::new(processor))
+    }
+
+    async fn incoming_status_amount(
+        backend: &DynMintPayment,
+        payment_id: &PaymentIdentifier,
+    ) -> Amount<CurrencyUnit> {
+        backend
+            .check_incoming_payment_status(payment_id)
+            .await
+            .expect("incoming status")
+            .into_iter()
+            .next()
+            .expect("one status")
+            .payment_amount
+    }
+
+    async fn exercise_single_lifecycle_owner(routes: &SatMsatBackends, fiat: &DynMintPayment) {
+        routes.sat.start().await.expect("SAT facade start is inert");
+        routes.msat.start().await.expect("native owner start");
+        fiat.start().await.expect("fiat facade start is inert");
+        assert!(routes.sat.is_payment_event_stream_active());
+        assert!(!routes.msat.is_payment_event_stream_active());
+
+        let mut stream = routes
+            .msat
+            .wait_payment_event()
+            .await
+            .expect("owner stream");
+        assert!(stream.next().await.is_some());
+        assert!(routes.sat.wait_payment_event().await.is_err());
+        assert!(fiat.wait_payment_event().await.is_err());
+
+        routes.sat.cancel_payment_event_stream();
+        fiat.cancel_payment_event_stream();
+        routes.msat.cancel_payment_event_stream();
+        routes.sat.stop().await.expect("SAT facade stop is inert");
+        fiat.stop().await.expect("fiat facade stop is inert");
+        routes.msat.stop().await.expect("owner stop");
+    }
+
+    async fn assert_invalid_outgoing_does_not_mutate(
+        owner: &CanonicalPaymentEventOwner,
+        store: &InMemoryRateQuoteStore,
+        control: &RateQuoteControlHandle,
+        fiat_quote: &cdk_common::QuoteId,
+    ) {
+        let mut non_paid = paid("fiat-melt", 1_501);
+        non_paid.status = MeltQuoteState::Unpaid;
+        let mut wrong_unit = paid("fiat-melt", 1_501);
+        wrong_unit.total_spent = Amount::new(2, CurrencyUnit::Sat);
+
+        assert!(owner
+            .route_outgoing(fiat_quote.clone(), non_paid)
+            .await
+            .is_none());
+        assert!(owner
+            .route_outgoing(fiat_quote.clone(), wrong_unit)
+            .await
+            .is_none());
+        assert!(owner
+            .route_outgoing(fiat_quote.clone(), paid("fiat-melt-b", 1_501))
+            .await
+            .is_none());
+        assert!(store
+            .load_unit_controls()
+            .await
+            .expect("unit controls")
+            .is_empty());
+        assert_eq!(control.outstanding(&CurrencyUnit::Usd).await, 0);
     }
 
     #[tokio::test]
@@ -871,24 +1009,18 @@ mod tests {
         owner
             .install_rate_context(store.clone(), RateQuoteControlHandle::new())
             .expect("rate context");
-        add_mint_quote(
-            &database,
-            PaymentIdentifier::CustomId("native".to_string()),
-            CurrencyUnit::Sat,
-        )
-        .await;
-        add_mint_quote(
-            &database,
-            PaymentIdentifier::CustomId("fiat".to_string()),
-            CurrencyUnit::Usd,
-        )
-        .await;
-        add_mint_quote(
-            &database,
-            PaymentIdentifier::CustomId("missing-fiat".to_string()),
-            CurrencyUnit::Usd,
-        )
-        .await;
+        for (lookup_id, unit) in [
+            ("native", CurrencyUnit::Sat),
+            ("fiat", CurrencyUnit::Usd),
+            ("missing-fiat", CurrencyUnit::Usd),
+        ] {
+            add_mint_quote(
+                &database,
+                PaymentIdentifier::CustomId(lookup_id.to_string()),
+                unit,
+            )
+            .await;
+        }
         store
             .insert(rate_record("fiat", RateQuoteSide::Mint, 125))
             .await
@@ -929,8 +1061,6 @@ mod tests {
             .install_rate_context(store.clone(), control.clone())
             .expect("rate context");
         let native_quote = cdk_common::QuoteId::new();
-        let fiat_quote = cdk_common::QuoteId::new();
-        let fiat_b_quote = cdk_common::QuoteId::new();
         add_melt_quote(
             &database,
             native_quote.clone(),
@@ -938,51 +1068,9 @@ mod tests {
             CurrencyUnit::Sat,
         )
         .await;
-        add_melt_quote(
-            &database,
-            fiat_quote.clone(),
-            Some(PaymentIdentifier::CustomId("fiat-melt".to_string())),
-            CurrencyUnit::Usd,
-        )
-        .await;
-        add_melt_quote(
-            &database,
-            fiat_b_quote,
-            Some(PaymentIdentifier::CustomId("fiat-melt-b".to_string())),
-            CurrencyUnit::Usd,
-        )
-        .await;
-        store
-            .insert(rate_record("fiat-melt", RateQuoteSide::Melt, 125))
-            .await
-            .expect("rate terms");
-        store
-            .insert(rate_record("fiat-melt-b", RateQuoteSide::Melt, 250))
-            .await
-            .expect("substitution terms");
-
-        let mut non_paid = paid("fiat-melt", 1_501);
-        non_paid.status = MeltQuoteState::Unpaid;
-        let mut wrong_unit = paid("fiat-melt", 1_501);
-        wrong_unit.total_spent = Amount::new(2, CurrencyUnit::Sat);
-        assert!(owner
-            .route_outgoing(fiat_quote.clone(), non_paid)
-            .await
-            .is_none());
-        assert!(owner
-            .route_outgoing(fiat_quote.clone(), wrong_unit)
-            .await
-            .is_none());
-        assert!(owner
-            .route_outgoing(fiat_quote.clone(), paid("fiat-melt-b", 1_501))
-            .await
-            .is_none());
-        assert!(store
-            .load_unit_controls()
-            .await
-            .expect("unit controls")
-            .is_empty());
-        assert_eq!(control.outstanding(&CurrencyUnit::Usd).await, 0);
+        let fiat_quote = add_rate_melt_quote(&database, &store, "fiat-melt", 125).await;
+        add_rate_melt_quote(&database, &store, "fiat-melt-b", 250).await;
+        assert_invalid_outgoing_does_not_mutate(&owner, &store, &control, &fiat_quote).await;
 
         let native = owner
             .route_outgoing(native_quote.clone(), paid("native-melt", 1_501))
@@ -1117,66 +1205,31 @@ mod tests {
             .lock()
             .expect("incoming status")
             .push(incoming("status", 1_501));
-        let starts = payment.starts.clone();
-        let stops = payment.stops.clone();
-        let waits = payment.waits.clone();
-        let cancels = payment.cancels.clone();
         let database: DynMintDatabase =
             Arc::new(cdk_sqlite::mint::memory::empty().await.expect("database"));
-        let (_, routes) = canonical_sat_msat_backends(Arc::new(payment), database)
+        let (_, routes) = canonical_sat_msat_backends(Arc::new(payment.clone()), database)
             .await
             .expect("canonical routes");
-        let fiat = CallStatusOnlyPayment::new(routes.sat.clone());
-
-        routes.sat.start().await.expect("SAT facade start is inert");
-        routes.msat.start().await.expect("native owner start");
-        fiat.start().await.expect("fiat facade start is inert");
-        assert!(routes.sat.is_payment_event_stream_active());
-        assert!(!routes.msat.is_payment_event_stream_active());
+        let store = Arc::new(InMemoryRateQuoteStore::new());
+        store
+            .insert(rate_record("status", RateQuoteSide::Mint, 125))
+            .await
+            .expect("rate terms");
+        let fiat = fiat_status_facade(routes.sat.clone(), store, RateQuoteControlHandle::new());
         let status_id = PaymentIdentifier::CustomId("status".to_string());
-        let native_status = routes
-            .msat
-            .check_incoming_payment_status(&status_id)
-            .await
-            .expect("native status");
-        let sat_status = routes
-            .sat
-            .check_incoming_payment_status(&status_id)
-            .await
-            .expect("SAT status");
-        let fiat_path_status = fiat
-            .check_incoming_payment_status(&status_id)
-            .await
-            .expect("fiat call/status facade");
         assert_eq!(
-            native_status[0].payment_amount,
+            incoming_status_amount(&routes.msat, &status_id).await,
             Amount::new(1_501, CurrencyUnit::Msat)
         );
         assert_eq!(
-            sat_status[0].payment_amount,
+            incoming_status_amount(&routes.sat, &status_id).await,
             Amount::new(1, CurrencyUnit::Sat)
         );
         assert_eq!(
-            fiat_path_status[0].payment_amount,
-            sat_status[0].payment_amount
+            incoming_status_amount(&fiat, &status_id).await,
+            Amount::new(125, CurrencyUnit::Usd)
         );
-        let mut stream = routes
-            .msat
-            .wait_payment_event()
-            .await
-            .expect("owner stream");
-        assert!(stream.next().await.is_some());
-        assert!(routes.sat.wait_payment_event().await.is_err());
-        routes.sat.cancel_payment_event_stream();
-        fiat.cancel_payment_event_stream();
-        routes.msat.cancel_payment_event_stream();
-        routes.sat.stop().await.expect("SAT facade stop is inert");
-        fiat.stop().await.expect("fiat facade stop is inert");
-        routes.msat.stop().await.expect("owner stop");
-
-        assert_eq!(starts.load(Ordering::Relaxed), 1);
-        assert_eq!(stops.load(Ordering::Relaxed), 1);
-        assert_eq!(waits.load(Ordering::Relaxed), 1);
-        assert_eq!(cancels.load(Ordering::Relaxed), 1);
+        exercise_single_lifecycle_owner(&routes, &fiat).await;
+        payment.assert_single_lifecycle_owner();
     }
 }

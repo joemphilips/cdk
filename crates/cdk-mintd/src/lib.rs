@@ -1653,24 +1653,27 @@ async fn configure_sat_msat_backend_for_unit(
     )
     .await?;
 
-    // The MSAT route exposes the same economic limits in millisatoshis:
-    // 1 sat = 1000 msat.
-    let msat_mint_melt_limits = MintMeltLimits {
-        mint_min: Amount::from(mint_melt_limits.mint_min.to_u64().saturating_mul(1000)),
-        mint_max: Amount::from(mint_melt_limits.mint_max.to_u64().saturating_mul(1000)),
-        melt_min: Amount::from(mint_melt_limits.melt_min.to_u64().saturating_mul(1000)),
-        melt_max: Amount::from(mint_melt_limits.melt_max.to_u64().saturating_mul(1000)),
-    };
     mint_builder = configure_backend_for_unit(
         settings,
         mint_builder,
         CurrencyUnit::Msat,
-        msat_mint_melt_limits,
+        msat_limits(mint_melt_limits),
         backends.msat,
     )
     .await?;
 
     Ok(mint_builder)
+}
+
+fn msat_limits(sat_limits: MintMeltLimits) -> MintMeltLimits {
+    // The MSAT route exposes the same economic limits in millisatoshis:
+    // 1 sat = 1000 msat.
+    MintMeltLimits {
+        mint_min: Amount::from(sat_limits.mint_min.to_u64().saturating_mul(1000)),
+        mint_max: Amount::from(sat_limits.mint_max.to_u64().saturating_mul(1000)),
+        melt_min: Amount::from(sat_limits.melt_min.to_u64().saturating_mul(1000)),
+        melt_max: Amount::from(sat_limits.melt_max.to_u64().saturating_mul(1000)),
+    }
 }
 
 async fn configure_non_sat_backend(
