@@ -123,8 +123,8 @@ pub fn create_new_keyset<C: secp256k1::Signing>(
 
 /// Create a new keyset for a conditional token (NUT-CTF).
 ///
-/// Uses a derivation path based on a SHA-256 hash of the condition_id and outcome_collection_id
-/// to derive a unique child index: `m/0'/<unit_index>'/<hash_derived_index>'`
+/// Uses all 256 bits of a domain-separated SHA-256 hash of the condition and
+/// outcome collection to derive a collision-resistant hardened path.
 #[cfg(feature = "conditional-tokens")]
 #[allow(clippy::too_many_arguments)]
 pub fn create_conditional_keyset<C: secp256k1::Signing>(
@@ -137,26 +137,8 @@ pub fn create_conditional_keyset<C: secp256k1::Signing>(
     input_fee_ppk: u64,
     final_expiry: Option<u64>,
 ) -> Option<(MintKeySet, MintKeySetInfo)> {
-    use bitcoin::hashes::{sha256, Hash};
-
-    let unit_index = unit.derivation_index()?;
-
-    // Derive a unique child index from SHA256(condition_id || outcome_collection_id)
-    let mut hash_input = Vec::new();
-    hash_input.extend_from_slice(condition_id.as_bytes());
-    hash_input.extend_from_slice(outcome_collection_id.as_bytes());
-    let hash = sha256::Hash::hash(&hash_input);
-    let hash_bytes = hash.as_byte_array();
-    // Use the first 4 bytes as a u32 index, masking to valid hardened range (max 2^31 - 1)
-    let derived_index =
-        u32::from_be_bytes([hash_bytes[0], hash_bytes[1], hash_bytes[2], hash_bytes[3]])
-            & 0x7FFF_FFFF;
-
-    let derivation_path = DerivationPath::from(vec![
-        ChildNumber::from_hardened_idx(0).expect("0 is a valid index"),
-        ChildNumber::from_hardened_idx(unit_index).expect("valid unit index"),
-        ChildNumber::from_hardened_idx(derived_index).expect("valid derived index"),
-    ]);
+    let (derivation_path, first_hash_index) =
+        conditional_derivation_path(&unit, condition_id, outcome_collection_id);
 
     let mut keyset = MintKeySet::generate(
         secp,
@@ -188,7 +170,7 @@ pub fn create_conditional_keyset<C: secp256k1::Signing>(
         valid_from: unix_time(),
         final_expiry: keyset.final_expiry,
         derivation_path,
-        derivation_path_index: Some(derived_index),
+        derivation_path_index: Some(first_hash_index),
         amounts: amounts.to_owned(),
         input_fee_ppk,
         issuer_version: None,
@@ -199,6 +181,50 @@ pub fn create_conditional_keyset<C: secp256k1::Signing>(
     Some((keyset, keyset_info))
 }
 
+#[cfg(feature = "conditional-tokens")]
+fn conditional_derivation_path(
+    unit: &CurrencyUnit,
+    condition_id: &str,
+    outcome_collection_id: &str,
+) -> (DerivationPath, u32) {
+    use bitcoin::hashes::{sha256, Hash, HashEngine};
+
+    let mut engine = sha256::Hash::engine();
+    engine.input(b"cdk:nut-ctf:keyset:v1");
+    let unit_name = unit.to_string();
+    engine.input(&(unit_name.len() as u64).to_be_bytes());
+    engine.input(unit_name.as_bytes());
+    engine.input(&(condition_id.len() as u64).to_be_bytes());
+    engine.input(condition_id.as_bytes());
+    engine.input(&(outcome_collection_id.len() as u64).to_be_bytes());
+    engine.input(outcome_collection_id.as_bytes());
+    let hash = sha256::Hash::from_engine(engine);
+    let hash_indices = split_hash_into_hardened_indices(hash.as_byte_array());
+
+    let mut path = Vec::with_capacity(2 + hash_indices.len());
+    path.push(ChildNumber::from_hardened_idx(0).expect("0 is a valid index"));
+    path.push(
+        ChildNumber::from_hardened_idx(unit.hashed_derivation_index())
+            .expect("hashed unit index is a valid hardened index"),
+    );
+    path.extend(hash_indices.map(|index| {
+        ChildNumber::from_hardened_idx(index).expect("31-bit hash segment is a valid index")
+    }));
+
+    (DerivationPath::from(path), hash_indices[0])
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn split_hash_into_hardened_indices(hash: &[u8; 32]) -> [u32; 9] {
+    let mut indices = [0_u32; 9];
+    for bit_index in 0..256 {
+        let bit = (hash[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
+        let segment = bit_index / 31;
+        indices[segment] = (indices[segment] << 1) | u32::from(bit);
+    }
+    indices
+}
+
 pub fn derivation_path_from_unit(unit: CurrencyUnit, index: u32) -> Option<DerivationPath> {
     let unit_index = unit.hashed_derivation_index();
 
@@ -207,6 +233,65 @@ pub fn derivation_path_from_unit(unit: CurrencyUnit, index: u32) -> Option<Deriv
         ChildNumber::from_hardened_idx(unit_index).expect("unit index should be valid"),
         ChildNumber::from_hardened_idx(index).expect("0 is a valid index"),
     ]))
+}
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod conditional_keyset_tests {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::Network;
+
+    use super::*;
+
+    #[test]
+    fn conditional_derivation_uses_more_than_the_legacy_31_bit_prefix() {
+        let first_condition = "condition-57823";
+        let second_condition = "condition-58876";
+        let outcome_collection = "outcome";
+        assert_eq!(
+            legacy_index(first_condition, outcome_collection),
+            legacy_index(second_condition, outcome_collection),
+            "fixture must collide under the old 31-bit derivation"
+        );
+
+        let secp = Secp256k1::new();
+        let xpriv =
+            Xpriv::new_master(Network::Bitcoin, &[42; 32]).expect("test seed should be valid");
+        let first = create_conditional_keyset(
+            &secp,
+            xpriv,
+            CurrencyUnit::Sat,
+            first_condition,
+            outcome_collection,
+            &[1, 2, 4],
+            0,
+            None,
+        )
+        .expect("sat is supported");
+        let second = create_conditional_keyset(
+            &secp,
+            xpriv,
+            CurrencyUnit::Sat,
+            second_condition,
+            outcome_collection,
+            &[1, 2, 4],
+            0,
+            None,
+        )
+        .expect("sat is supported");
+
+        assert_ne!(first.1.derivation_path, second.1.derivation_path);
+        assert_ne!(first.0.keys, second.0.keys);
+    }
+
+    fn legacy_index(condition_id: &str, outcome_collection_id: &str) -> u32 {
+        let hash = sha256::Hash::hash(
+            [condition_id.as_bytes(), outcome_collection_id.as_bytes()]
+                .concat()
+                .as_slice(),
+        );
+        let bytes = hash.as_byte_array();
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFF_FFFF
+    }
 }
 
 /// take all the keyset units and if te new keyset is a new unit we check
