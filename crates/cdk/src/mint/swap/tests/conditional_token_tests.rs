@@ -449,16 +449,16 @@ async fn nut_ctf_register_with_collateral_condition_info_echoes_it() {
     let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "collateral-event");
 
     let mut request = enum_condition_request("Collateral condition", vec![hex_tlv]);
-    request.collateral = Some("usd".to_string());
+    request.collateral = Some("sat".to_string());
 
     let response = mint.register_condition(request).await.unwrap();
     let info = mint.get_condition(&response.condition_id).await.unwrap();
 
-    assert_eq!(info.collateral, Some(CurrencyUnit::Usd));
+    assert_eq!(info.collateral, Some(CurrencyUnit::Sat));
 
     let conditions = mint.get_conditions(None, None, &[]).await.unwrap();
     assert_eq!(conditions.conditions.len(), 1);
-    assert_eq!(conditions.conditions[0].collateral, Some(CurrencyUnit::Usd));
+    assert_eq!(conditions.conditions[0].collateral, Some(CurrencyUnit::Sat));
 }
 
 #[test]
@@ -940,10 +940,9 @@ async fn test_register_condition_with_custom_outcome_collections() {
 async fn test_register_condition_one_vs_rest_default_creates_managed_keysets() {
     let mint = create_test_mint().await.unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
-    mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        default_keyset_creation: "one-vs-rest".to_string(),
-        ..NutCtfSettings::default()
-    });
+    let mut nut_ctf = mint_info.nuts.nut_ctf.take().unwrap_or_default();
+    nut_ctf.default_keyset_creation = "one-vs-rest".to_string();
+    mint_info.nuts.nut_ctf = Some(nut_ctf);
     mint.set_mint_info(mint_info).await.unwrap();
 
     let oracle = create_test_oracle();
@@ -1204,12 +1203,12 @@ async fn test_builder_rejects_duplicate_registration_fee_units() {
             .expect("test database should initialize"),
     );
 
-    let result = panic::catch_unwind(|| {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         MintBuilder::new(db).with_ctf_registration_fees(vec![
             registration_fee_setting(CurrencyUnit::Msat, 1, 1),
             registration_fee_setting(CurrencyUnit::Msat, 2, 2),
         ]);
-    });
+    }));
 
     assert!(
         result.is_err(),
