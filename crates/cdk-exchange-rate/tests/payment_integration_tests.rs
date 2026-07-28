@@ -18,11 +18,11 @@ use cdk_common::payment::{
     Bolt11IncomingPaymentOptions, Bolt11OutgoingPaymentOptions, IncomingPaymentOptions,
     MintPayment, OutgoingPaymentOptions,
 };
-use cdk_common::{Amount, Bolt11Invoice};
+use cdk_common::{Amount, Bolt11Invoice, QuoteId};
 use cdk_exchange_rate::{
     parked_payment_event_count, DynRateQuoteStore, InMemoryRateQuoteStore, PaymentErrorAdapter,
     RateConvertingPayment, RateConvertingPaymentConfig, RateConvertingPaymentError, RateOracle,
-    RateOracleError, RateQuoteControlHandle, RateQuoteStore, RateSnapshot,
+    RateOracleError, RateQuoteControlHandle, RateQuoteSide, RateQuoteStore, RateSnapshot,
 };
 use cdk_fake_wallet::{create_fake_invoice, FakeInvoiceDescription, FakeWallet};
 use futures::StreamExt;
@@ -201,6 +201,7 @@ async fn usd_mint_quote_uses_real_unit_semantics() {
         .expect("stored quote terms");
 
     assert_eq!(record.fiat_subunits, 100);
+    assert_eq!(record.side, RateQuoteSide::Mint);
     assert_eq!(record.sats_invoiced, 1010);
     assert_eq!(
         record.snapshot_json["aggregated_rate_sats_per_fiat_unit"],
@@ -279,6 +280,7 @@ fn melt_options(bolt11: Bolt11Invoice) -> OutgoingPaymentOptions {
         max_fee_amount: None,
         timeout_secs: None,
         melt_options: None,
+        quote_id: QuoteId::new(),
     }))
 }
 
@@ -297,9 +299,15 @@ async fn usd_melt_quote_converts_sats_to_fiat_mint_favoring() {
         .get_payment_quote(&CurrencyUnit::Usd, melt_options(bolt11))
         .await
         .expect("melt quote");
+    let record = store
+        .get_by_lookup_id(quote.request_lookup_id.as_ref().expect("melt lookup id"))
+        .await
+        .expect("store lookup")
+        .expect("stored quote terms");
 
     assert_eq!(quote.amount, Amount::new(100, CurrencyUnit::Usd));
     assert_eq!(quote.fee, Amount::new(0, CurrencyUnit::Usd));
+    assert_eq!(record.side, RateQuoteSide::Melt);
 }
 
 #[tokio::test]

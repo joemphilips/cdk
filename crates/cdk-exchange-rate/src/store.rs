@@ -9,11 +9,51 @@ use cdk_common::payment::PaymentIdentifier;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+/// Direction of the outer rate-converted quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateQuoteSide {
+    /// Fiat liability is issued after an incoming payment.
+    Mint,
+    /// Fiat liability is retired after an outgoing payment.
+    Melt,
+}
+
+impl RateQuoteSide {
+    /// Stable lowercase database representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mint => "mint",
+            Self::Melt => "melt",
+        }
+    }
+}
+
+impl std::fmt::Display for RateQuoteSide {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RateQuoteSide {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "mint" => Ok(Self::Mint),
+            "melt" => Ok(Self::Melt),
+            other => Err(format!("invalid rate quote side: {other}")),
+        }
+    }
+}
+
 /// Stored immutable terms for one rate-converted payment lookup id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateQuoteRecord {
     /// Inner payment backend lookup id.
     pub payment_lookup_id: PaymentIdentifier,
+    /// Direction of the outer rate-converted quote.
+    pub side: RateQuoteSide,
     /// Fiat unit credited or debited by the outer mint quote.
     pub fiat_unit: CurrencyUnit,
     /// Fiat amount in that unit's minor subunits.
@@ -32,6 +72,54 @@ pub struct RateQuoteRecord {
     pub sats_unbuffered: u64,
     /// Quote expiry as a Unix timestamp in seconds.
     pub expiry_unix: u64,
+}
+
+impl RateQuoteRecord {
+    /// Validate a settlement intent against the immutable persisted terms.
+    pub fn validate_settlement(
+        &self,
+        unit: &CurrencyUnit,
+        settlement: RateQuoteSettlement,
+    ) -> Result<(), RateQuoteStoreError> {
+        if &self.fiat_unit != unit {
+            return Err(RateQuoteStoreError::InvalidSettlement(format!(
+                "stored unit {} does not match requested unit {unit}",
+                self.fiat_unit
+            )));
+        }
+
+        let (expected_side, settled_subunits) = match settlement {
+            RateQuoteSettlement::MintCredit { fiat_subunits, .. } => {
+                (RateQuoteSide::Mint, fiat_subunits)
+            }
+            RateQuoteSettlement::Melt { fiat_subunits } => (RateQuoteSide::Melt, fiat_subunits),
+        };
+        if self.side != expected_side {
+            return Err(RateQuoteStoreError::InvalidSettlement(format!(
+                "stored side {} does not match requested side {expected_side}",
+                self.side
+            )));
+        }
+
+        let expected_subunits = match self.side {
+            RateQuoteSide::Mint => self.fiat_subunits,
+            RateQuoteSide::Melt => self
+                .fiat_subunits
+                .checked_add(self.fiat_fee_subunits)
+                .ok_or_else(|| {
+                    RateQuoteStoreError::InvalidSettlement(
+                        "stored fiat amount and fee overflow".to_string(),
+                    )
+                })?,
+        };
+        if settled_subunits != expected_subunits {
+            return Err(RateQuoteStoreError::InvalidSettlement(format!(
+                "settlement amount {settled_subunits} does not match stored amount {expected_subunits}"
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 /// Parked payment row for fail-closed orphaned payment events.
@@ -104,6 +192,12 @@ pub enum RateQuoteStoreError {
     /// Invalid unit-control request.
     #[error("invalid rate quote control request: {0}")]
     InvalidControl(String),
+    /// Settlement intent conflicts with immutable quote terms.
+    #[error("invalid rate quote settlement: {0}")]
+    InvalidSettlement(String),
+    /// A quote already exists for the payment lookup id.
+    #[error("duplicate rate quote lookup id: {0}")]
+    DuplicateQuote(String),
     /// Storage backend error.
     #[error("rate quote store error: {0}")]
     Storage(String),
@@ -248,9 +342,11 @@ impl RateQuoteStore for InMemoryRateQuoteStore {
             ));
         }
 
-        inner
-            .records
-            .insert(record.payment_lookup_id.to_string(), record);
+        let key = record.payment_lookup_id.to_string();
+        if inner.records.contains_key(&key) {
+            return Err(RateQuoteStoreError::DuplicateQuote(key));
+        }
+        inner.records.insert(key, record);
         Ok(())
     }
 
@@ -311,9 +407,12 @@ impl RateQuoteStore for InMemoryRateQuoteStore {
                 "forced in-memory settle failure".to_string(),
             ));
         }
-        if !inner.records.contains_key(&payment_lookup_id.to_string())
-            || !inner.settled.insert(payment_lookup_id.to_string())
-        {
+        let key = payment_lookup_id.to_string();
+        let Some(record) = inner.records.get(&key) else {
+            return Ok(false);
+        };
+        record.validate_settlement(unit, settlement)?;
+        if !inner.settled.insert(key) {
             return Ok(false);
         }
 
@@ -419,5 +518,130 @@ impl RateQuoteStore for InMemoryRateQuoteStore {
             .or_insert_with(|| UnitControlRecord::new(unit.clone()));
         control.buffer_surplus_sats = control.buffer_surplus_sats.saturating_add(sats);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(lookup_id: &str, side: RateQuoteSide) -> RateQuoteRecord {
+        RateQuoteRecord {
+            payment_lookup_id: PaymentIdentifier::CustomId(lookup_id.to_string()),
+            side,
+            fiat_unit: CurrencyUnit::Usd,
+            fiat_subunits: 100,
+            fiat_fee_subunits: 2,
+            snapshot_json: serde_json::json!({ "rate": 1_000 }),
+            sats_invoiced: 1_000,
+            sats_unbuffered: 990,
+            expiry_unix: 42,
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_store_round_trips_quote_side() {
+        let store = InMemoryRateQuoteStore::new();
+
+        for expected in [
+            record("mint", RateQuoteSide::Mint),
+            record("melt", RateQuoteSide::Melt),
+        ] {
+            store.insert(expected.clone()).await.expect("insert");
+            let actual = store
+                .get_by_lookup_id(&expected.payment_lookup_id)
+                .await
+                .expect("lookup")
+                .expect("stored record");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_store_rejects_duplicate_lookup_id() {
+        let store = InMemoryRateQuoteStore::new();
+        let first = record("duplicate", RateQuoteSide::Mint);
+
+        store.insert(first.clone()).await.expect("first insert");
+        let error = store
+            .insert(first)
+            .await
+            .expect_err("duplicate insert must fail");
+
+        assert!(matches!(error, RateQuoteStoreError::DuplicateQuote(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_settlement_does_not_mutate_and_correct_retry_commits_once() {
+        let store = InMemoryRateQuoteStore::new();
+        let quote = record("settlement", RateQuoteSide::Mint);
+        store.insert(quote.clone()).await.expect("insert");
+
+        for invalid in [
+            (
+                CurrencyUnit::Usd,
+                RateQuoteSettlement::Melt {
+                    fiat_subunits: quote.fiat_subunits,
+                },
+            ),
+            (
+                CurrencyUnit::Eur,
+                RateQuoteSettlement::MintCredit {
+                    fiat_subunits: quote.fiat_subunits,
+                    buffer_surplus_sats: 10,
+                },
+            ),
+            (
+                CurrencyUnit::Usd,
+                RateQuoteSettlement::MintCredit {
+                    fiat_subunits: quote.fiat_subunits + 1,
+                    buffer_surplus_sats: 10,
+                },
+            ),
+        ] {
+            let error = store
+                .settle_quote_and_commit_unit_control(
+                    &quote.payment_lookup_id,
+                    &invalid.0,
+                    invalid.1,
+                )
+                .await
+                .expect_err("conflicting settlement must fail");
+            assert!(matches!(error, RateQuoteStoreError::InvalidSettlement(_)));
+            assert!(
+                store
+                    .load_unit_controls()
+                    .await
+                    .expect("controls")
+                    .is_empty(),
+                "invalid settlement must not mutate unit control"
+            );
+        }
+
+        let correct = RateQuoteSettlement::MintCredit {
+            fiat_subunits: quote.fiat_subunits,
+            buffer_surplus_sats: 10,
+        };
+        assert!(store
+            .settle_quote_and_commit_unit_control(
+                &quote.payment_lookup_id,
+                &CurrencyUnit::Usd,
+                correct,
+            )
+            .await
+            .expect("correct retry"));
+        assert!(!store
+            .settle_quote_and_commit_unit_control(
+                &quote.payment_lookup_id,
+                &CurrencyUnit::Usd,
+                correct,
+            )
+            .await
+            .expect("idempotent retry"));
+
+        let controls = store.load_unit_controls().await.expect("controls");
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].outstanding, quote.fiat_subunits);
+        assert_eq!(controls[0].buffer_surplus_sats, 10);
     }
 }
