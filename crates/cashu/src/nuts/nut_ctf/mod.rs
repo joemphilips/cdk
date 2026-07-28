@@ -452,7 +452,6 @@ pub struct ConditionalKeysetsResponse {
 
 /// Per-unit condition registration fee settings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct RegistrationFeeSetting {
     /// Collateral unit this fee setting applies to.
     pub unit: String,
