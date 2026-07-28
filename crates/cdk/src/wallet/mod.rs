@@ -39,6 +39,8 @@ use crate::{Amount, OidcClient};
 mod auth;
 pub mod bip321;
 mod blind_signature;
+#[cfg(feature = "conditional-tokens")]
+mod ctf;
 #[cfg(feature = "nostr")]
 mod nostr_backup;
 #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]

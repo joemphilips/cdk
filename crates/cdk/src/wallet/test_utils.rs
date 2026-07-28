@@ -892,4 +892,56 @@ impl MintConnector for MockMintConnector {
             .pop_front()
             .expect("MockMintConnector: post_batch_mint called without configured response")
     }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditions(
+        &self,
+        _since: Option<u64>,
+        _limit: Option<u64>,
+        _status: &[String],
+    ) -> Result<crate::nuts::nut_ctf::GetConditionsResponse, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_condition(
+        &self,
+        _condition_id: &str,
+    ) -> Result<crate::nuts::nut_ctf::ConditionInfo, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_register_condition(
+        &self,
+        _request: crate::nuts::nut_ctf::RegisterConditionRequest,
+    ) -> Result<crate::nuts::nut_ctf::RegisterConditionResponse, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_conditional_keysets(
+        &self,
+        _since: Option<u64>,
+        _limit: Option<u64>,
+        _active: Option<bool>,
+    ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_ctf_convert(
+        &self,
+        _request: crate::nuts::nut_ctf::CtfConvertRequest,
+    ) -> Result<crate::nuts::nut_ctf::CtfConvertResponse, Error> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn post_redeem_outcome(
+        &self,
+        _request: crate::nuts::nut_ctf::RedeemOutcomeRequest,
+    ) -> Result<crate::nuts::nut_ctf::RedeemOutcomeResponse, Error> {
+        unimplemented!()
+    }
 }

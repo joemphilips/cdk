@@ -192,6 +192,7 @@ pub fn create_fake_wallet_settings(
             http_cache: cache::Config::default(),
             logging: cdk_mintd::config::LoggingConfig {
                 output: cdk_mintd::config::LoggingOutput::Both,
+                format: cdk_mintd::config::LoggingFormat::Text,
                 console_level: Some("debug".to_string()),
                 file_level: Some("debug".to_string()),
             },
@@ -264,6 +265,7 @@ pub fn create_cln_settings(
             http_cache: cache::Config::default(),
             logging: cdk_mintd::config::LoggingConfig {
                 output: cdk_mintd::config::LoggingOutput::Both,
+                format: cdk_mintd::config::LoggingFormat::Text,
                 console_level: Some("debug".to_string()),
                 file_level: Some("debug".to_string()),
             },
@@ -318,6 +320,7 @@ pub fn create_lnd_settings(
             http_cache: cache::Config::default(),
             logging: cdk_mintd::config::LoggingConfig {
                 output: cdk_mintd::config::LoggingOutput::Both,
+                format: cdk_mintd::config::LoggingFormat::Text,
                 console_level: Some("debug".to_string()),
                 file_level: Some("debug".to_string()),
             },

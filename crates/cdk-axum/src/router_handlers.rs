@@ -1,5 +1,7 @@
 use anyhow::Result;
 use axum::extract::ws::WebSocketUpgrade;
+#[cfg(feature = "conditional-tokens")]
+use axum::extract::Query;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -846,6 +848,19 @@ pub(crate) async fn get_index(
         supported_features.push((29, "Batched minting"));
     }
 
+    #[cfg(feature = "conditional-tokens")]
+    {
+        if mint_info.nuts.nut_ctf.is_some() {
+            supported_features.push((100, "Conditional Tokens (CTF)"));
+        }
+        if mint_info.nuts.nut_ctf_split_merge.is_some() {
+            supported_features.push((101, "CTF Split/Merge"));
+        }
+        if mint_info.nuts.nut_ctf_numeric.is_some() {
+            supported_features.push((102, "CTF Numeric"));
+        }
+    }
+
     // Avatar fallback letter
     let avatar_letter = name
         .chars()
@@ -1104,4 +1119,192 @@ where
     );
     // Per NUT-00 spec: "In case of an error, mints respond with the HTTP status code 400"
     (StatusCode::BAD_REQUEST, Json(err_response)).into_response()
+}
+
+// --- NUT-CTF Conditional Token Endpoints ---
+
+/// GET /v1/conditions - List all registered conditions
+#[cfg(feature = "conditional-tokens")]
+#[instrument(skip_all)]
+pub(crate) async fn get_conditions(
+    #[cfg(feature = "auth")] auth: AuthHeader,
+    State(state): State<MintState>,
+    Query(params): Query<cdk::nuts::nut_ctf::GetConditionsRequest>,
+) -> Result<Json<cdk::nuts::nut_ctf::GetConditionsResponse>, Response> {
+    #[cfg(feature = "auth")]
+    {
+        state
+            .mint
+            .verify_auth(
+                auth.into(),
+                &ProtectedEndpoint::new(Method::Get, RoutePath::Conditions),
+            )
+            .await
+            .map_err(into_response)?;
+    }
+
+    let response = state
+        .mint
+        .get_conditions(params.since, params.limit, &params.status)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not get conditions: {}", err);
+            into_response(err)
+        })?;
+    Ok(Json(response))
+}
+
+/// POST /v1/conditions - Register a new condition
+#[cfg(feature = "conditional-tokens")]
+#[instrument(skip_all)]
+pub(crate) async fn post_conditions(
+    #[cfg(feature = "auth")] auth: AuthHeader,
+    State(state): State<MintState>,
+    Json(payload): Json<cdk::nuts::nut_ctf::RegisterConditionRequest>,
+) -> Result<Json<cdk::nuts::nut_ctf::RegisterConditionResponse>, Response> {
+    #[cfg(feature = "auth")]
+    {
+        state
+            .mint
+            .verify_auth(
+                auth.into(),
+                &ProtectedEndpoint::new(Method::Post, RoutePath::Conditions),
+            )
+            .await
+            .map_err(into_response)?;
+    }
+
+    let response = state
+        .mint
+        .register_condition(payload)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not register condition: {}", err);
+            into_response(err)
+        })?;
+    Ok(Json(response))
+}
+
+/// GET /v1/conditions/{condition_id} - Get a specific condition
+#[cfg(feature = "conditional-tokens")]
+#[instrument(skip_all)]
+pub(crate) async fn get_condition(
+    #[cfg(feature = "auth")] auth: AuthHeader,
+    State(state): State<MintState>,
+    Path(condition_id): Path<String>,
+) -> Result<Json<cdk::nuts::nut_ctf::ConditionInfo>, Response> {
+    #[cfg(feature = "auth")]
+    {
+        state
+            .mint
+            .verify_auth(
+                auth.into(),
+                &ProtectedEndpoint::new(Method::Get, RoutePath::Condition),
+            )
+            .await
+            .map_err(into_response)?;
+    }
+
+    let response = state
+        .mint
+        .get_condition(&condition_id)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not get condition: {}", err);
+            into_response(err)
+        })?;
+    Ok(Json(response))
+}
+
+/// GET /v1/conditional_keysets - List all conditional keysets
+#[cfg(feature = "conditional-tokens")]
+#[instrument(skip_all)]
+pub(crate) async fn get_conditional_keysets(
+    #[cfg(feature = "auth")] auth: AuthHeader,
+    State(state): State<MintState>,
+    Query(params): Query<cdk::nuts::nut_ctf::GetConditionalKeysetsRequest>,
+) -> Result<Json<cdk::nuts::nut_ctf::ConditionalKeysetsResponse>, Response> {
+    #[cfg(feature = "auth")]
+    {
+        state
+            .mint
+            .verify_auth(
+                auth.into(),
+                &ProtectedEndpoint::new(Method::Get, RoutePath::ConditionalKeysets),
+            )
+            .await
+            .map_err(into_response)?;
+    }
+
+    let response = state
+        .mint
+        .get_conditional_keysets(params.since, params.limit, params.active)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not get conditional keysets: {}", err);
+            into_response(err)
+        })?;
+    Ok(Json(response))
+}
+
+/// POST /v1/ctf/convert - Convert conditional/collateral positions
+#[cfg(feature = "conditional-tokens")]
+#[instrument(skip_all)]
+pub(crate) async fn post_ctf_convert(
+    #[cfg(feature = "auth")] auth: AuthHeader,
+    State(state): State<MintState>,
+    Json(payload): Json<cdk::nuts::nut_ctf::CtfConvertRequest>,
+) -> Result<Json<cdk::nuts::nut_ctf::CtfConvertResponse>, Response> {
+    #[cfg(feature = "auth")]
+    {
+        state
+            .mint
+            .verify_auth(
+                auth.into(),
+                &ProtectedEndpoint::new(Method::Post, RoutePath::Swap),
+            )
+            .await
+            .map_err(into_response)?;
+    }
+
+    let response = state
+        .mint
+        .process_ctf_convert(payload)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not process CTF convert: {}", err);
+            into_response(err)
+        })?;
+    Ok(Json(response))
+}
+
+/// POST /v1/redeem_outcome - Redeem conditional tokens
+#[cfg(feature = "conditional-tokens")]
+#[instrument(skip_all)]
+pub(crate) async fn post_redeem_outcome(
+    #[cfg(feature = "auth")] auth: AuthHeader,
+    State(state): State<MintState>,
+    Json(payload): Json<cdk::nuts::nut_ctf::RedeemOutcomeRequest>,
+) -> Result<Json<cdk::nuts::nut_ctf::RedeemOutcomeResponse>, Response> {
+    #[cfg(feature = "auth")]
+    {
+        state
+            .mint
+            .verify_auth(
+                auth.into(),
+                &ProtectedEndpoint::new(Method::Post, RoutePath::RedeemOutcome),
+            )
+            .await
+            .map_err(into_response)?;
+    }
+
+    let response = state
+        .mint
+        .process_redeem_outcome(payload)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not process redeem outcome: {}", err);
+            into_response(err)
+        })?;
+    Ok(Json(response))
 }

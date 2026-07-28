@@ -16,6 +16,8 @@ use tracing::instrument;
 use crate::common::{
     check_unit_string_collision, create_new_keyset, derivation_path_from_unit, init_keysets,
 };
+#[cfg(feature = "conditional-tokens")]
+use crate::signatory::PreparedConditionalKeySet;
 use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
 
 /// In-memory Signatory
@@ -86,6 +88,14 @@ impl DbSignatory {
     ///
     /// Any operation performed with keysets, are done through this trait and never to the database
     /// directly.
+    ///
+    /// The load path is split in two:
+    /// - Regular keysets come from the `keyset` table. Active status is derived from
+    ///   `get_active_keysets()` which returns one keyset per unit (the primary).
+    /// - Conditional keysets (NUT-CTF) live in the separate `conditional_keyset` table.
+    ///   Each row's `active` flag is honoured verbatim (the unique partial index enforces
+    ///   "at most one active per outcome_collection_id"), so conditional keysets do NOT
+    ///   collapse the per-unit primary keyset.
     async fn reload_keys_from_db(&self) -> Result<(), Error> {
         let mut keysets = self.keysets.write().await;
         let mut active_keysets = self.active_keysets.write().await;
@@ -104,9 +114,24 @@ impl DbSignatory {
             keysets.insert(id, (info, keyset));
         }
 
-        // Publish the new snapshot to any keyset subscribers. Sending while the
-        // locks are held keeps the published set consistent with in-memory
-        // state.
+        #[cfg(feature = "conditional-tokens")]
+        {
+            for info in self
+                .localstore
+                .get_all_conditional_mint_keyset_infos()
+                .await?
+            {
+                let id = info.id;
+                let keyset = self.generate_keyset(&info);
+                // Conditional keysets are NOT registered in active_keysets — that map
+                // still has "one primary per unit" semantics so that wallets binding
+                // via /v1/keys find the real collateral keyset, not a CTF keyset.
+                keysets.insert(id, (info, keyset));
+            }
+        }
+
+        // Publish the complete regular-plus-conditional snapshot to keyset
+        // subscribers while the locks still make it consistent with memory.
         self.keyset_updates.send_replace(SignatoryKeysets {
             pubkey: self.xpub,
             keysets: keysets.values().map(|k| k.into()).collect(),
@@ -267,6 +292,46 @@ impl Signatory for DbSignatory {
         self.reload_keys_from_db().await?;
 
         Ok((&(info, keyset)).into())
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tracing::instrument(skip(self))]
+    async fn prepare_conditional_keyset(
+        &self,
+        unit: CurrencyUnit,
+        condition_id: &str,
+        outcome_collection: &str,
+        outcome_collection_id: &str,
+        amounts: Vec<u64>,
+        input_fee_ppk: u64,
+        final_expiry: Option<u64>,
+    ) -> Result<PreparedConditionalKeySet, Error> {
+        let (keyset, mut info) = crate::common::create_conditional_keyset(
+            &self.secp_ctx,
+            self.xpriv,
+            unit,
+            condition_id,
+            outcome_collection_id,
+            &amounts,
+            input_fee_ppk,
+            final_expiry,
+        )
+        .ok_or(Error::UnsupportedUnit)?;
+
+        info.outcome_collection = Some(outcome_collection.to_string());
+        info.active = true;
+
+        let public = (&(info.clone(), keyset)).into();
+
+        Ok(PreparedConditionalKeySet {
+            keyset: public,
+            info,
+        })
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    async fn reload_keysets_from_storage(&self) -> Result<(), Error> {
+        self.reload_keys_from_db().await
     }
 }
 

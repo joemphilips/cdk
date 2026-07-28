@@ -146,6 +146,18 @@ pub enum RoutePath {
     MintBlindAuth,
     /// WebSocket
     Ws,
+    /// Conditions (GET/POST /v1/conditions)
+    #[cfg(feature = "conditional-tokens")]
+    Conditions,
+    /// Single Condition (GET /v1/conditions/{id})
+    #[cfg(feature = "conditional-tokens")]
+    Condition,
+    /// Conditional Keysets (GET /v1/conditional_keysets)
+    #[cfg(feature = "conditional-tokens")]
+    ConditionalKeysets,
+    /// Redeem Outcome (POST /v1/redeem_outcome)
+    #[cfg(feature = "conditional-tokens")]
+    RedeemOutcome,
 }
 
 impl Serialize for RoutePath {
@@ -172,6 +184,12 @@ impl std::str::FromStr for RoutePath {
             "/v1/restore" => Ok(RoutePath::Restore),
             "/v1/auth/blind/mint" => Ok(RoutePath::MintBlindAuth),
             "/v1/ws" => Ok(RoutePath::Ws),
+            #[cfg(feature = "conditional-tokens")]
+            "/v1/conditions" => Ok(RoutePath::Conditions),
+            #[cfg(feature = "conditional-tokens")]
+            "/v1/conditional_keysets" => Ok(RoutePath::ConditionalKeysets),
+            #[cfg(feature = "conditional-tokens")]
+            "/v1/redeem_outcome" => Ok(RoutePath::RedeemOutcome),
             _ => {
                 // Try to parse as a payment method route
                 if let Some(method) = s.strip_prefix("/v1/mint/quote/") {
@@ -183,6 +201,15 @@ impl std::str::FromStr for RoutePath {
                 } else if let Some(method) = s.strip_prefix("/v1/melt/") {
                     Ok(RoutePath::Melt(normalize_payment_method(method)))
                 } else {
+                    // Conditional token paths with dynamic segments
+                    #[cfg(feature = "conditional-tokens")]
+                    {
+                        if let Some(condition_id) = s.strip_prefix("/v1/conditions/") {
+                            if !condition_id.is_empty() && !condition_id.contains('/') {
+                                return Ok(RoutePath::Condition);
+                            }
+                        }
+                    }
                     // Unknown path - this might be an old database value or config
                     // Provide a helpful error message
                     Err(Error::UnknownRoute(s.to_string()))
@@ -264,13 +291,22 @@ impl RoutePath {
     /// Get all non-payment-method route paths
     /// These are routes that don't depend on payment methods
     pub fn static_paths() -> Vec<RoutePath> {
-        vec![
+        #[allow(unused_mut)]
+        let mut paths = vec![
             RoutePath::Swap,
             RoutePath::Checkstate,
             RoutePath::Restore,
             RoutePath::MintBlindAuth,
             RoutePath::Ws,
-        ]
+        ];
+        #[cfg(feature = "conditional-tokens")]
+        {
+            paths.push(RoutePath::Conditions);
+            paths.push(RoutePath::Condition);
+            paths.push(RoutePath::ConditionalKeysets);
+            paths.push(RoutePath::RedeemOutcome);
+        }
+        paths
     }
 
     /// Get all route paths for common payment methods (bolt11, bolt12)
@@ -347,6 +383,14 @@ impl std::fmt::Display for RoutePath {
             RoutePath::Restore => write!(f, "/v1/restore"),
             RoutePath::MintBlindAuth => write!(f, "/v1/auth/blind/mint"),
             RoutePath::Ws => write!(f, "/v1/ws"),
+            #[cfg(feature = "conditional-tokens")]
+            RoutePath::Conditions => write!(f, "/v1/conditions"),
+            #[cfg(feature = "conditional-tokens")]
+            RoutePath::Condition => write!(f, "/v1/conditions/{{condition_id}}"),
+            #[cfg(feature = "conditional-tokens")]
+            RoutePath::ConditionalKeysets => write!(f, "/v1/conditional_keysets"),
+            #[cfg(feature = "conditional-tokens")]
+            RoutePath::RedeemOutcome => write!(f, "/v1/redeem_outcome"),
         }
     }
 }

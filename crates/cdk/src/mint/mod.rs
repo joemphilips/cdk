@@ -31,12 +31,18 @@ use crate::{Amount, OidcClient};
 pub(crate) mod auth;
 mod builder;
 mod check_spendable;
+#[cfg(feature = "conditional-tokens")]
+mod conditions;
 mod issue;
 mod keysets;
 mod ln;
 mod melt;
 mod proofs;
+#[cfg(feature = "conditional-tokens")]
+mod redeem_outcome;
 mod saga_recovery;
+#[cfg(feature = "conditional-tokens")]
+mod split_merge;
 mod start_up_check;
 mod subscription;
 mod swap;
@@ -86,6 +92,9 @@ pub struct Mint {
     max_inputs: usize,
     /// Maximum number of outputs allowed per transaction
     max_outputs: usize,
+    /// Maximum number of outcomes allowed per conditional-token condition
+    #[cfg(feature = "conditional-tokens")]
+    max_outcomes_per_condition: usize,
 }
 
 impl std::fmt::Debug for Mint {
@@ -224,6 +233,7 @@ impl Mint {
         payment_processors: HashMap<PaymentProcessorKey, DynMintPayment>,
         max_inputs: usize,
         max_outputs: usize,
+        #[cfg(feature = "conditional-tokens")] max_outcomes_per_condition: usize,
     ) -> Result<Self, Error> {
         Self::new_internal(
             mint_info,
@@ -233,6 +243,8 @@ impl Mint {
             payment_processors,
             max_inputs,
             max_outputs,
+            #[cfg(feature = "conditional-tokens")]
+            max_outcomes_per_condition,
         )
         .await
     }
@@ -246,6 +258,7 @@ impl Mint {
         payment_processors: HashMap<PaymentProcessorKey, DynMintPayment>,
         max_inputs: usize,
         max_outputs: usize,
+        #[cfg(feature = "conditional-tokens")] max_outcomes_per_condition: usize,
     ) -> Result<Self, Error> {
         Self::new_internal(
             mint_info,
@@ -255,6 +268,8 @@ impl Mint {
             payment_processors,
             max_inputs,
             max_outputs,
+            #[cfg(feature = "conditional-tokens")]
+            max_outcomes_per_condition,
         )
         .await
     }
@@ -269,6 +284,7 @@ impl Mint {
         payment_processors: HashMap<PaymentProcessorKey, DynMintPayment>,
         max_inputs: usize,
         max_outputs: usize,
+        #[cfg(feature = "conditional-tokens")] max_outcomes_per_condition: usize,
     ) -> Result<Self, Error> {
         // Subscribe up front and bootstrap the in-memory snapshot from the same
         // receiver that keeps it fresh. `borrow_and_update` pins the receiver
@@ -379,6 +395,8 @@ impl Mint {
             })),
             max_inputs,
             max_outputs,
+            #[cfg(feature = "conditional-tokens")]
+            max_outcomes_per_condition,
         })
     }
 
@@ -2026,6 +2044,8 @@ mod tests {
             HashMap::new(),
             1000,
             1000,
+            #[cfg(feature = "conditional-tokens")]
+            crate::nuts::nut_ctf::MAX_OUTCOMES,
         )
         .await
         .unwrap()
