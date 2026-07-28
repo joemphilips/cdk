@@ -616,6 +616,28 @@ where
 {
     type Err = Error;
 
+    async fn get_condition_for_update(
+        &mut self,
+        condition_id: &str,
+    ) -> Result<Option<cdk_common::database::mint::Acquired<StoredCondition>>, Self::Err> {
+        query(
+            r#"
+            SELECT condition_id, threshold, tags_json, announcements_json,
+                   collateral, attestation_status, winning_outcome, attested_at, created_at,
+                   condition_type, lo_bound, hi_bound, precision
+            FROM conditions
+            WHERE condition_id = :condition_id
+            FOR UPDATE
+            "#,
+        )?
+        .bind("condition_id", condition_id.to_string())
+        .fetch_one(&self.inner)
+        .await?
+        .map(sql_row_to_stored_condition)
+        .transpose()
+        .map(|condition| condition.map(Into::into))
+    }
+
     async fn add_condition(&mut self, condition: StoredCondition) -> Result<(), Self::Err> {
         insert_condition(&self.inner, condition).await
     }

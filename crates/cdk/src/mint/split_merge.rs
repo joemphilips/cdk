@@ -16,7 +16,7 @@ use cdk_common::CurrencyUnit;
 use tracing::instrument;
 
 use super::conditions::STATUS_PENDING;
-use super::swap::swap_saga::SwapSaga;
+use super::swap::atomic::execute_atomic_ctf_convert;
 use super::Mint;
 use crate::Error;
 
@@ -122,6 +122,7 @@ impl Mint {
             output_ranges.insert(key.clone(), (start, end));
         }
 
+        let all_input_proofs = proofs_sorted_by_y(all_input_proofs)?;
         let fee_breakdown = self.get_proofs_fee(&all_input_proofs).await?;
         let fee: u64 = fee_breakdown.total.into();
         if fee == 0 {
@@ -141,19 +142,14 @@ impl Mint {
         }
 
         let input_verification = self.verify_inputs(&all_input_proofs).await?;
-        let init_saga = SwapSaga::new(self, self.localstore.clone(), self.pubsub_manager.clone());
-        let setup_saga = init_saga
-            .setup_swap_unbalanced(
-                &all_input_proofs,
-                &all_blinded_messages,
-                None,
-                input_verification,
-            )
-            .await?;
-        let signed_saga = setup_saga.sign_outputs().await?;
-        let swap_response = signed_saga.finalize().await?;
-
-        let all_sigs = swap_response.signatures;
+        let all_sigs = execute_atomic_ctf_convert(
+            self,
+            &request.condition_id,
+            &all_input_proofs,
+            &all_blinded_messages,
+            input_verification,
+        )
+        .await?;
         let mut signatures = HashMap::new();
         for (key, (start, end)) in output_ranges {
             signatures.insert(key, all_sigs[start..end].to_vec());
@@ -374,6 +370,15 @@ fn check_unit(expected: &mut Option<CurrencyUnit>, actual: &CurrencyUnit) -> Res
             Ok(())
         }
     }
+}
+
+fn proofs_sorted_by_y(proofs: Vec<Proof>) -> Result<Vec<Proof>, Error> {
+    let mut keyed = proofs
+        .into_iter()
+        .map(|proof| Ok((proof.y()?.to_bytes(), proof)))
+        .collect::<Result<Vec<_>, Error>>()?;
+    keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(keyed.into_iter().map(|(_, proof)| proof).collect())
 }
 
 fn add_proof_amounts(

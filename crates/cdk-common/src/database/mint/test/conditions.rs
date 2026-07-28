@@ -77,6 +77,24 @@ where
     assert!(result.is_none());
 }
 
+/// Test acquiring a condition through the transaction locking API.
+pub async fn get_condition_for_update<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error>,
+{
+    let condition = test_condition(&"ab".repeat(32));
+    db.add_condition(condition.clone()).await.unwrap();
+
+    let mut tx = db.begin_transaction().await.unwrap();
+    let acquired = tx
+        .get_condition_for_update(&condition.condition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acquired.condition_id, condition.condition_id);
+    tx.commit().await.unwrap();
+}
+
 /// Test get_conditions returns multiple conditions
 pub async fn get_conditions_multiple<DB>(db: DB)
 where

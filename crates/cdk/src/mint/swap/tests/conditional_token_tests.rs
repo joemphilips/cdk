@@ -26,10 +26,10 @@ use cdk_common::nuts::{
 };
 use cdk_common::{Amount, CurrencyUnit, State};
 use cdk_fake_wallet::FakeWallet;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::mint::{Mint, MintBuilder, MintMeltLimits, UnitConfig};
-use crate::test_helpers::mint::mint_test_proofs;
+use crate::test_helpers::mint::{clear_fail_for, mint_test_proofs, set_fail_for};
 use crate::types::{FeeReserve, QuoteTTL};
 use crate::Error;
 
@@ -288,6 +288,110 @@ fn create_premint(
     .unwrap();
     let blinded_messages = pre_mint.blinded_messages().to_vec();
     (blinded_messages, pre_mint)
+}
+
+struct AtomicConvertFixture {
+    request: CtfConvertRequest,
+    input_ys: Vec<cdk_common::PublicKey>,
+    blinded_secrets: Vec<cdk_common::PublicKey>,
+}
+
+async fn atomic_convert_fixture(mint: &Mint) -> AtomicConvertFixture {
+    let face_amount = Amount::from(8192);
+    let input_proofs = mint_test_proofs_for_unit(mint, face_amount, CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let input_ys = input_proofs.ys().unwrap();
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+    let output_amount = Amount::from(8191);
+    let (yes_outputs, _) = create_premint(mint, *keysets.get("YES").unwrap(), output_amount);
+    let (no_outputs, _) = create_premint(mint, *keysets.get("NO").unwrap(), output_amount);
+    let blinded_secrets = yes_outputs
+        .iter()
+        .chain(&no_outputs)
+        .map(|message| message.blinded_secret)
+        .collect();
+
+    AtomicConvertFixture {
+        request: CtfConvertRequest {
+            condition_id,
+            parent_collection_id: None,
+            inputs: HashMap::from([("*".to_string(), input_proofs)]),
+            outputs: HashMap::from([
+                ("YES".to_string(), yes_outputs),
+                ("NO".to_string(), no_outputs),
+            ]),
+        },
+        input_ys,
+        blinded_secrets,
+    }
+}
+
+async fn assert_atomic_convert_rollback(failure_point: &str) {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let fixture = atomic_convert_fixture(&mint).await;
+
+    set_fail_for(failure_point);
+    let result = mint.process_ctf_convert(fixture.request.clone()).await;
+    clear_fail_for(failure_point);
+    assert!(result.is_err(), "{failure_point} must abort conversion");
+
+    assert_atomic_convert_absent(&mint, &fixture).await;
+    mint.process_ctf_convert(fixture.request.clone())
+        .await
+        .expect("the same conversion should succeed after rollback");
+    assert_atomic_convert_committed(&mint, &fixture).await;
+}
+
+async fn assert_atomic_convert_absent(mint: &Mint, fixture: &AtomicConvertFixture) {
+    let db = mint.localstore();
+    assert!(
+        db.get_proofs_states(&fixture.input_ys)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none),
+        "rolled-back inputs must not remain persisted"
+    );
+    assert!(
+        db.get_blind_signatures(&fixture.blinded_secrets)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none),
+        "rolled-back outputs must not retain signatures"
+    );
+    assert!(
+        db.get_completed_operations_by_kind(cdk_common::mint::OperationKind::Swap)
+            .await
+            .unwrap()
+            .is_empty(),
+        "rolled-back conversion must not record completion"
+    );
+}
+
+async fn assert_atomic_convert_committed(mint: &Mint, fixture: &AtomicConvertFixture) {
+    let db = mint.localstore();
+    assert_eq!(
+        db.get_proofs_states(&fixture.input_ys).await.unwrap(),
+        vec![Some(State::Spent); fixture.input_ys.len()]
+    );
+    assert!(db
+        .get_blind_signatures(&fixture.blinded_secrets)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_some));
+    assert_eq!(
+        db.get_completed_operations_by_kind(cdk_common::mint::OperationKind::Swap)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 fn after_conditional_input_fee(amount: Amount) -> Amount {
@@ -1901,6 +2005,158 @@ async fn test_ctf_split_msat_input_fee_charged_in_msat() {
             .map(|sig| sig.amount.to_u64())
             .sum::<u64>(),
         8191
+    );
+}
+
+#[tokio::test]
+async fn test_atomic_ctf_convert_commits_spent_signatures_and_operation() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let fixture = atomic_convert_fixture(&mint).await;
+
+    mint.process_ctf_convert(fixture.request.clone())
+        .await
+        .unwrap();
+    assert_atomic_convert_committed(&mint, &fixture).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_atomic_ctf_convert_rolls_back_signature_failure() {
+    assert_atomic_convert_rollback("ADD_SIGNATURES").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_atomic_ctf_convert_rolls_back_proof_update_failure() {
+    assert_atomic_convert_rollback("UPDATE_PROOFS").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_atomic_ctf_convert_rolls_back_completed_operation_failure() {
+    assert_atomic_convert_rollback("ADD_COMPLETED_OPERATION").await;
+}
+
+#[tokio::test]
+async fn test_atomic_ctf_convert_attestation_gap_rejects_without_persistence() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let fixture = atomic_convert_fixture(&mint).await;
+    let (reached, release) = mint.arm_atomic_ctf_test_pause().await;
+    let convert_mint = mint.clone();
+    let request = fixture.request.clone();
+    let convert = tokio::spawn(async move { convert_mint.process_ctf_convert(request).await });
+
+    timeout(Duration::from_secs(2), reached)
+        .await
+        .expect("conversion should reach its pre-transaction pause")
+        .expect("conversion pause sender");
+    assert!(mint
+        .localstore()
+        .update_condition_attestation(
+            &fixture.request.condition_id,
+            "attested",
+            Some("YES"),
+            Some(2_000_000),
+        )
+        .await
+        .unwrap());
+    release
+        .send(())
+        .expect("conversion should still be waiting at the pause");
+
+    assert!(matches!(
+        timeout(Duration::from_secs(2), convert)
+            .await
+            .expect("conversion should finish after release")
+            .expect("conversion task"),
+        Err(Error::ConvertNotPermitted)
+    ));
+    assert_atomic_convert_absent(&mint, &fixture).await;
+}
+
+#[tokio::test]
+async fn test_atomic_ctf_convert_spent_replay_rejects_before_signing_again() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let fixture = atomic_convert_fixture(&mint).await;
+    let before = mint.blind_sign_attempts();
+
+    mint.process_ctf_convert(fixture.request.clone())
+        .await
+        .unwrap();
+    let after_first = mint.blind_sign_attempts();
+    assert_eq!(after_first, before + 1);
+
+    assert!(matches!(
+        mint.process_ctf_convert(fixture.request.clone()).await,
+        Err(Error::TokenAlreadySpent)
+    ));
+    assert_eq!(mint.blind_sign_attempts(), after_first);
+}
+
+#[tokio::test]
+async fn test_atomic_ctf_convert_overlap_rejects_before_duplicate_signing() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let fixture = atomic_convert_fixture(&mint).await;
+    let before = mint.blind_sign_attempts();
+    let (reached, release) = mint.arm_atomic_ctf_test_pause().await;
+    let convert_mint = mint.clone();
+    let request = fixture.request.clone();
+    let first = tokio::spawn(async move { convert_mint.process_ctf_convert(request).await });
+
+    timeout(Duration::from_secs(2), reached)
+        .await
+        .expect("first conversion should reach its pause")
+        .expect("conversion pause sender");
+    let after_first_signing = mint.blind_sign_attempts();
+    assert_eq!(after_first_signing, before + 1);
+    assert!(matches!(
+        mint.process_ctf_convert(fixture.request.clone()).await,
+        Err(Error::TokenPending)
+    ));
+    assert_eq!(mint.blind_sign_attempts(), after_first_signing);
+
+    release.send(()).expect("first conversion should be paused");
+    timeout(Duration::from_secs(2), first)
+        .await
+        .expect("first conversion should finish after release")
+        .expect("first conversion task")
+        .expect("first conversion should commit");
+    assert_atomic_convert_committed(&mint, &fixture).await;
+}
+
+#[tokio::test]
+async fn test_ctf_convert_before_attestation_commits_then_attests() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let fixture = atomic_convert_fixture(&mint).await;
+    mint.process_ctf_convert(fixture.request.clone())
+        .await
+        .unwrap();
+    assert_atomic_convert_committed(&mint, &fixture).await;
+
+    let db = mint.localstore();
+    assert!(db
+        .update_condition_attestation(
+            &fixture.request.condition_id,
+            "attested",
+            Some("YES"),
+            Some(2_000_000),
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        db.get_condition(&fixture.request.condition_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .attestation_status,
+        "attested"
     );
 }
 
