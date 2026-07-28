@@ -283,6 +283,8 @@ mod tests {
             final_expiry,
             issuer_version: None,
             version: 0,
+            #[cfg(feature = "conditional-tokens")]
+            condition_id: None,
         }
     }
 
