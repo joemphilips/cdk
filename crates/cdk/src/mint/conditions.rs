@@ -92,6 +92,7 @@ impl Mint {
         for ann in &announcements {
             dlc::verify_announcement_signature(ann)?;
         }
+        dlc::validate_announcement_set(&announcements, request.threshold)?;
 
         // 2. Extract info from announcements
         let oracle_pubkeys: Vec<Vec<u8>> = announcements

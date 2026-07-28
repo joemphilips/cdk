@@ -11,6 +11,49 @@ use dlc_messages::ser_impls::read_as_tlv;
 
 use super::Error;
 
+/// Validate the invariants shared by every announcement in one condition.
+pub fn validate_announcement_set(
+    announcements: &[OracleAnnouncement],
+    threshold: u32,
+) -> Result<(), Error> {
+    let Some(first) = announcements.first() else {
+        return Err(announcement_set_error(
+            "at least one oracle announcement is required",
+        ));
+    };
+    if threshold == 0 || threshold as usize > announcements.len() {
+        return Err(announcement_set_error(format!(
+            "threshold {threshold} must be between 1 and {}",
+            announcements.len()
+        )));
+    }
+
+    let mut oracle_pubkeys = std::collections::HashSet::with_capacity(announcements.len());
+    for announcement in announcements {
+        if !oracle_pubkeys.insert(announcement.oracle_public_key.serialize()) {
+            return Err(announcement_set_error(
+                "oracle announcement public keys must be distinct",
+            ));
+        }
+        if announcement.oracle_event.event_id != first.oracle_event.event_id {
+            return Err(announcement_set_error(
+                "all oracle announcements must share the same event_id",
+            ));
+        }
+        if announcement.oracle_event.event_descriptor != first.oracle_event.event_descriptor {
+            return Err(announcement_set_error(
+                "all oracle announcements must share the same ordered event descriptor",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn announcement_set_error(message: impl Into<String>) -> Error {
+    Error::OracleAnnouncementVerificationFailed(message.into())
+}
+
 /// Parse a hex-encoded oracle announcement TLV into an OracleAnnouncement struct.
 pub fn parse_oracle_announcement(hex_tlv: &str) -> Result<OracleAnnouncement, Error> {
     let bytes = super::from_hex(hex_tlv)?;
@@ -206,8 +249,8 @@ pub fn verify_announcement_signature(announcement: &OracleAnnouncement) -> Resul
 mod tests {
     use super::*;
     use crate::nuts::nut_ctf::test_helpers::{
-        create_oracle_witness, create_test_announcement, create_test_oracle, create_test_oracle_2,
-        sign_ctf_attestation,
+        create_digit_decomposition_announcement, create_oracle_witness, create_test_announcement,
+        create_test_oracle, create_test_oracle_2, sign_ctf_attestation,
     };
     use crate::nuts::nut_ctf::to_hex;
 
@@ -377,6 +420,41 @@ mod tests {
             result.is_err(),
             "corrupted announcement should fail verification"
         );
+    }
+
+    #[test]
+    fn announcement_set_requires_distinct_oracles_and_valid_threshold() {
+        let oracle = create_test_oracle();
+        let (announcement, _) = create_test_announcement(&oracle, &["YES", "NO"], "evt");
+
+        assert!(validate_announcement_set(std::slice::from_ref(&announcement), 0).is_err());
+        assert!(validate_announcement_set(std::slice::from_ref(&announcement), 2).is_err());
+        assert!(validate_announcement_set(&[announcement.clone(), announcement], 2).is_err());
+    }
+
+    #[test]
+    fn announcement_set_rejects_mixed_event_ids_and_outcome_orders() {
+        let first_oracle = create_test_oracle();
+        let second_oracle = create_test_oracle_2();
+        let (first, _) = create_test_announcement(&first_oracle, &["YES", "NO"], "evt");
+        let (wrong_event, _) =
+            create_test_announcement(&second_oracle, &["YES", "NO"], "other-evt");
+        let (wrong_order, _) = create_test_announcement(&second_oracle, &["NO", "YES"], "evt");
+
+        assert!(validate_announcement_set(&[first.clone(), wrong_event], 2).is_err());
+        assert!(validate_announcement_set(&[first, wrong_order], 2).is_err());
+    }
+
+    #[test]
+    fn announcement_set_rejects_mixed_numeric_descriptors() {
+        let first_oracle = create_test_oracle();
+        let second_oracle = create_test_oracle_2();
+        let (first, _) =
+            create_digit_decomposition_announcement(&first_oracle, 10, false, 5, "usd", 0, "evt");
+        let (different_precision, _) =
+            create_digit_decomposition_announcement(&second_oracle, 10, false, 5, "usd", 2, "evt");
+
+        assert!(validate_announcement_set(&[first, different_precision], 2).is_err());
     }
 
     #[test]
