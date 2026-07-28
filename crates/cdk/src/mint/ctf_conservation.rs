@@ -101,8 +101,12 @@ impl<'a> CtfCoverageResolver<'a> {
         })
     }
 
-    async fn resolve_keyset(&self, keyset: &Id) -> Result<AssetCoverage, Error> {
-        let keyset_info = self.active_keyset_info(keyset)?;
+    pub(super) async fn resolve_keyset_at(
+        &self,
+        keyset: &Id,
+        now: u64,
+    ) -> Result<ResolvedCoverage, Error> {
+        let keyset_info = self.active_keyset_info(keyset, now)?;
         let binding = self
             .mint
             .localstore
@@ -113,11 +117,18 @@ impl<'a> CtfCoverageResolver<'a> {
             AssetKind::Collateral => self.outcomes.to_vec(),
             AssetKind::Conditional { collection, .. } => parse_outcome_collection(collection),
         };
-        Ok(AssetCoverage {
+        Ok(ResolvedCoverage(AssetCoverage {
             kind,
             outcomes,
             unit: keyset_info.unit,
-        })
+        }))
+    }
+
+    async fn resolve_keyset(&self, keyset: &Id) -> Result<AssetCoverage, Error> {
+        Ok(self
+            .resolve_keyset_at(keyset, cdk_common::util::unix_time())
+            .await?
+            .0)
     }
 
     fn resolve_binding(
@@ -145,7 +156,7 @@ impl<'a> CtfCoverageResolver<'a> {
         }
     }
 
-    fn active_keyset_info(&self, keyset: &Id) -> Result<MintKeySetInfo, Error> {
+    fn active_keyset_info(&self, keyset: &Id, now: u64) -> Result<MintKeySetInfo, Error> {
         let info = self
             .mint
             .get_keyset_info(keyset)
@@ -153,11 +164,15 @@ impl<'a> CtfCoverageResolver<'a> {
         if !info.active {
             return Err(Error::InactiveKeyset);
         }
+        if info.final_expiry.is_some_and(|expiry| expiry < now) {
+            return Err(Error::ExpiredKeyset);
+        }
         Ok(info)
     }
 }
 
 /// Coverage resolved from one declared CTF input or output entry.
+#[derive(Clone)]
 pub(super) struct ResolvedCoverage(AssetCoverage);
 
 /// Checked aggregate input/output value for every possible outcome.

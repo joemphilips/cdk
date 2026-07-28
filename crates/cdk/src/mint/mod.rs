@@ -13,6 +13,8 @@ use arc_swap::ArcSwap;
 use cdk_common::common::{PaymentProcessorKey, QuoteTTL};
 use cdk_common::database::mint::Acquired;
 use cdk_common::database::{self, DynMintAuthDatabase, DynMintDatabase};
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::nuts::nut_ctf::settlement::CanonicalHash;
 use cdk_common::nuts::{BlindSignature, BlindedMessage, CurrencyUnit, Id};
 use cdk_common::payment::{DynMintPayment, WaitPaymentResponse};
 pub use cdk_common::quote_id::QuoteId;
@@ -23,7 +25,7 @@ use cdk_signatory::signatory::{Signatory, SignatoryKeySet, SignatoryKeysets};
 use futures::{Stream, StreamExt};
 use nut21::ProtectedEndpoint;
 use subscription::PubSubManager;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{watch, Mutex, Notify, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::instrument;
 
@@ -48,6 +50,8 @@ mod proofs;
 mod redeem_outcome;
 mod saga_recovery;
 #[cfg(feature = "conditional-tokens")]
+mod settlement;
+#[cfg(feature = "conditional-tokens")]
 mod split_merge;
 mod start_up_check;
 mod subscription;
@@ -65,6 +69,8 @@ pub use cdk_common::mint::{MeltQuote, MintKeySetInfo, MintQuote};
 pub use cdk_common::mint_quote::{MintQuoteRequest, MintQuoteResponse};
 pub use issue::MintInput;
 pub use melt::PendingMelt;
+#[cfg(feature = "conditional-tokens")]
+pub use settlement::CtfSettlementError;
 pub use verification::Verification;
 
 const CDK_MINT_PRIMARY_NAMESPACE: &str = "cdk_mint";
@@ -91,7 +97,7 @@ pub struct Mint {
     oidc_client: Option<OidcClient>,
     /// In-memory keyset
     keysets: Arc<ArcSwap<Vec<SignatoryKeySet>>>,
-    /// Serializes writes to `keysets`.
+    /// Pins or replaces the authoritative `keysets` snapshot.
     ///
     /// Both a mint-initiated `rotate_keyset` and the signatory subscription
     /// drain task replace the snapshot. Holding this lock across "read the
@@ -119,6 +125,9 @@ pub struct Mint {
     /// Inputs currently being prepared for atomic CTF conversion.
     #[cfg(feature = "conditional-tokens")]
     ctf_input_reservations: Arc<StdMutex<HashSet<PublicKey>>>,
+    /// Digest-scoped singleflight gates for identical CTF settlement retries.
+    #[cfg(feature = "conditional-tokens")]
+    ctf_settlement_flights: Arc<StdMutex<HashMap<CanonicalHash, Weak<tokio::sync::Mutex<()>>>>>,
     /// Deterministic pre-transaction pause for atomic CTF race tests.
     #[cfg(all(test, feature = "conditional-tokens"))]
     atomic_ctf_test_pause: Arc<swap::atomic::AtomicCtfTestPause>,
@@ -448,6 +457,8 @@ impl Mint {
             max_outcomes_per_condition,
             #[cfg(feature = "conditional-tokens")]
             ctf_input_reservations: Arc::new(StdMutex::new(HashSet::new())),
+            #[cfg(feature = "conditional-tokens")]
+            ctf_settlement_flights: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(all(test, feature = "conditional-tokens"))]
             atomic_ctf_test_pause: Arc::new(swap::atomic::AtomicCtfTestPause::default()),
             #[cfg(test)]

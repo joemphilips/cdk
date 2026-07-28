@@ -5,13 +5,13 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
-use super::canonical::write_canonical_json;
+use super::canonical::{write_canonical_json, CTF_REQUEST_DOMAIN};
 use super::manifest::{strict_keyset_id, strict_public_key};
 use super::{
     ctf_receive_commitment, CanonicalHash, Error, PayToUnlockAuthorization, PayToUnlockCondition,
     PayToUnlockMode, PoolEntry, PoolManifest, SelectionBitmap,
 };
-use crate::nuts::nut00::{BlindedMessage, Proof, Proofs, Witness};
+use crate::nuts::nut00::{BlindSignature, BlindedMessage, Proof, Proofs, Witness};
 use crate::nuts::nut01::PublicKey;
 use crate::nuts::nut02::Id;
 use crate::nuts::nut12::ProofDleq;
@@ -245,6 +245,14 @@ pub struct CtfSettlementRequest {
     pub participants: Vec<CtfSettlementParticipant>,
 }
 
+/// Successful multi-party settlement response, grouped in participant order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CtfSettlementResponse {
+    /// One blind-signature array for each request participant.
+    pub signatures: Vec<Vec<BlindSignature>>,
+}
+
 impl fmt::Debug for CtfSettlementRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -285,6 +293,22 @@ impl CtfSettlementRequest {
     /// Validate protocol-pure structure, commitments, selections, and policies.
     pub fn validate(&self, limits: CtfSettlementLimits) -> Result<(), Error> {
         self.validated_authorizations(limits).map(drop)
+    }
+
+    /// Compute the canonical idempotency key for this exact settlement request.
+    ///
+    /// Top-level identifiers contribute their decoded 32-byte representations;
+    /// each participant contributes its self-delimiting canonical JSON record.
+    pub fn request_digest(&self) -> Result<CanonicalHash, Error> {
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(&self.condition_id.to_bytes());
+        canonical.extend_from_slice(&self.parent_collection_id.to_bytes());
+        for participant in &self.participants {
+            canonical.extend_from_slice(&participant.canonical_bytes()?);
+        }
+        Ok(CanonicalHash::from_bytes(
+            crate::nuts::nut_ctf::tagged_hash(CTF_REQUEST_DOMAIN, &canonical),
+        ))
     }
 
     /// Validate the request and return one shared authorization per participant.

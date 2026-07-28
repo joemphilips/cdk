@@ -465,6 +465,36 @@ fn standard_request_round_trips_and_validates() {
 }
 
 #[test]
+fn settlement_request_digest_has_stable_binary_id_vector() {
+    let request = valid_standard_request();
+    assert_eq!(
+        request
+            .request_digest()
+            .expect("canonical request")
+            .to_string(),
+        "48f6e7b04945ed9fd11700f14740ca13714de6b7c68f45183e60df2565ef6c26"
+    );
+
+    let mut different_parent = request.clone();
+    different_parent.parent_collection_id = CanonicalHash::from_bytes([1; 32]);
+    assert_ne!(
+        request.request_digest().expect("canonical request"),
+        different_parent
+            .request_digest()
+            .expect("canonical request with another parent")
+    );
+
+    let mut different_output = request.clone();
+    different_output.participants[0].outputs[0].amount += Amount::ONE;
+    assert_ne!(
+        request.request_digest().expect("canonical request"),
+        different_output
+            .request_digest()
+            .expect("canonical request with another output")
+    );
+}
+
+#[test]
 fn participant_authorization_excludes_only_proof_nonce() {
     let mut request = valid_standard_request();
     let (commitment, offer_keyset, expected) = {

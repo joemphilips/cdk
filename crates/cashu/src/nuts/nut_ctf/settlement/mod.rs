@@ -19,7 +19,7 @@ pub use refund::{
 };
 pub use request::{
     CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits, CtfSettlementParticipant,
-    CtfSettlementRequest, ParticipantMode,
+    CtfSettlementRequest, CtfSettlementResponse, ParticipantMode,
 };
 pub use settings::{
     NutCtfSettlementSettings, NutCtfSettlementSettingsError, NutCtfSplitMergeSettings,

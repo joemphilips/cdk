@@ -14,7 +14,9 @@ use cdk::error::ErrorCode;
 use cdk::error::ErrorResponse;
 use cdk::nuts::nut21::{Method, ProtectedEndpoint, RoutePath};
 #[cfg(feature = "conditional-tokens")]
-use cdk::nuts::nut_ctf::settlement::{CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits};
+use cdk::nuts::nut_ctf::settlement::{
+    CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits, Error as SettlementError,
+};
 use cdk::nuts::{
     CheckStateRequest, CheckStateResponse, Id, KeysResponse, KeysetResponse, MintInfo,
     RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
@@ -1276,22 +1278,21 @@ pub(crate) async fn post_ctf_convert(
     )
     .map_err(ctf_settlement_error_response)?
     .mode();
-    if mode == CtfConvertMode::MultiParty {
-        return Err(multi_party_unavailable_response());
-    }
+    verify_ctf_convert_auth(&state, &headers).await?;
 
+    match mode {
+        CtfConvertMode::SingleParty => process_single_party_ctf_convert(&state, &payload).await,
+        CtfConvertMode::MultiParty => process_multi_party_ctf_convert(&state, &payload).await,
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn process_single_party_ctf_convert(
+    state: &MintState,
+    payload: &[u8],
+) -> Result<Response, Response> {
     let Json(payload) = Json::<cdk::nuts::nut_ctf::CtfConvertRequest>::from_bytes(&payload)
         .map_err(|error| error.into_response())?;
-    let auth = AuthHeader::from_headers(&headers).map_err(|error| error.into_response())?;
-    state
-        .mint
-        .verify_auth(
-            auth.into(),
-            &ProtectedEndpoint::new(Method::Post, RoutePath::Swap),
-        )
-        .await
-        .map_err(into_response)?;
-
     let response = state
         .mint
         .process_ctf_convert(payload)
@@ -1301,6 +1302,48 @@ pub(crate) async fn post_ctf_convert(
             into_response(err)
         })?;
     Ok(Json(response).into_response())
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn process_multi_party_ctf_convert(
+    state: &MintState,
+    payload: &[u8],
+) -> Result<Response, Response> {
+    let mint_info = state.mint.mint_info().await.map_err(into_response)?;
+    let settings = mint_info
+        .nuts
+        .nut_ctf_split_merge
+        .as_ref()
+        .and_then(|settings| settings.multi_party())
+        .ok_or_else(multi_party_unavailable_response)?;
+    let limits = settings.structural_limits().map_err(|error| {
+        tracing::error!("Invalid advertised multi-party CTF settings: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+    let admission =
+        CtfConvertAdmission::preflight(payload, limits).map_err(ctf_settlement_error_response)?;
+    let request = admission
+        .decode_multi_party()
+        .map_err(ctf_settlement_error_response)?;
+    let response = state
+        .mint
+        .process_ctf_settlement(&request, settings, unix_time())
+        .await
+        .map_err(ctf_settlement_execution_error_response)?;
+    Ok(Json(response).into_response())
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn verify_ctf_convert_auth(state: &MintState, headers: &HeaderMap) -> Result<(), Response> {
+    let auth = AuthHeader::from_headers(headers).map_err(|error| error.into_response())?;
+    state
+        .mint
+        .verify_auth(
+            auth.into(),
+            &ProtectedEndpoint::new(Method::Post, RoutePath::Swap),
+        )
+        .await
+        .map_err(into_response)
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -1327,8 +1370,6 @@ fn require_json_content_type(headers: &HeaderMap) -> Result<(), Response> {
 
 #[cfg(feature = "conditional-tokens")]
 fn ctf_settlement_error_response(error: cdk::nuts::nut_ctf::settlement::Error) -> Response {
-    use cdk::nuts::nut_ctf::settlement::Error as SettlementError;
-
     let code = match &error {
         SettlementError::DuplicateInput => ErrorCode::DuplicateInputs,
         SettlementError::DuplicateOutput => ErrorCode::DuplicateOutputs,
@@ -1356,6 +1397,32 @@ fn ctf_settlement_error_response(error: cdk::nuts::nut_ctf::settlement::Error) -
         Json(ErrorResponse::new(code, error.to_string())),
     )
         .into_response()
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError) -> Response {
+    use cdk::mint::CtfSettlementError;
+
+    match error {
+        CtfSettlementError::Protocol(error) => ctf_settlement_error_response(error),
+        CtfSettlementError::AuthorizationExpired => {
+            ctf_settlement_error_response(SettlementError::SettlementAfterExpiry)
+        }
+        CtfSettlementError::AuthorizationBeyondKeysetExpiry => ctf_settlement_error_response(
+            SettlementError::InvalidCondition("authorization exceeds refundable keyset lifetime"),
+        ),
+        CtfSettlementError::CollateralUnitMismatch => into_response(cdk::Error::UnitMismatch),
+        CtfSettlementError::Mint(error) => into_response(error),
+        CtfSettlementError::Settings(error) => {
+            tracing::error!("Invalid multi-party CTF settings: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        error
+        @ (CtfSettlementError::MissingCollateralUnit | CtfSettlementError::ExpiryOverflow) => {
+            tracing::error!("Invalid persisted multi-party CTF state: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -1553,18 +1620,35 @@ mod ctf_convert_admission_tests {
         BlindAuthToken::new(proof).without_dleq()
     }
 
-    async fn assert_rejected_without_auth_spend(
-        body: serde_json::Value,
-        expected_status: StatusCode,
-    ) {
-        assert_rejected_without_auth_spend_at_limits(body, expected_status, 1000, 1000).await;
-    }
-
     async fn assert_rejected_without_auth_spend_at_limits(
         body: serde_json::Value,
         expected_status: StatusCode,
         max_inputs: usize,
         max_outputs: usize,
+    ) {
+        assert_rejected_with_auth_state(body, expected_status, max_inputs, max_outputs, None).await;
+    }
+
+    async fn assert_rejected_after_auth_spend(
+        body: serde_json::Value,
+        expected_status: StatusCode,
+    ) {
+        assert_rejected_with_auth_state(
+            body,
+            expected_status,
+            1000,
+            1000,
+            Some(cdk::nuts::State::Spent),
+        )
+        .await;
+    }
+
+    async fn assert_rejected_with_auth_state(
+        body: serde_json::Value,
+        expected_status: StatusCode,
+        max_inputs: usize,
+        max_outputs: usize,
+        expected_auth_state: Option<cdk::nuts::State>,
     ) {
         let (state, auth_db) = auth_protected_state_with_limits(max_inputs, max_outputs).await;
         let token = blind_auth_token(&state.mint).await;
@@ -1583,7 +1667,7 @@ mod ctf_convert_admission_tests {
                 .get_proofs_states(&[proof_y])
                 .await
                 .expect("auth state"),
-            vec![None]
+            vec![expected_auth_state]
         );
     }
 
@@ -1606,7 +1690,7 @@ mod ctf_convert_admission_tests {
     async fn legacy_preflight_allows_mint_limits_above_multi_party_limits() {
         let inputs = vec![serde_json::json!({}); 4097];
         let outputs = vec![serde_json::json!({}); 8193];
-        assert_rejected_without_auth_spend_at_limits(
+        assert_rejected_with_auth_state(
             serde_json::json!({
                 "condition_id": "11".repeat(32),
                 "inputs": {"*": inputs},
@@ -1615,6 +1699,7 @@ mod ctf_convert_admission_tests {
             StatusCode::UNPROCESSABLE_ENTITY,
             4097,
             8193,
+            Some(cdk::nuts::State::Spent),
         )
         .await;
     }
@@ -1728,8 +1813,8 @@ mod ctf_convert_admission_tests {
     }
 
     #[tokio::test]
-    async fn malformed_legacy_does_not_consume_blind_auth() {
-        assert_rejected_without_auth_spend(
+    async fn malformed_legacy_authenticates_before_strict_decode() {
+        assert_rejected_after_auth_spend(
             serde_json::json!({
                 "condition_id": "11".repeat(32),
                 "inputs": {"*": [{"id": "not-a-key"}]},
@@ -1741,8 +1826,8 @@ mod ctf_convert_admission_tests {
     }
 
     #[tokio::test]
-    async fn unavailable_multi_does_not_consume_blind_auth() {
-        assert_rejected_without_auth_spend(
+    async fn unavailable_multi_authenticates_before_mint_info_read() {
+        assert_rejected_after_auth_spend(
             serde_json::json!({
                 "condition_id": "11".repeat(32),
                 "participants": [
