@@ -659,9 +659,9 @@ impl CurrencyUnit {
         }
     }
 
-    /// Construct a custom unit, normalizing to uppercase and trimming whitespace.
+    /// Construct a custom unit, normalizing and trimming whitespace while preserving case.
     pub fn custom<S: AsRef<str>>(value: S) -> Self {
-        Self::Custom(normalize_custom_unit(value.as_ref()).to_uppercase())
+        Self::Custom(normalize_custom_unit(value.as_ref()))
     }
 
     ///  Big endian encoded integer of the first 4 bytes of the sha256 hash of the unit string.
@@ -694,6 +694,22 @@ impl FromStr for CurrencyUnit {
             "AUTH" => Ok(Self::Auth),
             _ => Ok(Self::Custom(normalize_custom_unit(value))),
         }
+    }
+}
+
+#[cfg(test)]
+mod currency_unit_tests {
+    use super::*;
+
+    #[test]
+    fn parses_msat_and_milli_cent_units() {
+        let msat = CurrencyUnit::from_str("msat").expect("msat should parse");
+        assert_eq!(msat, CurrencyUnit::Msat);
+        assert_eq!(msat.to_string(), "msat");
+
+        let mc = CurrencyUnit::from_str("milli-cent").expect("milli-cent should parse");
+        assert_eq!(mc, CurrencyUnit::Custom("milli-cent".to_string()));
+        assert_eq!(mc.to_string(), "milli-cent");
     }
 }
 
@@ -1452,9 +1468,12 @@ mod tests {
     fn test_currency_unit_custom_normalizes_and_stays_custom() {
         let unit = CurrencyUnit::custom(" usd\n");
 
-        assert_eq!(unit, CurrencyUnit::Custom("USD".to_string()));
+        assert_eq!(unit, CurrencyUnit::Custom("usd".to_string()));
         assert_ne!(unit, CurrencyUnit::default());
         assert_eq!(unit.to_string(), "usd");
+
+        let milli_cent = CurrencyUnit::custom(" milli-cent\n");
+        assert_eq!(milli_cent, CurrencyUnit::Custom("milli-cent".to_string()));
     }
 
     #[test]

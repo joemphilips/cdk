@@ -16,6 +16,7 @@ integration-tests = []
 conditional-tokens = ["cdk/conditional-tokens"]
 prometheus = ["dep:cdk-prometheus"]
 info-page = ["dep:maud"]
+auth = []
 
 [dependencies]
 anyhow.workspace = true
