@@ -1569,6 +1569,8 @@ mod tests {
             HashMap::new(),
             1000,
             1000,
+            #[cfg(feature = "conditional-tokens")]
+            crate::nuts::nut_ctf::MAX_OUTCOMES,
         )
         .await
         .unwrap()

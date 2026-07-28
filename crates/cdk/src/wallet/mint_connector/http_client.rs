@@ -965,7 +965,7 @@ where
         let auth_token = self
             .get_auth_token(Method::Get, RoutePath::Conditions)
             .await?;
-        self.transport.http_get(url, auth_token).await
+        self.transport_http_get(url, auth_token).await
     }
 
     /// Get a specific condition [NUT-CTF]
@@ -981,7 +981,7 @@ where
         let auth_token = self
             .get_auth_token(Method::Get, RoutePath::Condition)
             .await?;
-        self.transport.http_get(url, auth_token).await
+        self.transport_http_get(url, auth_token).await
     }
 
     /// Register a condition [NUT-CTF]
@@ -995,7 +995,7 @@ where
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::Conditions)
             .await?;
-        self.transport.http_post(url, auth_token, &request).await
+        self.transport_http_post(url, auth_token, &request).await
     }
 
     /// Get conditional keysets [NUT-CTF]
@@ -1024,7 +1024,7 @@ where
         let auth_token = self
             .get_auth_token(Method::Get, RoutePath::ConditionalKeysets)
             .await?;
-        self.transport.http_get(url, auth_token).await
+        self.transport_http_get(url, auth_token).await
     }
 
     /// CTF convert [NUT-CTF-split-merge]
@@ -1036,7 +1036,7 @@ where
     ) -> Result<crate::nuts::nut_ctf::CtfConvertResponse, Error> {
         let url = self.mint_url.join_paths(&["v1", "ctf", "convert"])?;
         let auth_token = self.get_auth_token(Method::Post, RoutePath::Swap).await?;
-        self.transport.http_post(url, auth_token, &request).await
+        self.transport_http_post(url, auth_token, &request).await
     }
 
     /// Redeem outcome [NUT-CTF]
@@ -1050,7 +1050,7 @@ where
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::RedeemOutcome)
             .await?;
-        self.transport.http_post(url, auth_token, &request).await
+        self.transport_http_post(url, auth_token, &request).await
     }
 }
 
