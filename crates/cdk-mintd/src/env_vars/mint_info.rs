@@ -130,17 +130,7 @@ impl MintInfo {
 #[cfg(test)]
 #[cfg(feature = "conditional-tokens")]
 mod tests {
-    use std::sync::{Mutex, MutexGuard};
-
     use super::*;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .expect("environment lock should not be poisoned")
-    }
 
     fn clear_registration_fee_env() {
         env::remove_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_BASE);
@@ -151,7 +141,7 @@ mod tests {
 
     #[test]
     fn registration_fee_from_env_requires_base_when_per_keyset_is_set() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_registration_fee_env();
         env::set_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_PER_KEYSET, "10000");
 
@@ -169,7 +159,7 @@ mod tests {
 
     #[test]
     fn registration_fee_from_env_requires_per_keyset_when_base_is_set() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_registration_fee_env();
         env::set_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_BASE, "10000");
 
@@ -187,7 +177,7 @@ mod tests {
 
     #[test]
     fn registration_fee_from_env_returns_fee_when_both_fields_are_set() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_registration_fee_env();
         env::set_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_BASE, "10000");
         env::set_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_PER_KEYSET, "20000");
@@ -207,7 +197,7 @@ mod tests {
 
     #[test]
     fn registration_fee_from_env_omits_unit_when_neither_field_is_set() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_registration_fee_env();
 
         let fee = registration_fee_from_env(
@@ -221,7 +211,7 @@ mod tests {
 
     #[test]
     fn registration_fee_from_env_does_not_create_zero_fee_from_malformed_values() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_registration_fee_env();
         env::set_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_BASE, "abc");
         env::set_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_PER_KEYSET, "def");

@@ -43,14 +43,6 @@ mod tests {
 
     use super::*;
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-        ENV_LOCK
-            .lock()
-            .expect("signatory env test lock should not be poisoned")
-    }
-
     fn clear_env_vars() {
         env::remove_var(ENV_SIGNATORY_ENABLED);
         env::remove_var(ENV_SIGNATORY_ADDRESS);
@@ -61,7 +53,7 @@ mod tests {
 
     #[test]
     fn signatory_from_env_reads_enabled_and_connection_fields() {
-        let _guard = env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_env_vars();
 
         env::set_var(ENV_SIGNATORY_ENABLED, "true");

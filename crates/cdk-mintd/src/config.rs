@@ -1415,13 +1415,6 @@ mod tests {
 
     use super::*;
 
-    fn config_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        // Share the single process-wide env lock with the rest of the crate's
-        // tests. `std::env` is global, so config.rs and lib.rs tests must
-        // serialize on the *same* mutex or they race over env vars.
-        crate::test_utils::env_lock()
-    }
-
     #[cfg(feature = "bdk")]
     fn clear_bdk_env_vars() {
         std::env::remove_var(crate::env_vars::BDK_MNEMONIC_ENV_VAR);
@@ -1685,7 +1678,7 @@ min_send_amount_sat = 1200
     #[cfg(feature = "bdk")]
     #[test]
     fn test_bdk_env_min_send_amount_sat_override() {
-        let _guard = config_env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_bdk_env_vars();
         std::env::set_var(crate::env_vars::ENV_ONCHAIN_BACKEND, "bdk");
         std::env::set_var(crate::env_vars::BDK_NETWORK_ENV_VAR, "regtest");
@@ -1709,7 +1702,7 @@ min_send_amount_sat = 1200
     #[cfg(feature = "bdk")]
     #[test]
     fn test_bdk_env_electrum_config() {
-        let _guard = config_env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_bdk_env_vars();
         std::env::set_var(crate::env_vars::ENV_ONCHAIN_BACKEND, "bdk");
         std::env::set_var(crate::env_vars::BDK_NETWORK_ENV_VAR, "regtest");
@@ -1840,7 +1833,7 @@ target_block_time_secs = 300
     #[cfg(feature = "bdk")]
     #[test]
     fn test_bdk_env_fee_options_override() {
-        let _guard = config_env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_bdk_env_vars();
         std::env::set_var(crate::env_vars::ENV_ONCHAIN_BACKEND, "bdk");
         std::env::set_var(crate::env_vars::BDK_NETWORK_ENV_VAR, "regtest");
@@ -1872,7 +1865,7 @@ target_block_time_secs = 300
     #[cfg(feature = "bdk")]
     #[test]
     fn test_bdk_env_target_block_time_override() {
-        let _guard = config_env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_bdk_env_vars();
         std::env::set_var(crate::env_vars::ENV_ONCHAIN_BACKEND, "bdk");
         std::env::set_var(crate::env_vars::BDK_NETWORK_ENV_VAR, "regtest");
@@ -2252,7 +2245,7 @@ max_delay_time = 3
     /// This test runs sequentially for all enabled backends to avoid env var interference.
     #[test]
     fn test_env_var_only_config_all_backends() {
-        let _guard = config_env_lock();
+        let _guard = crate::test_utils::env_lock();
 
         // Run each backend test sequentially
         #[cfg(feature = "lnd")]
@@ -2279,7 +2272,7 @@ max_delay_time = 3
     fn test_prometheus_toml_config_survives_env_overlay() {
         use std::{env, fs};
 
-        let _guard = config_env_lock();
+        let _guard = crate::test_utils::env_lock();
 
         env::remove_var(crate::env_vars::ENV_LN_BACKEND);
         env::remove_var(crate::env_vars::ENV_PROMETHEUS_ENABLED);
