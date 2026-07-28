@@ -1271,6 +1271,8 @@ pub(crate) async fn post_ctf_convert(
         &payload,
         UNADVERTISED_MULTI_PARTY_LIMITS,
         MAX_CTF_CONVERT_BODY_BYTES,
+        state.mint.max_inputs(),
+        state.mint.max_outputs(),
     )
     .map_err(ctf_settlement_error_response)?
     .mode();
@@ -1452,7 +1454,10 @@ mod ctf_convert_admission_tests {
         headers
     }
 
-    async fn auth_protected_state() -> (MintState, Arc<cdk_sqlite::mint::MintSqliteAuthDatabase>) {
+    async fn auth_protected_state_with_limits(
+        max_inputs: usize,
+        max_outputs: usize,
+    ) -> (MintState, Arc<cdk_sqlite::mint::MintSqliteAuthDatabase>) {
         let mint_db = Arc::new(cdk_sqlite::mint::memory::empty().await.expect("mint db"));
         let auth_db = Arc::new(
             cdk_sqlite::mint::MintSqliteAuthDatabase::new(":memory:")
@@ -1482,6 +1487,7 @@ mod ctf_convert_admission_tests {
             .await
             .expect("payment processor");
         let mint = builder
+            .with_limits(max_inputs, max_outputs)
             .with_auth(
                 auth_db.clone(),
                 "https://example.com/.well-known/openid-configuration".to_string(),
@@ -1499,6 +1505,10 @@ mod ctf_convert_admission_tests {
             },
             auth_db,
         )
+    }
+
+    async fn auth_protected_state() -> (MintState, Arc<cdk_sqlite::mint::MintSqliteAuthDatabase>) {
+        auth_protected_state_with_limits(1000, 1000).await
     }
 
     async fn blind_auth_token(mint: &Mint) -> BlindAuthToken {
@@ -1544,7 +1554,16 @@ mod ctf_convert_admission_tests {
         body: serde_json::Value,
         expected_status: StatusCode,
     ) {
-        let (state, auth_db) = auth_protected_state().await;
+        assert_rejected_without_auth_spend_at_limits(body, expected_status, 1000, 1000).await;
+    }
+
+    async fn assert_rejected_without_auth_spend_at_limits(
+        body: serde_json::Value,
+        expected_status: StatusCode,
+        max_inputs: usize,
+        max_outputs: usize,
+    ) {
+        let (state, auth_db) = auth_protected_state_with_limits(max_inputs, max_outputs).await;
         let token = blind_auth_token(&state.mint).await;
         let proof_y = token.auth_proof.y().expect("proof Y");
         let response = post_ctf_convert(
@@ -1563,6 +1582,38 @@ mod ctf_convert_admission_tests {
                 .expect("auth state"),
             vec![None]
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_preflight_uses_lower_mint_transaction_limits() {
+        assert_rejected_without_auth_spend_at_limits(
+            serde_json::json!({
+                "condition_id": "11".repeat(32),
+                "inputs": {"*": [{}, {}]},
+                "outputs": {}
+            }),
+            StatusCode::BAD_REQUEST,
+            1,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_preflight_allows_mint_limits_above_multi_party_limits() {
+        let inputs = vec![serde_json::json!({}); 4097];
+        let outputs = vec![serde_json::json!({}); 8193];
+        assert_rejected_without_auth_spend_at_limits(
+            serde_json::json!({
+                "condition_id": "11".repeat(32),
+                "inputs": {"*": inputs},
+                "outputs": {"*": outputs}
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            4097,
+            8193,
+        )
+        .await;
     }
 
     #[tokio::test]
