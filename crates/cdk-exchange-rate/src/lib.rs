@@ -20,7 +20,8 @@ pub use payment::{
     DEFAULT_RATE_QUOTE_TTL_SECS,
 };
 pub use store::{
-    DynRateQuoteStore, InMemoryRateQuoteStore, ParkedPaymentRecord, RateQuoteRecord,
-    RateQuoteSettlement, RateQuoteSide, RateQuoteStore, RateQuoteStoreError, UnitControlRecord,
+    ActiveMintReservation, DynRateQuoteStore, InMemoryRateQuoteStore, ParkedPaymentRecord,
+    RateQuoteRecord, RateQuoteSettlement, RateQuoteSide, RateQuoteStore, RateQuoteStoreError,
+    UnitControlRecord,
 };
 pub use types::{AggregationMeta, RateOracleError, RateSnapshot, SourceReading};
