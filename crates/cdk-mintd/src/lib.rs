@@ -5413,4 +5413,89 @@ backend = "fakewallet"
 
         assert_eq!(settings.info.listen_port, 9090);
     }
+
+    fn rate_quoter_with_usd_cap(buffer_bps: u64, cap: u64) -> config::RateQuoter {
+        config::RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            buffer_bps,
+            per_unit_caps: HashMap::from([(CurrencyUnit::Usd, cap)]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_rejects_nonzero_cap_with_omitted_buffer() {
+        let rate_quoter = config::RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            per_unit_caps: HashMap::from([(CurrencyUnit::Usd, 100)]),
+            ..Default::default()
+        };
+        let units = rate_quoter_units(&rate_quoter);
+
+        let error = validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
+            .expect_err("omitted buffer defaults to zero and must reject nonzero caps");
+        assert!(error.to_string().contains("buffer_bps must be nonzero"));
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_rejects_nonzero_cap_with_zero_buffer() {
+        let rate_quoter = rate_quoter_with_usd_cap(0, 100);
+        let units = rate_quoter_units(&rate_quoter);
+
+        let error = validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
+            .expect_err("explicit zero buffer must reject nonzero caps");
+        assert!(error.to_string().contains("buffer_bps must be nonzero"));
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_allows_nonzero_cap_with_nonzero_buffer() {
+        let rate_quoter = rate_quoter_with_usd_cap(100, 100);
+        let units = rate_quoter_units(&rate_quoter);
+
+        validate_configured_rate_quoter_caps_require_buffer(&rate_quoter, &units)
+            .expect("nonzero buffer allows nonzero caps");
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_rejects_persisted_nonzero_cap_with_zero_buffer() {
+        let store: DynRateQuoteStore = Arc::new(InMemoryRateQuoteStore::new());
+        let seed_control = RateQuoteControlHandle::with_store_and_buffer_bps(store.clone(), 100);
+        seed_control
+            .set_unit_issuance_cap(CurrencyUnit::Usd, 100)
+            .await
+            .expect("seed persisted cap");
+
+        let rate_quoter = config::RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            buffer_bps: 0,
+            ..Default::default()
+        };
+        let control = RateQuoteControlHandle::with_store_and_buffer_bps(store, 0);
+        control.load_persisted().await.expect("load persisted cap");
+        let units = rate_quoter_units(&rate_quoter);
+
+        let error =
+            validate_persisted_rate_quoter_caps_require_buffer(&rate_quoter, &units, &control)
+                .await
+                .expect_err("persisted nonzero cap with zero buffer must reject startup");
+        assert!(error.to_string().contains("buffer_bps must be nonzero"));
+    }
+
+    #[tokio::test]
+    async fn rate_quoter_rejects_volatile_store_without_opt_in() {
+        let settings = config::Settings::default();
+        let rate_quoter = config::RateQuoter {
+            units: vec![CurrencyUnit::Usd],
+            allow_in_memory_store: false,
+            ..Default::default()
+        };
+
+        let error = match rate_quote_store(&settings, &rate_quoter).await {
+            Ok(_) => panic!("sqlite must not silently fall back to volatile rate quote store"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("durable Postgres rate quote store"));
+    }
 }
