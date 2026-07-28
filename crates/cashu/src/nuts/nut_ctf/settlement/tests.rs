@@ -440,8 +440,8 @@ fn standard_request_round_trips_and_validates() {
     let request = valid_standard_request();
     let encoded = serde_json::to_vec(&request).expect("serializable request");
     let decoded = CtfSettlementRequest::decode(&encoded, limits()).expect("strict request");
-    decoded
-        .validate(CtfSettlementLimits {
+    let authorizations = decoded
+        .validated_authorizations(CtfSettlementLimits {
             max_request_bytes: 16 * 1024,
             max_participants: 8,
             max_inputs: 16,
@@ -449,6 +449,10 @@ fn standard_request_round_trips_and_validates() {
             max_pool_entries: 32,
         })
         .expect("valid standard settlement");
+    assert_eq!(authorizations.len(), decoded.participants.len());
+    for (authorization, participant) in authorizations.iter().zip(&decoded.participants) {
+        assert_eq!(authorization.offer_keyset, participant.inputs[0].keyset_id);
+    }
     assert!(decoded
         .participants
         .iter()
@@ -457,6 +461,47 @@ fn standard_request_round_trips_and_validates() {
     assert_eq!(
         decoded.validate_positive_input_fees(|_| Some(0)),
         Err(Error::ZeroFeeKeyset)
+    );
+}
+
+#[test]
+fn participant_authorization_excludes_only_proof_nonce() {
+    let mut request = valid_standard_request();
+    let (commitment, offer_keyset, expected) = {
+        let participant = &mut request.participants[0];
+        let commitment = ctf_receive_commitment(&participant.outputs)
+            .expect("valid outputs")
+            .to_string();
+        let offer_keyset = participant.inputs[0].keyset_id;
+        participant.inputs.push(Proof::new(
+            Amount::from(1),
+            offer_keyset,
+            condition("03", &commitment, &offer_keyset.to_string(), &[]),
+            PublicKey::from_str(POINT_C).expect("valid point"),
+        ));
+        participant
+            .inputs
+            .sort_by_key(|proof| (proof.keyset_id.to_string(), proof.secret.to_string()));
+        let expected = PayToUnlockCondition::parse(&participant.inputs[0].secret)
+            .expect("valid condition")
+            .authorization();
+        (commitment, offer_keyset, expected)
+    };
+
+    let authorizations = request
+        .validated_authorizations(limits())
+        .expect("distinct proof nonces share one participant authorization");
+    assert_eq!(authorizations[0], expected);
+
+    let participant = &mut request.participants[0];
+    participant.inputs[1].secret =
+        condition_with_expiry("03", &commitment, &offer_keyset.to_string(), "101", &[]);
+    participant
+        .inputs
+        .sort_by_key(|proof| (proof.keyset_id.to_string(), proof.secret.to_string()));
+    assert_eq!(
+        request.validated_authorizations(limits()),
+        Err(Error::InconsistentAuthorization)
     );
 }
 
@@ -710,9 +755,19 @@ fn condition(
     offer_keyset: &str,
     extra_tags: &[(&str, &str)],
 ) -> Secret {
+    condition_with_expiry(nonce_byte, data, offer_keyset, "100", extra_tags)
+}
+
+fn condition_with_expiry(
+    nonce_byte: &str,
+    data: &str,
+    offer_keyset: &str,
+    expiry: &str,
+    extra_tags: &[(&str, &str)],
+) -> Secret {
     let mut tags = vec![
         json!(["offer_keyset", offer_keyset]),
-        json!(["expiry", "100"]),
+        json!(["expiry", expiry]),
         json!(["refund", REFUND_KEY]),
     ];
     tags.extend(extra_tags.iter().map(|(name, value)| json!([name, value])));

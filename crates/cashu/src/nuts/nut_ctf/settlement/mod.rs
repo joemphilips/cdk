@@ -10,7 +10,7 @@ mod request;
 mod settings;
 
 pub use canonical::{ctf_receive_commitment, CanonicalHash};
-pub use condition::{PayToUnlockCondition, PayToUnlockMode, PoolPolicy};
+pub use condition::{PayToUnlockAuthorization, PayToUnlockCondition, PayToUnlockMode, PoolPolicy};
 pub use manifest::{PoolEntry, PoolEntryRole, PoolManifest, SelectionBitmap};
 pub use request::{
     CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits, CtfSettlementParticipant,
