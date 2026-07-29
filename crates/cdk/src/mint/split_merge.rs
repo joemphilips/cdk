@@ -132,6 +132,6 @@ fn proofs_sorted_by_y(proofs: Vec<Proof>) -> Result<Vec<Proof>, Error> {
         .into_iter()
         .map(|proof| Ok((proof.y()?.to_bytes(), proof)))
         .collect::<Result<Vec<_>, Error>>()?;
-    keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    keyed.sort_unstable_by_key(|entry| entry.0);
     Ok(keyed.into_iter().map(|(_, proof)| proof).collect())
 }

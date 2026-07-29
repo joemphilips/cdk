@@ -115,6 +115,26 @@ pub struct PreparedConditionalKeySet {
     pub info: MintKeySetInfo,
 }
 
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone)]
+/// Arguments for preparing a conditional keyset.
+pub struct PrepareConditionalKeysetArguments {
+    /// Collateral unit.
+    pub unit: CurrencyUnit,
+    /// Condition identifier.
+    pub condition_id: String,
+    /// Canonical outcome collection.
+    pub outcome_collection: String,
+    /// Outcome collection identifier.
+    pub outcome_collection_id: String,
+    /// Supported denominations.
+    pub amounts: Vec<u64>,
+    /// Input fee in parts per thousand.
+    pub input_fee_ppk: u64,
+    /// Optional final keyset expiry.
+    pub final_expiry: Option<u64>,
+}
+
 impl SignatoryKeySet {
     /// Returns true if `final_expiry` is set and strictly in the past.
     pub fn is_expired(&self) -> bool {
@@ -232,23 +252,9 @@ pub trait Signatory {
     #[cfg(feature = "conditional-tokens")]
     async fn prepare_conditional_keyset(
         &self,
-        unit: CurrencyUnit,
-        condition_id: &str,
-        outcome_collection: &str,
-        outcome_collection_id: &str,
-        amounts: Vec<u64>,
-        input_fee_ppk: u64,
-        final_expiry: Option<u64>,
+        args: PrepareConditionalKeysetArguments,
     ) -> Result<PreparedConditionalKeySet, Error> {
-        let _ = (
-            unit,
-            condition_id,
-            outcome_collection,
-            outcome_collection_id,
-            amounts,
-            input_fee_ppk,
-            final_expiry,
-        );
+        let _ = args;
         Err(Error::Custom(
             "Conditional keyset preparation is not supported by this signatory".to_string(),
         ))

@@ -5,15 +5,21 @@ use std::ops::Range;
 #[cfg(feature = "conditional-tokens")]
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(any(test, feature = "conditional-tokens"))]
+use cdk_common::database;
 use cdk_common::database::mint::Acquired;
-use cdk_common::database::{self, DynMintTransaction};
+use cdk_common::database::DynMintTransaction;
 use cdk_common::mint::{Operation, OperationKind, ProofsWithState};
 use cdk_common::nuts::{BlindSignature, BlindedMessage};
-use cdk_common::{Error, Proofs, ProofsMethods, PublicKey, State};
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::ProofsMethods;
+use cdk_common::{Error, Proofs, PublicKey, State};
 use uuid::Uuid;
 
 #[cfg(feature = "conditional-tokens")]
 use super::super::conditions::STATUS_PENDING;
+#[cfg(feature = "conditional-tokens")]
+use super::super::settlement::PreparedCtfSettlement;
 use super::super::{Mint, Verification};
 use crate::fees::ProofsFeeBreakdown;
 #[cfg(feature = "conditional-tokens")]
@@ -336,14 +342,8 @@ pub(in crate::mint) async fn execute_atomic_ctf_convert(
 #[cfg(feature = "conditional-tokens")]
 pub(in crate::mint) async fn execute_atomic_ctf_settlement(
     mint: &Mint,
-    condition_id: &str,
     request_digest: CanonicalHash,
-    input_proofs: &Proofs,
-    blinded_messages: &[BlindedMessage],
-    participant_output_ranges: &[Range<usize>],
-    input_verification: Verification,
-    output_verification: Verification,
-    fee_breakdown: ProofsFeeBreakdown,
+    settlement: PreparedCtfSettlement,
 ) -> Result<CtfSettlementResponse, Error> {
     if let Some(response) = mint
         .localstore()
@@ -353,26 +353,35 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
         return Ok(response);
     }
 
-    let canonical_inputs = canonical_input_proofs(input_proofs)?;
+    let PreparedCtfSettlement {
+        condition_id,
+        participant_output_ranges,
+        inputs,
+        outputs,
+        input_verification,
+        output_verification,
+        fee,
+    } = settlement;
+    let canonical_inputs = canonical_input_proofs(&inputs)?;
     let prepared = PreparedAtomicCtf::from_verified_settlement(
         mint,
         &canonical_inputs,
-        blinded_messages,
+        &outputs,
         input_verification,
         output_verification,
-        fee_breakdown,
+        fee,
     )
     .await?;
-    let response = grouped_settlement_response(&prepared.signatures, participant_output_ranges)?;
+    let response = grouped_settlement_response(&prepared.signatures, &participant_output_ranges)?;
     #[cfg(test)]
     mint.atomic_ctf_test_pause.pause_if_armed().await;
 
     finish_atomic_ctf_settlement(
         mint,
-        condition_id,
+        &condition_id,
         request_digest,
         &canonical_inputs,
-        blinded_messages,
+        &outputs,
         prepared,
         response,
     )

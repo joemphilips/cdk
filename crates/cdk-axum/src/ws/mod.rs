@@ -218,6 +218,7 @@ mod tests {
                 HashMap::new(),
                 max_inputs,
                 max_outputs,
+                #[cfg(feature = "conditional-tokens")]
                 cdk::nuts::nut_ctf::MAX_OUTCOMES,
             )
             .await

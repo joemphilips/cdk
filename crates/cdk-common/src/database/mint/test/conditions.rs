@@ -266,6 +266,35 @@ where
     assert_eq!(active.get("YES"), Some(&new_id));
 }
 
+/// Test that the public keyset cursor includes every row at its boundary.
+pub async fn get_conditional_keysets_since_includes_boundary<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let condition = test_condition(&"f1".repeat(32));
+    db.add_condition(condition.clone()).await.unwrap();
+    let first = Id::from_str("001711afb1de20cb").unwrap();
+    let second = Id::from_str("001711afb1de20cc").unwrap();
+
+    for (id, outcome, outcome_id) in [
+        (first, "YES", "f2".repeat(32)),
+        (second, "NO", "f3".repeat(32)),
+    ] {
+        let info = test_conditional_keyset_info(id, &condition.condition_id, outcome, &outcome_id);
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info, 2_000)
+            .await
+            .unwrap();
+    }
+
+    let returned = db
+        .get_all_conditional_keyset_infos(Some(2_000), None, None)
+        .await
+        .unwrap();
+    assert_eq!(returned.len(), 2);
+    assert!(returned.iter().any(|keyset| keyset.id == first));
+    assert!(returned.iter().any(|keyset| keyset.id == second));
+}
+
 /// Test that a settlement response and its completed operation commit atomically.
 pub async fn ctf_settlement_replay_round_trip<DB>(db: DB)
 where

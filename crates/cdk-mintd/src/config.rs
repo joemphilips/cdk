@@ -1590,7 +1590,7 @@ min_send_amount_sat = 1200
     #[cfg(feature = "bdk")]
     #[test]
     fn test_bdk_env_wallet_rescan_height_override() {
-        let _guard = config_env_lock();
+        let _guard = crate::test_utils::env_lock();
         clear_bdk_env_vars();
         std::env::set_var(crate::env_vars::ENV_ONCHAIN_BACKEND, "bdk");
         std::env::set_var(crate::env_vars::BDK_NETWORK_ENV_VAR, "regtest");

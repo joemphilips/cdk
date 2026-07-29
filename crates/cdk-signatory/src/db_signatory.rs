@@ -298,27 +298,21 @@ impl Signatory for DbSignatory {
     #[tracing::instrument(skip(self))]
     async fn prepare_conditional_keyset(
         &self,
-        unit: CurrencyUnit,
-        condition_id: &str,
-        outcome_collection: &str,
-        outcome_collection_id: &str,
-        amounts: Vec<u64>,
-        input_fee_ppk: u64,
-        final_expiry: Option<u64>,
+        args: crate::signatory::PrepareConditionalKeysetArguments,
     ) -> Result<PreparedConditionalKeySet, Error> {
         let (keyset, mut info) = crate::common::create_conditional_keyset(
             &self.secp_ctx,
             self.xpriv,
-            unit,
-            condition_id,
-            outcome_collection_id,
-            &amounts,
-            input_fee_ppk,
-            final_expiry,
+            args.unit,
+            &args.condition_id,
+            &args.outcome_collection_id,
+            &args.amounts,
+            args.input_fee_ppk,
+            args.final_expiry,
         )
         .ok_or(Error::UnsupportedUnit)?;
 
-        info.outcome_collection = Some(outcome_collection.to_string());
+        info.outcome_collection = Some(args.outcome_collection);
         info.active = true;
 
         let public = (&(info.clone(), keyset)).into();

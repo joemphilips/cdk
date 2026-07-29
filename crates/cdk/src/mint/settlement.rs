@@ -139,19 +139,9 @@ impl Mint {
 
         let _keyset_snapshot = self.keyset_store_lock.read().await;
         let prepared = self.prepare_ctf_settlement(request, settings, now).await?;
-        execute_atomic_ctf_settlement(
-            self,
-            &prepared.condition_id,
-            request_digest,
-            &prepared.inputs,
-            &prepared.outputs,
-            &prepared.participant_output_ranges,
-            prepared.input_verification,
-            prepared.output_verification,
-            prepared.fee,
-        )
-        .await
-        .map_err(CtfSettlementError::Mint)
+        execute_atomic_ctf_settlement(self, request_digest, prepared)
+            .await
+            .map_err(CtfSettlementError::Mint)
     }
 
     fn ctf_settlement_flight(

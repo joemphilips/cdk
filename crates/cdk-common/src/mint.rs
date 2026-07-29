@@ -1757,6 +1757,12 @@ mod tests {
             input_fee_ppk: 0,
             final_expiry,
             issuer_version: None,
+            #[cfg(feature = "conditional-tokens")]
+            condition_id: None,
+            #[cfg(feature = "conditional-tokens")]
+            outcome_collection: None,
+            #[cfg(feature = "conditional-tokens")]
+            outcome_collection_id: None,
         }
     }
 

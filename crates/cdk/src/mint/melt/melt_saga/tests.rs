@@ -10,6 +10,7 @@
 
 use std::str::FromStr;
 
+#[cfg(feature = "conditional-tokens")]
 use cdk_common::dhke::construct_proofs;
 use cdk_common::melt::MeltQuoteRequest;
 use cdk_common::mint::{
@@ -18,11 +19,11 @@ use cdk_common::mint::{
 };
 use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
-use cdk_common::nuts::{
-    MeltQuoteBolt11Request, MeltQuoteState, MeltRequest, MintQuoteState, PreMintSecrets, SecretKey,
-    SwapRequest,
-};
+use cdk_common::nuts::{MeltQuoteBolt11Request, MeltQuoteState, MeltRequest, MintQuoteState};
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::nuts::{PreMintSecrets, SecretKey, SwapRequest};
 use cdk_common::payment::PaymentIdentifier;
+#[cfg(feature = "conditional-tokens")]
 use cdk_common::secret::Secret;
 use cdk_common::util::unix_time;
 use cdk_common::{
@@ -49,6 +50,7 @@ async fn test_melt_saga_initial_state_creation() {
 }
 
 #[tokio::test]
+#[cfg(feature = "conditional-tokens")]
 async fn test_melt_setup_rejects_pay_to_unlock_without_spending_it() {
     let mint = create_test_mint().await.unwrap();
     let quote = create_test_onchain_melt_quote(&mint).await;
@@ -83,6 +85,7 @@ async fn test_melt_setup_rejects_pay_to_unlock_without_spending_it() {
         .all(Option::is_none));
 }
 
+#[cfg(feature = "conditional-tokens")]
 async fn mint_pay_to_unlock_proofs(mint: &crate::mint::Mint, amount: Amount) -> cdk_common::Proofs {
     let source = mint_test_proofs(mint, amount).await.unwrap();
     let keyset_id = *mint
@@ -114,6 +117,7 @@ async fn mint_pay_to_unlock_proofs(mint: &crate::mint::Mint, amount: Amount) -> 
     construct_proofs(response.signatures, premint.rs(), premint.secrets(), &keys).unwrap()
 }
 
+#[cfg(feature = "conditional-tokens")]
 fn pay_to_unlock_secret(
     keyset_id: cdk_common::nuts::Id,
     refund_key: &SecretKey,
