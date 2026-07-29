@@ -89,6 +89,16 @@ impl PoolPolicy {
         }
         Ok(())
     }
+
+    /// Validate policy bounds that depend only on the fixed authorization inputs.
+    pub fn validate_input_total(self, input_total: u128) -> Result<(), Error> {
+        if self.max_debit > input_total {
+            return Err(Error::InvalidPoolPolicy(
+                "max_debit exceeds the fixed input total",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The closed standard or pool authorization mode.

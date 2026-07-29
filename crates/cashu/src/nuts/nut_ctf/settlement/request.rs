@@ -394,6 +394,38 @@ impl CtfSettlementRequest {
     }
 }
 
+/// Validate one fixed-input CTF pool authorization before a settlement selection exists.
+///
+/// Raw request-byte admission is deliberately outside this typed primitive because the
+/// pinned NUT does not define a standalone range-authorization wire artifact. Callers must
+/// bound their own wire body before decoding `inputs` and `manifest`.
+pub fn validate_ctf_range_authorization(
+    inputs: &[Proof],
+    manifest: &PoolManifest,
+    limits: CtfSettlementLimits,
+) -> Result<PayToUnlockAuthorization, Error> {
+    limits.validate()?;
+    if inputs.is_empty() {
+        return Err(Error::InvalidStructure(
+            "a range authorization requires inputs",
+        ));
+    }
+    if inputs.len() > limits.max_inputs {
+        return Err(Error::LimitExceeded("inputs"));
+    }
+    if manifest.entries().len() > limits.max_pool_entries {
+        return Err(Error::LimitExceeded("pool manifest entries"));
+    }
+
+    ensure_input_order(inputs)?;
+    let mut proof_secrets = HashSet::with_capacity(inputs.len());
+    let mut condition_nonces = HashSet::with_capacity(inputs.len());
+    let authorization =
+        parse_authorization_inputs(inputs, &mut proof_secrets, &mut condition_nonces)?;
+    validate_pool_authorization(inputs, manifest, &authorization)?;
+    Ok(authorization.authorization())
+}
+
 fn enforce_request_bytes(bytes: &[u8], maximum: usize) -> Result<(), Error> {
     if bytes.len() > maximum {
         return Err(Error::LimitExceeded("request bytes"));
@@ -722,8 +754,15 @@ fn parse_authorization(
     proof_secrets: &mut HashSet<Secret>,
     condition_nonces: &mut HashSet<CanonicalHash>,
 ) -> Result<PayToUnlockCondition, Error> {
-    let mut conditions = participant
-        .inputs
+    parse_authorization_inputs(&participant.inputs, proof_secrets, condition_nonces)
+}
+
+fn parse_authorization_inputs(
+    inputs: &[Proof],
+    proof_secrets: &mut HashSet<Secret>,
+    condition_nonces: &mut HashSet<CanonicalHash>,
+) -> Result<PayToUnlockCondition, Error> {
+    let mut conditions = inputs
         .iter()
         .map(|proof| {
             if !proof_secrets.insert(proof.secret.clone()) {
@@ -773,10 +812,7 @@ fn validate_participant_mode(
             if manifest.entries().len() > max_pool_entries {
                 return Err(Error::LimitExceeded("pool manifest entries"));
             }
-            if manifest.commitment() != authorization.data {
-                return Err(Error::ManifestCommitmentMismatch);
-            }
-            manifest.validate_keysets(authorization.offer_keyset)?;
+            validate_pool_authorization(&participant.inputs, manifest, authorization)?;
             manifest.validate_selection(selection, &participant.outputs)?;
             let input_total = participant.inputs.iter().try_fold(0u128, |sum, proof| {
                 sum.checked_add(u128::from(u64::from(proof.amount)))
@@ -792,6 +828,30 @@ fn validate_participant_mode(
         }
     }
     Ok(())
+}
+
+fn validate_pool_authorization(
+    inputs: &[Proof],
+    manifest: &PoolManifest,
+    authorization: &PayToUnlockCondition,
+) -> Result<(), Error> {
+    let policy = match authorization.mode {
+        PayToUnlockMode::Pool(policy) => policy,
+        PayToUnlockMode::Standard => {
+            return Err(Error::InvalidStructure(
+                "range authorization requires pool PAY_TO_UNLOCK tags",
+            ));
+        }
+    };
+    if manifest.commitment() != authorization.data {
+        return Err(Error::ManifestCommitmentMismatch);
+    }
+    manifest.validate_keysets(authorization.offer_keyset)?;
+    let input_total = inputs.iter().try_fold(0u128, |sum, proof| {
+        sum.checked_add(u128::from(u64::from(proof.amount)))
+            .ok_or(Error::ArithmeticOverflow)
+    })?;
+    policy.validate_input_total(input_total)
 }
 
 fn validate_standard_output_keyset(
