@@ -17,6 +17,7 @@ const RATE_N: &str = "rate_n";
 const RATE_D: &str = "rate_d";
 const MIN_RECEIVE: &str = "min_receive";
 const MAX_DEBIT: &str = "max_debit";
+const COORDINATOR_PUBKEY: &str = "coordinator_pubkey";
 
 /// Numeric owner policy for a pool-mode range authorization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,6 +124,8 @@ pub struct PayToUnlockAuthorization {
     pub expiry: u64,
     /// Fresh BIP-340 x-only refund public key.
     pub refund: XOnlyPublicKey,
+    /// Optional BIP-340 coordinator authorized to submit settlement.
+    pub coordinator_pubkey: Option<XOnlyPublicKey>,
     /// Closed standard or pool authorization.
     pub mode: PayToUnlockMode,
 }
@@ -140,6 +143,8 @@ pub struct PayToUnlockCondition {
     pub expiry: u64,
     /// Fresh BIP-340 x-only refund public key.
     pub refund: XOnlyPublicKey,
+    /// Optional BIP-340 coordinator authorized to submit settlement.
+    pub coordinator_pubkey: Option<XOnlyPublicKey>,
     /// Closed standard or pool authorization.
     pub mode: PayToUnlockMode,
 }
@@ -154,6 +159,33 @@ impl fmt::Debug for PayToUnlockCondition {
 }
 
 impl PayToUnlockCondition {
+    /// Extract only the optional coordinator key for pre-cache authentication.
+    ///
+    /// This deliberately does not validate commitments, policy numbers, or
+    /// other condition fields. Full settlement validation remains a separate
+    /// cache-miss step.
+    pub(super) fn parse_coordinator_pubkey(
+        secret: &Secret,
+    ) -> Result<Option<XOnlyPublicKey>, Error> {
+        let (kind, data): (String, StrictSecretData) = serde_json::from_slice(secret.as_bytes())
+            .map_err(|_| Error::CoordinatorAuthentication)?;
+        if kind != "PAY_TO_UNLOCK" {
+            return Err(Error::CoordinatorAuthentication);
+        }
+
+        let mut coordinator = None;
+        for tag in data.tags {
+            if tag.first().map(String::as_str) != Some(COORDINATOR_PUBKEY) {
+                continue;
+            }
+            if tag.len() != 2 || coordinator.is_some() {
+                return Err(Error::CoordinatorAuthentication);
+            }
+            coordinator = Some(parse_coordinator_key(&tag[1])?);
+        }
+        Ok(coordinator)
+    }
+
     /// Decode a `PAY_TO_UNLOCK` secret, or return `None` for another secret kind.
     pub fn parse_optional(secret: &Secret) -> Result<Option<Self>, Error> {
         let Ok(value) = serde_json::from_slice::<Value>(secret.as_bytes()) else {
@@ -183,6 +215,11 @@ impl PayToUnlockCondition {
         let offer_keyset = parse_keyset_id(&tags.offer_keyset)?;
         let expiry = parse_minimal_u64(&tags.expiry, EXPIRY)?;
         let refund = parse_refund_key(&tags.refund)?;
+        let coordinator_pubkey = tags
+            .coordinator_pubkey
+            .as_deref()
+            .map(parse_coordinator_key)
+            .transpose()?;
         let mode = tags.mode()?;
 
         Ok(Self {
@@ -191,6 +228,7 @@ impl PayToUnlockCondition {
             offer_keyset,
             expiry,
             refund,
+            coordinator_pubkey,
             mode,
         })
     }
@@ -209,6 +247,7 @@ impl PayToUnlockCondition {
             offer_keyset: self.offer_keyset,
             expiry: self.expiry,
             refund: self.refund,
+            coordinator_pubkey: self.coordinator_pubkey,
             mode: self.mode,
         }
     }
@@ -231,6 +270,7 @@ struct ConditionTags {
     rate_d: Option<String>,
     min_receive: Option<String>,
     max_debit: Option<String>,
+    coordinator_pubkey: Option<String>,
 }
 
 impl ConditionTags {
@@ -248,6 +288,7 @@ impl ConditionTags {
                 RATE_D => set_tag(&mut parsed.rate_d, &tag)?,
                 MIN_RECEIVE => set_tag(&mut parsed.min_receive, &tag)?,
                 MAX_DEBIT => set_tag(&mut parsed.max_debit, &tag)?,
+                COORDINATOR_PUBKEY => set_tag(&mut parsed.coordinator_pubkey, &tag)?,
                 _ => return Err(Error::UnknownTag),
             }
         }
@@ -260,6 +301,7 @@ impl ConditionTags {
             rate_d: parsed.rate_d,
             min_receive: parsed.min_receive,
             max_debit: parsed.max_debit,
+            coordinator_pubkey: parsed.coordinator_pubkey,
         })
     }
 
@@ -288,6 +330,7 @@ struct PartialConditionTags {
     rate_d: Option<String>,
     min_receive: Option<String>,
     max_debit: Option<String>,
+    coordinator_pubkey: Option<String>,
 }
 
 fn set_tag(destination: &mut Option<String>, tag: &[String]) -> Result<(), Error> {
@@ -328,6 +371,14 @@ fn parse_refund_key(value: &str) -> Result<XOnlyPublicKey, Error> {
         XOnlyPublicKey::from_str(value).map_err(|_| Error::InvalidPublicKey { field: REFUND })?;
     if key.to_string() != value {
         return Err(Error::InvalidPublicKey { field: REFUND });
+    }
+    Ok(key)
+}
+
+fn parse_coordinator_key(value: &str) -> Result<XOnlyPublicKey, Error> {
+    let key = XOnlyPublicKey::from_str(value).map_err(|_| Error::CoordinatorAuthentication)?;
+    if key.to_string() != value {
+        return Err(Error::CoordinatorAuthentication);
     }
     Ok(key)
 }

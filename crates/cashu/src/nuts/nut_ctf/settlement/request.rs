@@ -1,11 +1,14 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::str::FromStr;
 
+use bitcoin::secp256k1::schnorr::Signature;
+use bitcoin::secp256k1::{Message, XOnlyPublicKey};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
-use super::canonical::{write_canonical_json, CTF_REQUEST_DOMAIN};
+use super::canonical::{write_canonical_json, CTF_COORDINATOR_DOMAIN, CTF_REQUEST_DOMAIN};
 use super::manifest::{strict_keyset_id, strict_public_key};
 use super::{
     ctf_receive_commitment, CanonicalHash, Error, PayToUnlockAuthorization, PayToUnlockCondition,
@@ -17,7 +20,7 @@ use crate::nuts::nut02::Id;
 use crate::nuts::nut12::ProofDleq;
 use crate::nuts::nut_ctf::CtfConvertRequest;
 use crate::secret::Secret;
-use crate::Amount;
+use crate::{Amount, SECP256K1};
 
 /// Advertised structural limits applied before expensive settlement validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +217,7 @@ impl CtfSettlementParticipant {
             .collect::<Vec<_>>();
 
         let mut participant = Map::new();
+        let mut encoded = Vec::new();
         participant.insert("inputs".to_string(), Value::Array(input_values));
         participant.insert("outputs".to_string(), Value::Array(output_values));
         if let ParticipantMode::Pool {
@@ -222,13 +226,13 @@ impl CtfSettlementParticipant {
         } = &self.mode
         {
             participant.insert("pool_manifest".to_string(), serde_json::to_value(manifest)?);
-            participant.insert(
-                "pool_selection".to_string(),
-                Value::String(selection.to_hex()),
-            );
+            let selection = crate::util::hex::decode(selection.to_hex())
+                .map_err(|_| Error::InvalidSelection("selection hex could not be decoded"))?;
+            write_canonical_json(&Value::Object(participant), &mut encoded)?;
+            encoded.extend_from_slice(&selection);
+            return Ok(encoded);
         }
 
-        let mut encoded = Vec::new();
         write_canonical_json(&Value::Object(participant), &mut encoded)?;
         Ok(encoded)
     }
@@ -243,6 +247,8 @@ pub struct CtfSettlementRequest {
     pub parent_collection_id: CanonicalHash,
     /// Canonically ordered standard and pool participants.
     pub participants: Vec<CtfSettlementParticipant>,
+    /// Optional BIP-340 signature by the coordinator bound in the inputs.
+    pub coordinator_sig: Option<Signature>,
 }
 
 /// Successful multi-party settlement response, grouped in participant order.
@@ -283,15 +289,18 @@ impl CtfSettlementRequest {
             .into_iter()
             .map(CtfSettlementParticipant::try_from)
             .collect::<Result<Vec<_>, _>>()?;
+        let coordinator_sig = parse_coordinator_signature(wire.coordinator_sig)?;
         Ok(Self {
             condition_id,
             parent_collection_id,
             participants,
+            coordinator_sig,
         })
     }
 
     /// Validate protocol-pure structure, commitments, selections, and policies.
     pub fn validate(&self, limits: CtfSettlementLimits) -> Result<(), Error> {
+        self.verify_coordinator_authentication()?;
         self.validated_authorizations(limits).map(drop)
     }
 
@@ -300,15 +309,59 @@ impl CtfSettlementRequest {
     /// Top-level identifiers contribute their decoded 32-byte representations;
     /// each participant contributes its self-delimiting canonical JSON record.
     pub fn request_digest(&self) -> Result<CanonicalHash, Error> {
+        let canonical = self.canonical_bytes()?;
+        Ok(CanonicalHash::from_bytes(
+            crate::nuts::nut_ctf::tagged_hash(CTF_REQUEST_DOMAIN, &canonical),
+        ))
+    }
+
+    /// Compute the BIP-340 coordinator message digest over the request bytes.
+    ///
+    /// The returned tagged digest is the message signed directly. Callers must
+    /// not hash it again.
+    pub fn coordinator_digest(&self) -> Result<CanonicalHash, Error> {
+        let canonical = self.canonical_bytes()?;
+        Ok(CanonicalHash::from_bytes(
+            crate::nuts::nut_ctf::tagged_hash(CTF_COORDINATOR_DOMAIN, &canonical),
+        ))
+    }
+
+    /// Verify the optional coordinator binding before any replay lookup.
+    ///
+    /// Generic CDK permits a request to mix bound and unbound participants, but
+    /// every populated coordinator key must be identical.
+    pub fn verify_coordinator_authentication(&self) -> Result<(), Error> {
+        let mut coordinator = None;
+        for proof in self
+            .participants
+            .iter()
+            .flat_map(|participant| participant.inputs.iter())
+        {
+            if let Some(candidate) = PayToUnlockCondition::parse_coordinator_pubkey(&proof.secret)?
+            {
+                merge_coordinator_key(&mut coordinator, candidate)?;
+            }
+        }
+        match (coordinator, self.coordinator_sig.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(coordinator), Some(signature)) => {
+                let message = Message::from_digest(self.coordinator_digest()?.to_bytes());
+                SECP256K1
+                    .verify_schnorr(signature, &message, &coordinator)
+                    .map_err(|_| Error::CoordinatorAuthentication)
+            }
+            _ => Err(Error::CoordinatorAuthentication),
+        }
+    }
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut canonical = Vec::new();
         canonical.extend_from_slice(&self.condition_id.to_bytes());
         canonical.extend_from_slice(&self.parent_collection_id.to_bytes());
         for participant in &self.participants {
             canonical.extend_from_slice(&participant.canonical_bytes()?);
         }
-        Ok(CanonicalHash::from_bytes(
-            crate::nuts::nut_ctf::tagged_hash(CTF_REQUEST_DOMAIN, &canonical),
-        ))
+        Ok(canonical)
     }
 
     /// Validate the request and return one shared authorization per participant.
@@ -527,15 +580,53 @@ fn checked_preflight_count(
     current.checked_add(count).ok_or(Error::ArithmeticOverflow)
 }
 
+fn parse_coordinator_signature(value: Option<Value>) -> Result<Option<Signature>, Error> {
+    let value = match value {
+        None => return Ok(None),
+        Some(Value::String(value)) => value,
+        Some(_) => return Err(Error::CoordinatorAuthentication),
+    };
+    if value.len() != 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::CoordinatorAuthentication);
+    }
+    let signature = Signature::from_str(&value).map_err(|_| Error::CoordinatorAuthentication)?;
+    if signature.to_string() != value {
+        return Err(Error::CoordinatorAuthentication);
+    }
+    Ok(Some(signature))
+}
+
+fn merge_coordinator_key(
+    shared: &mut Option<XOnlyPublicKey>,
+    coordinator: XOnlyPublicKey,
+) -> Result<(), Error> {
+    match shared {
+        Some(existing) if *existing != coordinator => Err(Error::CoordinatorAuthentication),
+        None => {
+            *shared = Some(coordinator);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 impl Serialize for CtfSettlementRequest {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut request = serializer.serialize_struct("CtfSettlementRequest", 3)?;
+        let field_count = 3 + usize::from(self.coordinator_sig.is_some());
+        let mut request = serializer.serialize_struct("CtfSettlementRequest", field_count)?;
         request.serialize_field("condition_id", &self.condition_id)?;
         request.serialize_field("parent_collection_id", &self.parent_collection_id)?;
         request.serialize_field("participants", &ParticipantSlice(&self.participants))?;
+        if let Some(signature) = self.coordinator_sig {
+            request.serialize_field("coordinator_sig", &signature.to_string())?;
+        }
         request.end()
     }
 }
@@ -589,6 +680,8 @@ struct SettlementRequestWire {
     #[serde(default, deserialize_with = "deserialize_present")]
     parent_collection_id: Option<String>,
     participants: Vec<ParticipantWire>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    coordinator_sig: Option<Value>,
 }
 
 #[derive(Deserialize)]

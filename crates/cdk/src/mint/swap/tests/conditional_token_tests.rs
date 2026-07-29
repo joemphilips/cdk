@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bip39::Mnemonic;
+use bitcoin::secp256k1::{
+    Keypair, Message, Secp256k1, SecretKey as CoordinatorSecretKey, XOnlyPublicKey,
+};
 use cdk_common::amount::SplitTarget;
 use cdk_common::dhke::construct_proofs;
 use cdk_common::error::{ErrorCode, ErrorResponse};
@@ -319,6 +322,8 @@ fn create_premint(
 
 const SETTLEMENT_REFUND_KEY: &str =
     "194603ffa36356f4a56b7df9371fc3192472351453ec7398b8da8117e7c3e104";
+const SETTLEMENT_COORDINATOR_KEY: &str =
+    "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
 
 struct StandardSettlementFixture {
     request: CtfSettlementRequest,
@@ -328,6 +333,21 @@ struct StandardSettlementFixture {
 }
 
 async fn standard_settlement_fixture(mint: &Mint, now: u64) -> StandardSettlementFixture {
+    standard_settlement_fixture_for_coordinator(mint, now, None).await
+}
+
+async fn coordinator_bound_standard_settlement_fixture(
+    mint: &Mint,
+    now: u64,
+) -> StandardSettlementFixture {
+    standard_settlement_fixture_for_coordinator(mint, now, Some(SETTLEMENT_COORDINATOR_KEY)).await
+}
+
+async fn standard_settlement_fixture_for_coordinator(
+    mint: &Mint,
+    now: u64,
+    coordinator: Option<&str>,
+) -> StandardSettlementFixture {
     let regular_keyset = get_regular_keyset_id(mint);
     let alice_source = mint_test_proofs_for_unit(mint, Amount::from(9), CurrencyUnit::Sat)
         .await
@@ -342,12 +362,26 @@ async fn standard_settlement_fixture(mint: &Mint, now: u64) -> StandardSettlemen
     let (yes_outputs, _) = create_premint(mint, yes_keyset, Amount::from(15));
     let (no_outputs, _) = create_premint(mint, no_keyset, Amount::from(15));
     let expiry = now + 60;
-    let alice =
-        standard_settlement_participant(mint, alice_source, regular_keyset, yes_outputs, expiry, 1)
-            .await;
-    let bob =
-        standard_settlement_participant(mint, bob_source, regular_keyset, no_outputs, expiry, 2)
-            .await;
+    let alice = standard_settlement_participant(
+        mint,
+        alice_source,
+        regular_keyset,
+        yes_outputs,
+        expiry,
+        1,
+        coordinator,
+    )
+    .await;
+    let bob = standard_settlement_participant(
+        mint,
+        bob_source,
+        regular_keyset,
+        no_outputs,
+        expiry,
+        2,
+        coordinator,
+    )
+    .await;
     let mut participants = vec![alice, bob];
     canonicalize_settlement_participants(&mut participants);
     let (input_ys, output_points) = settlement_storage_keys(&participants);
@@ -357,6 +391,7 @@ async fn standard_settlement_fixture(mint: &Mint, now: u64) -> StandardSettlemen
             condition_id: CanonicalHash::parse(&condition_id, "condition_id").unwrap(),
             parent_collection_id: CanonicalHash::from_bytes([0; 32]),
             participants,
+            coordinator_sig: None,
         },
         output_only_keyset: yes_keyset,
         input_ys,
@@ -386,9 +421,16 @@ async fn mixed_pool_settlement_fixture(mint: &Mint, now: u64) -> MixedPoolSettle
     let (no_outputs, _) = create_premint(mint, *keysets.get("NO").unwrap(), Amount::from(15));
     let (change_candidates, _) = create_premint(mint, regular_keyset, Amount::from(7));
     let expiry = now + 60;
-    let alice =
-        standard_settlement_participant(mint, alice_source, regular_keyset, yes_outputs, expiry, 1)
-            .await;
+    let alice = standard_settlement_participant(
+        mint,
+        alice_source,
+        regular_keyset,
+        yes_outputs,
+        expiry,
+        1,
+        None,
+    )
+    .await;
     let pool = pool_settlement_participant(
         mint,
         bob_source,
@@ -416,6 +458,7 @@ async fn mixed_pool_settlement_fixture(mint: &Mint, now: u64) -> MixedPoolSettle
             condition_id: CanonicalHash::parse(&condition_id, "condition_id").unwrap(),
             parent_collection_id: CanonicalHash::from_bytes([0; 32]),
             participants,
+            coordinator_sig: None,
         },
         input_ys,
         selected_output_points,
@@ -500,10 +543,16 @@ async fn standard_settlement_participant(
     outputs: Vec<cdk_common::BlindedMessage>,
     expiry: u64,
     nonce: u8,
+    coordinator: Option<&str>,
 ) -> CtfSettlementParticipant {
     let commitment = ctf_receive_commitment(&outputs).unwrap();
-    let secret =
-        settlement_pay_to_unlock_secret(offer_keyset, commitment.to_string(), expiry, nonce);
+    let secret = settlement_pay_to_unlock_secret(
+        offer_keyset,
+        commitment.to_string(),
+        expiry,
+        nonce,
+        coordinator,
+    );
     let input = issue_locked_proof(mint, source, offer_keyset, secret).await;
     CtfSettlementParticipant {
         inputs: vec![input],
@@ -537,22 +586,56 @@ async fn issue_locked_proof(
         .remove(0)
 }
 
-fn settlement_pay_to_unlock_secret(keyset: Id, data: String, expiry: u64, nonce: u8) -> Secret {
+fn settlement_pay_to_unlock_secret(
+    keyset: Id,
+    data: String,
+    expiry: u64,
+    nonce: u8,
+    coordinator: Option<&str>,
+) -> Secret {
+    let mut tags = vec![
+        serde_json::json!(["offer_keyset", keyset.to_string()]),
+        serde_json::json!(["expiry", expiry.to_string()]),
+        serde_json::json!(["refund", SETTLEMENT_REFUND_KEY]),
+    ];
+    if let Some(coordinator) = coordinator {
+        tags.push(serde_json::json!(["coordinator_pubkey", coordinator]));
+    }
     Secret::new(
         serde_json::json!([
             "PAY_TO_UNLOCK",
             {
                 "nonce": format!("{nonce:02x}").repeat(32),
                 "data": data,
-                "tags": [
-                    ["offer_keyset", keyset.to_string()],
-                    ["expiry", expiry.to_string()],
-                    ["refund", SETTLEMENT_REFUND_KEY]
-                ]
+                "tags": tags
             }
         ])
         .to_string(),
     )
+}
+
+fn sign_coordinator_request(
+    request: &mut CtfSettlementRequest,
+    secret_scalar: u8,
+    aux_rand: [u8; 32],
+) {
+    let secp = Secp256k1::new();
+    let mut secret_bytes = [0; 32];
+    secret_bytes[31] = secret_scalar;
+    let secret_key =
+        CoordinatorSecretKey::from_slice(&secret_bytes).expect("coordinator secret key");
+    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    if secret_scalar == 3 {
+        assert_eq!(
+            XOnlyPublicKey::from_keypair(&keypair).0.to_string(),
+            SETTLEMENT_COORDINATOR_KEY
+        );
+    }
+    let digest = request
+        .coordinator_digest()
+        .expect("coordinator request digest");
+    let message = Message::from_digest(digest.to_bytes());
+    request.coordinator_sig = Some(secp.sign_schnorr_with_aux_rand(&message, &keypair, &aux_rand));
 }
 
 fn settlement_pool_pay_to_unlock_secret(
@@ -2939,6 +3022,51 @@ async fn test_ctf_settlement_mixed_pool_persists_only_selection_and_replays() {
         .expect("mixed settlement should replay exactly");
     assert_eq!(replay, response);
     assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_authenticates_before_cached_replay() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let mut fixture = coordinator_bound_standard_settlement_fixture(&mint, now).await;
+    sign_coordinator_request(&mut fixture.request, 3, [1; 32]);
+
+    let response = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .expect("coordinator-authenticated settlement should commit");
+    let signing_attempts = mint.blind_sign_attempts();
+
+    let original_signature = fixture.request.coordinator_sig;
+    let mut alternate_valid_signature = fixture.request.clone();
+    sign_coordinator_request(&mut alternate_valid_signature, 3, [2; 32]);
+    assert_ne!(
+        alternate_valid_signature.coordinator_sig, original_signature,
+        "different auxiliary randomness should produce a distinct valid signature"
+    );
+    assert_eq!(
+        mint.process_ctf_settlement(&alternate_valid_signature, settlement_settings(), now)
+            .await
+            .expect("another valid signature over identical bytes authenticates replay"),
+        response
+    );
+
+    let mut invalid_signature = fixture.request.clone();
+    sign_coordinator_request(&mut invalid_signature, 4, [3; 32]);
+    assert!(matches!(
+        mint.process_ctf_settlement(&invalid_signature, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Protocol(
+            cdk_common::nuts::nut_ctf::settlement::Error::CoordinatorAuthentication
+        ))
+    ));
+    assert_eq!(
+        mint.blind_sign_attempts(),
+        signing_attempts,
+        "authenticated replay and rejected forgery must not sign again"
+    );
 }
 
 #[tokio::test]
