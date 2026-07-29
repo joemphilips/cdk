@@ -132,7 +132,7 @@ pub struct Mint {
     #[cfg(all(test, feature = "conditional-tokens"))]
     atomic_ctf_test_pause: Arc<swap::atomic::AtomicCtfTestPause>,
     /// Number of blind-signing calls made by this mint in tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "conditional-tokens"))]
     blind_sign_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -154,6 +154,13 @@ struct TaskState {
     /// Keyset subscription retained from construction, drained once by the first
     /// `start()`. `None` after it has been taken; a restart re-subscribes.
     keyset_updates: Option<watch::Receiver<SignatoryKeysets>>,
+}
+
+struct MintLimits {
+    max_inputs: usize,
+    max_outputs: usize,
+    #[cfg(feature = "conditional-tokens")]
+    max_outcomes_per_condition: usize,
 }
 
 /// Supervised subscription to a single payment processor's event stream.
@@ -294,15 +301,21 @@ impl Mint {
             localstore,
             None,
             payment_processors,
-            max_inputs,
-            max_outputs,
-            #[cfg(feature = "conditional-tokens")]
-            max_outcomes_per_condition,
+            MintLimits {
+                max_inputs,
+                max_outputs,
+                #[cfg(feature = "conditional-tokens")]
+                max_outcomes_per_condition,
+            },
         )
         .await
     }
 
     /// Create new [`Mint`] with authentication support
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preserve the public constructor shape when conditional-token limits are enabled"
+    )]
     pub async fn new_with_auth(
         mint_info: MintInfo,
         signatory: Arc<dyn Signatory + Send + Sync>,
@@ -319,10 +332,12 @@ impl Mint {
             localstore,
             Some(auth_localstore),
             payment_processors,
-            max_inputs,
-            max_outputs,
-            #[cfg(feature = "conditional-tokens")]
-            max_outcomes_per_condition,
+            MintLimits {
+                max_inputs,
+                max_outputs,
+                #[cfg(feature = "conditional-tokens")]
+                max_outcomes_per_condition,
+            },
         )
         .await
     }
@@ -335,9 +350,7 @@ impl Mint {
         localstore: DynMintDatabase,
         auth_localstore: Option<DynMintAuthDatabase>,
         payment_processors: HashMap<PaymentProcessorKey, DynMintPayment>,
-        max_inputs: usize,
-        max_outputs: usize,
-        #[cfg(feature = "conditional-tokens")] max_outcomes_per_condition: usize,
+        limits: MintLimits,
     ) -> Result<Self, Error> {
         // Subscribe up front and bootstrap the in-memory snapshot from the same
         // receiver that keeps it fresh. `borrow_and_update` pins the receiver
@@ -451,17 +464,17 @@ impl Mint {
                 keyset_updates: Some(keyset_updates),
                 ..Default::default()
             })),
-            max_inputs,
-            max_outputs,
+            max_inputs: limits.max_inputs,
+            max_outputs: limits.max_outputs,
             #[cfg(feature = "conditional-tokens")]
-            max_outcomes_per_condition,
+            max_outcomes_per_condition: limits.max_outcomes_per_condition,
             #[cfg(feature = "conditional-tokens")]
             ctf_input_reservations: Arc::new(StdMutex::new(HashSet::new())),
             #[cfg(feature = "conditional-tokens")]
             ctf_settlement_flights: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(all(test, feature = "conditional-tokens"))]
             atomic_ctf_test_pause: Arc::new(swap::atomic::AtomicCtfTestPause::default()),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "conditional-tokens"))]
             blind_sign_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
@@ -1384,7 +1397,7 @@ impl Mint {
         &self,
         blinded_message: Vec<BlindedMessage>,
     ) -> Result<Vec<BlindSignature>, Error> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "conditional-tokens"))]
         self.blind_sign_attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1408,7 +1421,7 @@ impl Mint {
         result
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "conditional-tokens"))]
     /// Return the number of blind-signing calls made by this mint.
     pub(crate) fn blind_sign_attempts(&self) -> usize {
         self.blind_sign_attempts

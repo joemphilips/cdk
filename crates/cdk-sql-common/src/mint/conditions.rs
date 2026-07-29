@@ -301,10 +301,10 @@ impl<RM> SQLMintDatabase<RM>
 where
     RM: DatabasePool + 'static,
 {
-    /// Query the `conditional_keyset` table with optional cursor pagination
-    /// (`since` is strictly greater than), `limit`, and active filter. This
-    /// is the shared path for both the public NUT-CTF listing endpoint and
-    /// the internal `reload_keys_from_db` bootstrap.
+    /// Query the `conditional_keyset` table with optional inclusive cursor
+    /// pagination, `limit`, and active filter. This is the shared path for
+    /// both the public NUT-CTF listing endpoint and the internal
+    /// `reload_keys_from_db` bootstrap.
     pub(crate) async fn query_conditional_keysets(
         &self,
         since: Option<u64>,
@@ -323,8 +323,9 @@ where
         );
 
         if since.is_some() {
-            // Cursor pagination: strictly greater than the last-seen timestamp.
-            sql.push_str(" AND created_at > :since");
+            // Replay the boundary timestamp so same-second rows cannot be
+            // skipped. Clients deduplicate returned keysets by ID.
+            sql.push_str(" AND created_at >= :since");
         }
 
         if active.is_some() {
@@ -454,9 +455,9 @@ where
         );
 
         if since.is_some() {
-            // Cursor pagination: strictly greater, so callers can pass the
-            // last-seen `created_at` without re-receiving the boundary row.
-            sql.push_str(" AND created_at > :since");
+            // Replay the boundary timestamp so same-second rows cannot be
+            // skipped. Clients deduplicate returned conditions by ID.
+            sql.push_str(" AND created_at >= :since");
         }
 
         if !status.is_empty() {
@@ -483,7 +484,7 @@ where
         }
 
         for (i, s) in status.iter().enumerate() {
-            stmt = stmt.bind(&format!("status_{}", i), s.clone());
+            stmt = stmt.bind(format!("status_{}", i), s.clone());
         }
 
         if let Some(limit_val) = limit {

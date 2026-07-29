@@ -24,6 +24,10 @@ pub struct TestOracle {
 }
 
 /// Create a deterministic test oracle (for reproducible tests)
+///
+/// # Panics
+///
+/// Panics if the fixed test secret keys are invalid.
 pub fn create_test_oracle() -> TestOracle {
     let secp = Secp256k1::new();
 
@@ -43,6 +47,10 @@ pub fn create_test_oracle() -> TestOracle {
 }
 
 /// Create a second test oracle (for multi-oracle / threshold tests)
+///
+/// # Panics
+///
+/// Panics if the fixed test secret keys are invalid.
 pub fn create_test_oracle_2() -> TestOracle {
     let secp = Secp256k1::new();
 
@@ -63,6 +71,10 @@ pub fn create_test_oracle_2() -> TestOracle {
 /// Create a valid oracle announcement with a proper signature.
 ///
 /// Returns the parsed `OracleAnnouncement` and its hex-encoded TLV representation.
+///
+/// # Panics
+///
+/// Panics if the constructed test announcement cannot be TLV-encoded.
 pub fn create_test_announcement(
     oracle: &TestOracle,
     outcomes: &[&str],
@@ -74,7 +86,7 @@ pub fn create_test_announcement(
         oracle_nonces: vec![oracle.nonce_public],
         event_maturity_epoch: 1_000_000,
         event_descriptor: EventDescriptor::EnumEvent(EnumEventDescriptor {
-            outcomes: outcomes.iter().map(|s| s.to_string()).collect(),
+            outcomes: outcomes.iter().map(ToString::to_string).collect(),
         }),
         event_id: event_id.to_string(),
     };
@@ -161,6 +173,11 @@ pub fn create_oracle_witness(oracle: &TestOracle, outcome: &str) -> OracleWitnes
 /// Create a digit decomposition oracle announcement for numeric conditions (NUT-CTF-numeric).
 ///
 /// Returns the parsed `OracleAnnouncement` and its hex-encoded TLV representation.
+///
+/// # Panics
+///
+/// Panics if a deterministic test nonce is invalid or the constructed
+/// announcement cannot be TLV-encoded.
 pub fn create_digit_decomposition_announcement(
     oracle: &TestOracle,
     base: u16,
@@ -228,6 +245,11 @@ pub fn create_digit_decomposition_announcement(
 ///
 /// Produces per-digit Schnorr signatures. Each digit is signed with its own nonce.
 /// Returns a Vec of 64-byte signatures (one per digit/nonce).
+///
+/// # Panics
+///
+/// Panics if a deterministic test nonce is invalid or the helper's internally
+/// generated digit and nonce counts diverge.
 pub fn sign_digit_attestation(
     oracle: &TestOracle,
     value: i64,

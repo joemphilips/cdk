@@ -719,13 +719,15 @@ impl Mint {
             let keyset = self
                 .signatory
                 .prepare_conditional_keyset(
-                    unit.clone(),
-                    condition_id,
-                    outcome_collection_string,
-                    &outcome_collection_id,
-                    amounts.clone(),
-                    1,
-                    None,
+                    cdk_signatory::signatory::PrepareConditionalKeysetArguments {
+                        unit: unit.clone(),
+                        condition_id: condition_id.to_string(),
+                        outcome_collection: outcome_collection_string.clone(),
+                        outcome_collection_id,
+                        amounts: amounts.clone(),
+                        input_fee_ppk: 1,
+                        final_expiry: None,
+                    },
                 )
                 .await?;
 
