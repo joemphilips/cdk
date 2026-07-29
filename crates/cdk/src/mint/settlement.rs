@@ -5,14 +5,15 @@ use std::ops::Range;
 use std::sync::{Arc, Weak};
 
 use cdk_common::mint::MintKeySetInfo;
-use cdk_common::nuts::nut00::{BlindedMessage, Proofs};
+use cdk_common::nuts::nut00::{BlindedMessage, Proofs, ProofsMethods};
 use cdk_common::nuts::nut02::Id;
 use cdk_common::nuts::nut_ctf::settlement::{
+    validate_ctf_range_authorization as validate_range_protocol, CanonicalHash,
     CtfSettlementRequest, CtfSettlementResponse, Error as SettlementError,
     NutCtfSettlementSettings, NutCtfSettlementSettingsError, ParticipantMode,
-    PayToUnlockAuthorization,
+    PayToUnlockAuthorization, PoolManifest,
 };
-use cdk_common::CurrencyUnit;
+use cdk_common::{CurrencyUnit, State};
 
 use super::conditions::STATUS_PENDING;
 use super::ctf_conservation::{
@@ -64,6 +65,49 @@ pub enum CtfSettlementError {
 }
 
 impl Mint {
+    /// Validate one fixed-input CTF range authorization without reserving or mutating it.
+    ///
+    /// The caller must apply its wire-body byte limit before decoding these typed NUT
+    /// primitives. A successful validation is only a point-in-time admission check; final
+    /// settlement revalidates proof state and every mint lifecycle invariant atomically.
+    pub async fn validate_ctf_range_authorization(
+        &self,
+        condition_id: CanonicalHash,
+        parent_collection_id: CanonicalHash,
+        inputs: &Proofs,
+        manifest: &PoolManifest,
+        settings: NutCtfSettlementSettings,
+        now: u64,
+    ) -> Result<PayToUnlockAuthorization, CtfSettlementError> {
+        let limits = settings.structural_limits()?;
+        if !parent_collection_id.is_zero() {
+            return Err(SettlementError::NonRootParentCollection.into());
+        }
+        let authorization = validate_range_protocol(inputs, manifest, limits)?;
+
+        let _keyset_snapshot = self.keyset_store_lock.read().await;
+        let condition_id = condition_id.to_string();
+        let condition = self.load_pending_condition(&condition_id).await?;
+        let collateral = condition
+            .collateral
+            .clone()
+            .ok_or(CtfSettlementError::MissingCollateralUnit)?;
+        let outcomes = condition_outcomes(&condition)?;
+        let expiry_ceiling = self
+            .range_authorization_expiry_ceiling(&condition_id, settings, now)
+            .await?;
+        validate_authorization_expiries(&[authorization], now, expiry_ceiling)?;
+
+        let resolver = CtfCoverageResolver::new(self, &condition_id, &outcomes)?;
+        let keysets = range_authorization_keysets(inputs, manifest);
+        self.resolve_involved_keysets(keysets, &resolver, &collateral, now)
+            .await?;
+        self.validate_manifest_denominations(manifest)?;
+        self.verify_inputs(inputs).await?;
+        self.require_inputs_unspent(inputs).await?;
+        Ok(authorization)
+    }
+
     /// Atomically execute or replay one validated multi-party CTF settlement.
     pub async fn process_ctf_settlement(
         &self,
@@ -207,6 +251,21 @@ impl Mint {
         effective_expiry_ceiling(&expiries, now, settings.max_expiry_seconds())
     }
 
+    async fn range_authorization_expiry_ceiling(
+        &self,
+        condition_id: &str,
+        settings: NutCtfSettlementSettings,
+        now: u64,
+    ) -> Result<u64, CtfSettlementError> {
+        let keyset_ceiling = self
+            .settlement_expiry_ceiling(condition_id, settings, now)
+            .await?;
+        let advertised_ceiling = now
+            .checked_add(settings.max_expiry_seconds())
+            .ok_or(CtfSettlementError::ExpiryOverflow)?;
+        Ok(keyset_ceiling.min(advertised_ceiling))
+    }
+
     async fn resolve_settlement_keysets(
         &self,
         request: &CtfSettlementRequest,
@@ -214,13 +273,61 @@ impl Mint {
         collateral: &CurrencyUnit,
         now: u64,
     ) -> Result<HashMap<Id, ResolvedCoverage>, CtfSettlementError> {
+        self.resolve_involved_keysets(involved_keysets(request), resolver, collateral, now)
+            .await
+    }
+
+    async fn resolve_involved_keysets(
+        &self,
+        keysets: BTreeSet<Id>,
+        resolver: &CtfCoverageResolver<'_>,
+        collateral: &CurrencyUnit,
+        now: u64,
+    ) -> Result<HashMap<Id, ResolvedCoverage>, CtfSettlementError> {
         let mut resolved = HashMap::new();
-        for id in involved_keysets(request) {
+        for id in keysets {
             let info = self.get_keyset_info(&id).ok_or(Error::UnknownKeySet)?;
             validate_involved_keyset(&info, collateral)?;
             resolved.insert(id, resolver.resolve_keyset_at(&id, now).await?);
         }
         Ok(resolved)
+    }
+
+    fn validate_manifest_denominations(
+        &self,
+        manifest: &PoolManifest,
+    ) -> Result<(), CtfSettlementError> {
+        for entry in manifest.entries() {
+            let info = self
+                .get_keyset_info(&entry.keyset_id)
+                .ok_or(Error::UnknownKeySet)?;
+            if !info.amounts.contains(&entry.amount) {
+                return Err(SettlementError::UnsupportedDenomination.into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn require_inputs_unspent(&self, inputs: &Proofs) -> Result<(), CtfSettlementError> {
+        let input_ys = inputs.ys().map_err(Error::from)?;
+        let states = self
+            .localstore
+            .get_proofs_states(&input_ys)
+            .await
+            .map_err(Error::from)?;
+        if states.len() != input_ys.len() {
+            return Err(Error::UnknownPaymentState.into());
+        }
+        for state in states {
+            match state {
+                None | Some(State::Unspent) => {}
+                Some(State::Spent) => return Err(Error::TokenAlreadySpent.into()),
+                Some(State::Pending | State::Reserved | State::PendingSpent) => {
+                    return Err(Error::TokenPending.into());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -278,6 +385,14 @@ fn involved_keysets(request: &CtfSettlementRequest) -> BTreeSet<Id> {
         }
     }
     keysets
+}
+
+fn range_authorization_keysets(inputs: &Proofs, manifest: &PoolManifest) -> BTreeSet<Id> {
+    inputs
+        .iter()
+        .map(|proof| proof.keyset_id)
+        .chain(manifest.entries().iter().map(|entry| entry.keyset_id))
+        .collect()
 }
 
 fn validate_involved_keyset(

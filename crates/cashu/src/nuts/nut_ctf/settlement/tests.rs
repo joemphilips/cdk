@@ -727,6 +727,62 @@ fn mixed_standard_and_pool_request_validates_exact_selection() {
     );
 }
 
+#[test]
+fn standalone_range_authorization_validates_without_a_selection() {
+    let manifest = PoolManifest::new(
+        vec![
+            pool_entry(0, PoolEntryRole::Receive, 4, KEYSET_B, POINT_C),
+            pool_entry(1, PoolEntryRole::Receive, 6, KEYSET_B, POINT_D),
+            pool_entry(2, PoolEntryRole::Change, 4, KEYSET_A, POINT_E),
+            pool_entry(3, PoolEntryRole::Change, 6, KEYSET_A, POINT_A),
+        ],
+        4,
+    )
+    .expect("valid manifest");
+    let proof = Proof::new(
+        Amount::from(10),
+        Id::from_str(KEYSET_A).expect("valid keyset"),
+        condition(
+            "03",
+            &manifest.commitment().to_string(),
+            KEYSET_A,
+            &[
+                ("rate_n", "1"),
+                ("rate_d", "1"),
+                ("min_receive", "1"),
+                ("max_debit", "10"),
+            ],
+        ),
+        PublicKey::from_str(POINT_A).expect("valid point"),
+    );
+
+    let authorization =
+        validate_ctf_range_authorization(std::slice::from_ref(&proof), &manifest, limits())
+            .expect("fixed inputs and full manifest are sufficient for admission");
+    assert!(matches!(authorization.mode, PayToUnlockMode::Pool(_)));
+
+    let count_limited = CtfSettlementLimits {
+        max_inputs: 2,
+        ..limits()
+    };
+    assert_eq!(
+        validate_ctf_range_authorization(
+            &[proof.clone(), proof.clone(), proof.clone()],
+            &manifest,
+            count_limited,
+        ),
+        Err(Error::LimitExceeded("inputs"))
+    );
+    let manifest_limited = CtfSettlementLimits {
+        max_pool_entries: 2,
+        ..limits()
+    };
+    assert_eq!(
+        validate_ctf_range_authorization(std::slice::from_ref(&proof), &manifest, manifest_limited,),
+        Err(Error::LimitExceeded("pool manifest entries"))
+    );
+}
+
 fn limits() -> CtfSettlementLimits {
     CtfSettlementLimits {
         max_request_bytes: 16 * 1024,

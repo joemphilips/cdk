@@ -18,8 +18,8 @@ pub use refund::{
     verify_pay_to_unlock_refund,
 };
 pub use request::{
-    CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits, CtfSettlementParticipant,
-    CtfSettlementRequest, CtfSettlementResponse, ParticipantMode,
+    validate_ctf_range_authorization, CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits,
+    CtfSettlementParticipant, CtfSettlementRequest, CtfSettlementResponse, ParticipantMode,
 };
 pub use settings::{
     NutCtfSettlementSettings, NutCtfSettlementSettingsError, NutCtfSplitMergeSettings,
@@ -124,6 +124,9 @@ pub enum Error {
     /// A participating keyset could not be resolved.
     #[error("participating keyset is unknown")]
     UnknownKeyset,
+    /// A manifest entry amount is not published by its signing keyset.
+    #[error("pool manifest contains an unsupported denomination")]
+    UnsupportedDenomination,
     /// A settlement request arrived at or after its authorization expiry.
     #[error("settlement authorization has expired")]
     SettlementAfterExpiry,

@@ -10,6 +10,7 @@ use bip39::Mnemonic;
 use cdk_common::amount::SplitTarget;
 use cdk_common::dhke::construct_proofs;
 use cdk_common::error::{ErrorCode, ErrorResponse};
+use cdk_common::mint::Operation;
 use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::nut_ctf::settlement::{
     ctf_receive_commitment, sign_pay_to_unlock_refund, CanonicalHash, CtfSettlementParticipant,
@@ -2503,6 +2504,306 @@ async fn test_ctf_settlement_preparation_retains_exact_verified_artifacts_withou
 }
 
 #[tokio::test]
+async fn test_ctf_range_authorization_validation_is_side_effect_free() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = mixed_pool_settlement_fixture(&mint, now).await;
+    let (inputs, manifest) = range_authorization_parts(&fixture);
+    persist_test_proof_state(&mint, &inputs, State::Unspent).await;
+    let states_before = mint
+        .localstore()
+        .get_proofs_states(&inputs.ys().unwrap())
+        .await
+        .unwrap();
+    let signatures_before = mint
+        .localstore()
+        .get_blind_signatures(
+            &manifest
+                .entries()
+                .iter()
+                .map(|entry| entry.blinded_secret)
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let signing_attempts = mint.blind_sign_attempts();
+
+    let authorization = mint
+        .validate_ctf_range_authorization(
+            fixture.request.condition_id,
+            fixture.request.parent_collection_id,
+            &inputs,
+            &manifest,
+            settlement_settings(),
+            now,
+        )
+        .await
+        .expect("valid range authorization");
+
+    assert!(matches!(
+        authorization.mode,
+        cdk_common::nuts::nut_ctf::settlement::PayToUnlockMode::Pool(_)
+    ));
+    assert_eq!(
+        mint.localstore()
+            .get_proofs_states(&inputs.ys().unwrap())
+            .await
+            .unwrap(),
+        states_before
+    );
+    assert_eq!(
+        mint.localstore()
+            .get_blind_signatures(
+                &manifest
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.blinded_secret)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap(),
+        signatures_before
+    );
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+}
+
+#[tokio::test]
+async fn test_ctf_range_authorization_rejects_invalid_signature_for_unknown_y() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = mixed_pool_settlement_fixture(&mint, now).await;
+    let (mut inputs, manifest) = range_authorization_parts(&fixture);
+    let offer_keyset = inputs[0].keyset_id;
+    inputs[0].secret = settlement_pool_pay_to_unlock_secret(
+        offer_keyset,
+        manifest.commitment().to_string(),
+        now + 60,
+        99,
+    );
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&inputs.ys().unwrap())
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+
+    let result = mint
+        .validate_ctf_range_authorization(
+            fixture.request.condition_id,
+            fixture.request.parent_collection_id,
+            &inputs,
+            &manifest,
+            settlement_settings(),
+            now,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(CtfSettlementError::Mint(Error::DHKE(
+                cdk_common::dhke::Error::TokenNotVerified
+            )))
+        ),
+        "unexpected invalid-signature result: {result:?}"
+    );
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&inputs.ys().unwrap())
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+}
+
+#[tokio::test]
+async fn test_ctf_range_authorization_requires_unspent_inputs() {
+    for state in [State::Pending, State::Spent] {
+        let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+            .await
+            .unwrap();
+        let now = unix_time();
+        let fixture = mixed_pool_settlement_fixture(&mint, now).await;
+        let (inputs, manifest) = range_authorization_parts(&fixture);
+        persist_test_proof_state(&mint, &inputs, state).await;
+
+        let result = mint
+            .validate_ctf_range_authorization(
+                fixture.request.condition_id,
+                fixture.request.parent_collection_id,
+                &inputs,
+                &manifest,
+                settlement_settings(),
+                now,
+            )
+            .await;
+        match state {
+            State::Pending => {
+                assert!(matches!(
+                    result,
+                    Err(CtfSettlementError::Mint(Error::TokenPending))
+                ));
+            }
+            State::Spent => {
+                assert!(matches!(
+                    result,
+                    Err(CtfSettlementError::Mint(Error::TokenAlreadySpent))
+                ));
+            }
+            State::Unspent | State::Reserved | State::PendingSpent => {
+                unreachable!("test covers pending and spent only");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_ctf_range_authorization_rejects_keyset_lifecycle_and_denominations() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = mixed_pool_settlement_fixture(&mint, now).await;
+    let (inputs, manifest) = range_authorization_parts(&fixture);
+    let target = manifest.entries()[0].keyset_id;
+    let unsupported_amount = manifest.entries()[0].amount;
+    let original = mint.keysets.load().as_ref().clone();
+
+    rewrite_test_keyset(&mint, target, true, 0, None);
+    assert!(matches!(
+        validate_range_fixture(&mint, &fixture, &inputs, &manifest, now).await,
+        Err(CtfSettlementError::Protocol(
+            cdk_common::nuts::nut_ctf::settlement::Error::ZeroFeeKeyset
+        ))
+    ));
+
+    mint.keysets.store(Arc::new(original.clone()));
+    rewrite_test_keyset(&mint, target, false, 1, None);
+    assert!(matches!(
+        validate_range_fixture(&mint, &fixture, &inputs, &manifest, now).await,
+        Err(CtfSettlementError::Mint(Error::InactiveKeyset))
+    ));
+
+    mint.keysets.store(Arc::new(original.clone()));
+    rewrite_test_keyset(&mint, target, true, 1, Some(now - 1));
+    assert!(matches!(
+        validate_range_fixture(&mint, &fixture, &inputs, &manifest, now).await,
+        Err(CtfSettlementError::Mint(Error::ExpiredKeyset))
+    ));
+
+    mint.keysets.store(Arc::new(original.clone()));
+    rewrite_test_keyset_unit(&mint, target, CurrencyUnit::Msat);
+    assert!(matches!(
+        validate_range_fixture(&mint, &fixture, &inputs, &manifest, now).await,
+        Err(CtfSettlementError::CollateralUnitMismatch)
+    ));
+
+    mint.keysets.store(Arc::new(original.clone()));
+    remove_test_keyset_amount(&mint, target, unsupported_amount);
+    assert!(matches!(
+        validate_range_fixture(&mint, &fixture, &inputs, &manifest, now).await,
+        Err(CtfSettlementError::Protocol(
+            cdk_common::nuts::nut_ctf::settlement::Error::UnsupportedDenomination
+        ))
+    ));
+    mint.keysets.store(Arc::new(original));
+}
+
+#[tokio::test]
+async fn test_ctf_range_authorization_rejects_wrong_or_attested_condition() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = mixed_pool_settlement_fixture(&mint, now).await;
+    let (inputs, manifest) = range_authorization_parts(&fixture);
+    let (other_condition, _) =
+        register_test_condition_with_event(&mint, &["UP", "DOWN"], None, "wrong-condition-event")
+            .await;
+
+    assert!(matches!(
+        mint.validate_ctf_range_authorization(
+            CanonicalHash::parse(&other_condition, "condition_id").unwrap(),
+            fixture.request.parent_collection_id,
+            &inputs,
+            &manifest,
+            settlement_settings(),
+            now,
+        )
+        .await,
+        Err(CtfSettlementError::Mint(Error::OutputsMustUseRegularKeyset))
+    ));
+
+    assert!(mint
+        .localstore()
+        .update_condition_attestation(
+            &fixture.request.condition_id.to_string(),
+            "attested",
+            Some("YES"),
+            Some(now),
+        )
+        .await
+        .unwrap());
+    assert!(matches!(
+        validate_range_fixture(&mint, &fixture, &inputs, &manifest, now).await,
+        Err(CtfSettlementError::Mint(Error::ConvertNotPermitted))
+    ));
+}
+
+#[tokio::test]
+async fn test_ctf_range_authorization_enforces_expiry_boundaries() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = mixed_pool_settlement_fixture(&mint, now).await;
+    let (inputs, manifest) = range_authorization_parts(&fixture);
+
+    assert!(matches!(
+        validate_range_fixture(&mint, &fixture, &inputs, &manifest, now + 60).await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    let thirty_second_settings =
+        NutCtfSettlementSettings::new(8, 32, 64, 64 * 1024, 30, 32).unwrap();
+    assert!(matches!(
+        mint.validate_ctf_range_authorization(
+            fixture.request.condition_id,
+            fixture.request.parent_collection_id,
+            &inputs,
+            &manifest,
+            thirty_second_settings,
+            now,
+        )
+        .await,
+        Err(CtfSettlementError::AuthorizationBeyondKeysetExpiry)
+    ));
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_rejects_input_spent_after_range_validation() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = mixed_pool_settlement_fixture(&mint, now).await;
+    let (inputs, manifest) = range_authorization_parts(&fixture);
+    validate_range_fixture(&mint, &fixture, &inputs, &manifest, now)
+        .await
+        .expect("admission validation succeeds");
+
+    persist_test_proof_state(&mint, &inputs, State::Spent).await;
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::TokenAlreadySpent))
+    ));
+}
+
+#[tokio::test]
 async fn test_ctf_settlement_preparation_rejects_output_fee_and_keyset_lifecycle() {
     let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
         .await
@@ -3011,6 +3312,99 @@ fn rewrite_test_keyset(
         })
         .collect();
     mint.keysets.store(Arc::new(keysets));
+}
+
+fn rewrite_test_keyset_unit(mint: &Mint, id: Id, unit: CurrencyUnit) {
+    let keysets = mint
+        .keysets
+        .load()
+        .iter()
+        .cloned()
+        .map(|mut keyset| {
+            if keyset.id == id {
+                keyset.unit = unit.clone();
+            }
+            keyset
+        })
+        .collect();
+    mint.keysets.store(Arc::new(keysets));
+}
+
+fn remove_test_keyset_amount(mint: &Mint, id: Id, amount: u64) {
+    let keysets = mint
+        .keysets
+        .load()
+        .iter()
+        .cloned()
+        .map(|mut keyset| {
+            if keyset.id == id {
+                keyset.amounts.retain(|candidate| *candidate != amount);
+            }
+            keyset
+        })
+        .collect();
+    mint.keysets.store(Arc::new(keysets));
+}
+
+fn range_authorization_parts(
+    fixture: &MixedPoolSettlementFixture,
+) -> (cdk_common::Proofs, PoolManifest) {
+    let participant = &fixture.request.participants[fixture.pool_participant];
+    let manifest = match &participant.mode {
+        ParticipantMode::Pool { manifest, .. } => manifest.clone(),
+        ParticipantMode::Standard => unreachable!("fixture identifies the pool participant"),
+    };
+    (participant.inputs.clone(), manifest)
+}
+
+async fn validate_range_fixture(
+    mint: &Mint,
+    fixture: &MixedPoolSettlementFixture,
+    inputs: &cdk_common::Proofs,
+    manifest: &PoolManifest,
+    now: u64,
+) -> Result<cdk_common::nuts::nut_ctf::settlement::PayToUnlockAuthorization, CtfSettlementError> {
+    mint.validate_ctf_range_authorization(
+        fixture.request.condition_id,
+        fixture.request.parent_collection_id,
+        inputs,
+        manifest,
+        settlement_settings(),
+        now,
+    )
+    .await
+}
+
+async fn persist_test_proof_state(mint: &Mint, proofs: &cdk_common::Proofs, state: State) {
+    let mut transaction = mint.localstore().begin_transaction().await.unwrap();
+    let mut acquired = transaction
+        .add_proofs(
+            proofs.clone(),
+            None,
+            &Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO),
+        )
+        .await
+        .unwrap();
+    match state {
+        State::Unspent => {}
+        State::Pending => {
+            Mint::update_proofs_state(&mut transaction, &mut acquired, State::Pending)
+                .await
+                .unwrap();
+        }
+        State::Spent => {
+            Mint::update_proofs_state(&mut transaction, &mut acquired, State::Pending)
+                .await
+                .unwrap();
+            Mint::update_proofs_state(&mut transaction, &mut acquired, State::Spent)
+                .await
+                .unwrap();
+        }
+        State::Reserved | State::PendingSpent => {
+            unreachable!("test helper supports persisted mint proof states only");
+        }
+    }
+    transaction.commit().await.unwrap();
 }
 
 /// Test that zero-fee split-as-convert is rejected.
