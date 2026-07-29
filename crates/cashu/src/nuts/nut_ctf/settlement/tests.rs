@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use serde_json::{json, Value};
 
 use super::*;
@@ -17,6 +18,9 @@ const POINT_C: &str = "03a40f20667ed53513075dc51e715ff2046cad64eb68960632269ba7f
 const POINT_D: &str = "03fd4ce5a16b65576145949e6f99f445f8249fee17c606b688b504a849cdc452de";
 const POINT_E: &str = "02648eccfa4c026960966276fa5a4cae46ce0fd432211a4f449bf84f13aa5f8303";
 const REFUND_KEY: &str = "194603ffa36356f4a56b7df9371fc3192472351453ec7398b8da8117e7c3e104";
+const COORDINATOR_KEY: &str = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+const OTHER_COORDINATOR_KEY: &str =
+    "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13";
 
 #[test]
 fn receive_commitment_has_stable_ctf_vector() {
@@ -57,6 +61,45 @@ fn condition_parser_accepts_reduced_pool_policy() {
             max_debit: 100,
         })
     ));
+}
+
+#[test]
+fn condition_parser_accepts_optional_coordinator_key_in_standard_and_pool_modes() {
+    let standard = condition(
+        "08",
+        &"88".repeat(32),
+        KEYSET_A,
+        &[("coordinator_pubkey", COORDINATOR_KEY)],
+    );
+    assert_eq!(
+        PayToUnlockCondition::parse(&standard)
+            .expect("coordinator-bound standard condition")
+            .coordinator_pubkey
+            .expect("coordinator key")
+            .to_string(),
+        COORDINATOR_KEY
+    );
+
+    let pool = condition(
+        "09",
+        &"99".repeat(32),
+        KEYSET_A,
+        &[
+            ("rate_n", "5"),
+            ("rate_d", "3"),
+            ("min_receive", "1"),
+            ("max_debit", "100"),
+            ("coordinator_pubkey", COORDINATOR_KEY),
+        ],
+    );
+    assert_eq!(
+        PayToUnlockCondition::parse(&pool)
+            .expect("coordinator-bound pool condition")
+            .coordinator_pubkey
+            .expect("coordinator key")
+            .to_string(),
+        COORDINATOR_KEY
+    );
 }
 
 #[test]
@@ -495,6 +538,173 @@ fn settlement_request_digest_has_stable_binary_id_vector() {
 }
 
 #[test]
+fn coordinator_digest_and_signature_have_stable_vectors() {
+    let mut request = valid_standard_request();
+    bind_participant(&mut request.participants[0], COORDINATOR_KEY);
+    sign_request(&mut request, [0; 32]);
+
+    assert_eq!(
+        request
+            .coordinator_digest()
+            .expect("canonical coordinator digest")
+            .to_string(),
+        "36f97a2f4c9729822f03e2d37722564efd31fa3accb5419d996b22dc64a27d91"
+    );
+    assert_eq!(
+        request
+            .coordinator_sig
+            .expect("coordinator signature")
+            .to_string(),
+        "9e88f34f2c98e02771b16c132785cfa20944909d6305e1343169cf445c49692534173186514fbb6c91892373ea07371f3c9659306f166667f4d0344416c09380"
+    );
+    request
+        .verify_coordinator_authentication()
+        .expect("stable vector authenticates");
+}
+
+#[test]
+fn coordinator_auth_accepts_mixed_bound_and_unbound_but_rejects_conflicting_keys() {
+    let mut mixed = valid_standard_request();
+    bind_participant(&mut mixed.participants[0], COORDINATOR_KEY);
+    sign_request(&mut mixed, [1; 32]);
+    mixed
+        .verify_coordinator_authentication()
+        .expect("generic CDK accepts mixed bound and unbound participants");
+
+    let mut conflicting = valid_standard_request();
+    bind_participant(&mut conflicting.participants[0], COORDINATOR_KEY);
+    bind_participant(&mut conflicting.participants[1], OTHER_COORDINATOR_KEY);
+    sign_request(&mut conflicting, [2; 32]);
+    assert_eq!(
+        conflicting.verify_coordinator_authentication(),
+        Err(Error::CoordinatorAuthentication)
+    );
+}
+
+#[test]
+fn coordinator_auth_rejects_missing_unexpected_and_noncanonical_authority() {
+    let mut missing_signature = valid_standard_request();
+    bind_participant(&mut missing_signature.participants[0], COORDINATOR_KEY);
+    assert_eq!(
+        missing_signature.verify_coordinator_authentication(),
+        Err(Error::CoordinatorAuthentication)
+    );
+
+    let mut unexpected_signature = valid_standard_request();
+    sign_request(&mut unexpected_signature, [4; 32]);
+    assert_eq!(
+        unexpected_signature.verify_coordinator_authentication(),
+        Err(Error::CoordinatorAuthentication)
+    );
+
+    for malformed in [COORDINATOR_KEY.to_uppercase(), "00".repeat(32)] {
+        let mut request = valid_standard_request();
+        bind_participant(&mut request.participants[0], &malformed);
+        assert_eq!(
+            request.verify_coordinator_authentication(),
+            Err(Error::CoordinatorAuthentication)
+        );
+        assert_eq!(
+            request.validate(limits()),
+            Err(Error::CoordinatorAuthentication)
+        );
+    }
+}
+
+#[test]
+fn pool_coordinator_digest_authenticates_and_commits_to_all_request_fields() {
+    let mut request = valid_mixed_pool_request();
+    bind_participant(&mut request.participants[1], COORDINATOR_KEY);
+    sign_request(&mut request, [5; 32]);
+
+    assert_eq!(
+        request
+            .coordinator_digest()
+            .expect("pool coordinator digest")
+            .to_string(),
+        "08f81f67d68ba9cd0b8c50876e86d14a12a24d9afc3835fb6eaf3f5b612aa64f"
+    );
+    request
+        .verify_coordinator_authentication()
+        .expect("pool request authenticates");
+
+    let mut mutations = Vec::new();
+    let mut condition = request.clone();
+    condition.condition_id = CanonicalHash::from_bytes([0x22; 32]);
+    mutations.push(condition);
+    let mut parent = request.clone();
+    parent.parent_collection_id = CanonicalHash::from_bytes([0x33; 32]);
+    mutations.push(parent);
+    let mut participant = request.clone();
+    participant.participants[0].outputs[0].amount += Amount::ONE;
+    mutations.push(participant);
+    let mut selection = request.clone();
+    if let ParticipantMode::Pool { selection, .. } = &mut selection.participants[1].mode {
+        *selection = SelectionBitmap::parse("07", 4).expect("different canonical selection");
+    }
+    mutations.push(selection);
+    let mut manifest = request.clone();
+    if let ParticipantMode::Pool {
+        manifest: pool_manifest,
+        ..
+    } = &mut manifest.participants[1].mode
+    {
+        let mut entries = pool_manifest.entries().to_vec();
+        entries[0].amount += 1;
+        *pool_manifest = PoolManifest::new(entries, 8).expect("different canonical manifest");
+    }
+    mutations.push(manifest);
+
+    for mutation in mutations {
+        assert_eq!(
+            mutation.verify_coordinator_authentication(),
+            Err(Error::CoordinatorAuthentication)
+        );
+    }
+}
+
+#[test]
+fn coordinator_precheck_is_auth_only_while_validate_remains_complete() {
+    let mut request = valid_standard_request();
+    bind_participant(&mut request.participants[0], COORDINATOR_KEY);
+    request.participants[0].outputs[0].amount += Amount::ONE;
+    sign_request(&mut request, [6; 32]);
+
+    request
+        .verify_coordinator_authentication()
+        .expect("auth-only precheck accepts a correctly signed request");
+    assert_eq!(
+        request.validate(limits()),
+        Err(Error::OutputCommitmentMismatch)
+    );
+}
+
+#[test]
+fn coordinator_signature_is_strict_and_signature_independent_of_request_digest() {
+    let mut request = valid_standard_request();
+    bind_participant(&mut request.participants[0], COORDINATOR_KEY);
+    let digest = request.request_digest().expect("request digest");
+    sign_request(&mut request, [3; 32]);
+    assert_eq!(
+        request.request_digest().expect("signed request digest"),
+        digest
+    );
+
+    let mut wire = serde_json::to_value(&request).expect("request wire");
+    wire["coordinator_sig"] = Value::String(
+        request
+            .coordinator_sig
+            .expect("coordinator signature")
+            .to_string()
+            .to_uppercase(),
+    );
+    assert_eq!(
+        CtfSettlementRequest::decode(&serde_json::to_vec(&wire).expect("request bytes"), limits()),
+        Err(Error::CoordinatorAuthentication)
+    );
+}
+
+#[test]
 fn participant_authorization_excludes_only_proof_nonce() {
     let mut request = valid_standard_request();
     let (commitment, offer_keyset, expected) = {
@@ -656,48 +866,7 @@ fn nut06_rejects_multi_party_when_legacy_convert_is_disabled() {
 
 #[test]
 fn mixed_standard_and_pool_request_validates_exact_selection() {
-    let standard = standard_participant(KEYSET_B, KEYSET_A, POINT_B, POINT_B, 6, 6, "02");
-    let entries = vec![
-        pool_entry(0, PoolEntryRole::Receive, 4, KEYSET_B, POINT_C),
-        pool_entry(1, PoolEntryRole::Receive, 6, KEYSET_B, POINT_D),
-        pool_entry(2, PoolEntryRole::Change, 4, KEYSET_A, POINT_E),
-        pool_entry(3, PoolEntryRole::Change, 6, KEYSET_A, POINT_A),
-    ];
-    let manifest = PoolManifest::new(entries, 8).expect("valid manifest");
-    let selection = SelectionBitmap::parse("06", 4).expect("valid selection");
-    let selected_outputs = vec![output(6, KEYSET_B, POINT_D), output(4, KEYSET_A, POINT_E)];
-    manifest
-        .validate_selection(&selection, &selected_outputs)
-        .expect("outputs exactly match selected entries");
-    let pool_proof = Proof::new(
-        Amount::from(10),
-        Id::from_str(KEYSET_A).expect("valid keyset"),
-        condition(
-            "03",
-            &manifest.commitment().to_string(),
-            KEYSET_A,
-            &[
-                ("rate_n", "1"),
-                ("rate_d", "1"),
-                ("min_receive", "6"),
-                ("max_debit", "6"),
-            ],
-        ),
-        PublicKey::from_str(POINT_A).expect("valid point"),
-    );
-    let pool = CtfSettlementParticipant {
-        inputs: vec![pool_proof],
-        outputs: selected_outputs,
-        mode: ParticipantMode::Pool {
-            manifest,
-            selection,
-        },
-    };
-    let request = CtfSettlementRequest {
-        condition_id: CanonicalHash::parse(&"11".repeat(32), "condition_id").expect("valid hash"),
-        parent_collection_id: CanonicalHash::from_bytes([0; 32]),
-        participants: vec![standard, pool],
-    };
+    let request = valid_mixed_pool_request();
 
     request
         .validate(CtfSettlementLimits {
@@ -806,7 +975,79 @@ fn valid_standard_request() -> CtfSettlementRequest {
         condition_id: CanonicalHash::parse(&"11".repeat(32), "condition_id").expect("valid hash"),
         parent_collection_id: CanonicalHash::from_bytes([0; 32]),
         participants: vec![participant_b, participant_a],
+        coordinator_sig: None,
     }
+}
+
+fn valid_mixed_pool_request() -> CtfSettlementRequest {
+    let standard = standard_participant(KEYSET_B, KEYSET_A, POINT_B, POINT_B, 6, 6, "02");
+    let entries = vec![
+        pool_entry(0, PoolEntryRole::Receive, 4, KEYSET_B, POINT_C),
+        pool_entry(1, PoolEntryRole::Receive, 6, KEYSET_B, POINT_D),
+        pool_entry(2, PoolEntryRole::Change, 4, KEYSET_A, POINT_E),
+        pool_entry(3, PoolEntryRole::Change, 6, KEYSET_A, POINT_A),
+    ];
+    let manifest = PoolManifest::new(entries, 8).expect("valid manifest");
+    let selection = SelectionBitmap::parse("06", 4).expect("valid selection");
+    let selected_outputs = vec![output(6, KEYSET_B, POINT_D), output(4, KEYSET_A, POINT_E)];
+    manifest
+        .validate_selection(&selection, &selected_outputs)
+        .expect("outputs exactly match selected entries");
+    let pool_proof = Proof::new(
+        Amount::from(10),
+        Id::from_str(KEYSET_A).expect("valid keyset"),
+        condition(
+            "03",
+            &manifest.commitment().to_string(),
+            KEYSET_A,
+            &[
+                ("rate_n", "1"),
+                ("rate_d", "1"),
+                ("min_receive", "6"),
+                ("max_debit", "6"),
+            ],
+        ),
+        PublicKey::from_str(POINT_A).expect("valid point"),
+    );
+    let pool = CtfSettlementParticipant {
+        inputs: vec![pool_proof],
+        outputs: selected_outputs,
+        mode: ParticipantMode::Pool {
+            manifest,
+            selection,
+        },
+    };
+    CtfSettlementRequest {
+        condition_id: CanonicalHash::parse(&"11".repeat(32), "condition_id").expect("valid hash"),
+        parent_collection_id: CanonicalHash::from_bytes([0; 32]),
+        participants: vec![standard, pool],
+        coordinator_sig: None,
+    }
+}
+
+fn bind_participant(participant: &mut CtfSettlementParticipant, coordinator_key: &str) {
+    for proof in &mut participant.inputs {
+        let mut condition: Value =
+            serde_json::from_slice(proof.secret.as_bytes()).expect("condition JSON");
+        condition[1]["tags"]
+            .as_array_mut()
+            .expect("condition tags")
+            .push(json!(["coordinator_pubkey", coordinator_key]));
+        proof.secret = Secret::new(condition.to_string());
+    }
+}
+
+fn sign_request(request: &mut CtfSettlementRequest, aux_rand: [u8; 32]) {
+    let secp = Secp256k1::new();
+    let mut secret_bytes = [0; 32];
+    secret_bytes[31] = 3;
+    let secret_key = SecretKey::from_slice(&secret_bytes).expect("coordinator secret");
+    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    let digest = request
+        .coordinator_digest()
+        .expect("canonical coordinator digest");
+    let message = Message::from_digest(digest.to_bytes());
+    request.coordinator_sig = Some(secp.sign_schnorr_with_aux_rand(&message, &keypair, &aux_rand));
 }
 
 fn standard_participant(

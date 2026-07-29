@@ -67,6 +67,9 @@ pub enum Error {
     /// A PAY_TO_UNLOCK tag is not defined by CTF settlement.
     #[error("unknown PAY_TO_UNLOCK tag")]
     UnknownTag,
+    /// Coordinator binding or BIP-340 request authentication failed.
+    #[error("invalid coordinator authentication")]
+    CoordinatorAuthentication,
     /// Standard and pool tags were mixed.
     #[error("pool tags must be all present or all absent")]
     PartialPoolTags,

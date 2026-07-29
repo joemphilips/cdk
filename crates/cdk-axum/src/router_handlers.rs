@@ -1387,6 +1387,7 @@ fn ctf_settlement_error_response(error: cdk::nuts::nut_ctf::settlement::Error) -
         SettlementError::InvalidPoolPolicy(_) | SettlementError::ArithmeticOverflow => {
             ErrorCode::Unknown(15014)
         }
+        SettlementError::CoordinatorAuthentication => ErrorCode::Unknown(15015),
         SettlementError::SettlementAfterExpiry => ErrorCode::SettlementAfterExpiry,
         SettlementError::RefundBeforeExpiry => ErrorCode::RefundBeforeExpiry,
         SettlementError::RefundWitnessMissingOrInvalid => ErrorCode::RefundWitnessMissingOrInvalid,
@@ -1801,6 +1802,10 @@ mod ctf_convert_admission_tests {
                 ErrorCode::Unknown(15013),
             ),
             (
+                SettlementError::CoordinatorAuthentication,
+                ErrorCode::Unknown(15015),
+            ),
+            (
                 SettlementError::ZeroFeeKeyset,
                 ErrorCode::PayToUnlockInvalidCondition,
             ),
@@ -1809,6 +1814,89 @@ mod ctf_convert_admission_tests {
         for (failure, expected) in cases {
             let error = decode_error(ctf_settlement_error_response(failure)).await;
             assert_eq!(error.code, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_coordinator_signature_uses_15015() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "condition_id": "11".repeat(32),
+            "participants": [
+                {"inputs": [], "outputs": []},
+                {"inputs": [], "outputs": []}
+            ],
+            "coordinator_sig": "AA".repeat(64)
+        }))
+        .expect("request bytes");
+        let error = cdk::nuts::nut_ctf::settlement::CtfSettlementRequest::decode(
+            &payload,
+            UNADVERTISED_MULTI_PARTY_LIMITS,
+        )
+        .expect_err("uppercase signature must be rejected");
+
+        assert_eq!(
+            decode_error(ctf_settlement_error_response(error))
+                .await
+                .code,
+            ErrorCode::Unknown(15015)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_coordinator_public_key_uses_15015() {
+        const KEYSET: &str = "00deadbeef123456";
+        const PROOF_POINT: &str =
+            "02194603ffa36356f4a56b7df9371fc3192472351453ec7398b8da8117e7c3e104";
+        const REFUND_KEY: &str = "194603ffa36356f4a56b7df9371fc3192472351453ec7398b8da8117e7c3e104";
+        const COORDINATOR_KEY: &str =
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+
+        for malformed in [COORDINATOR_KEY.to_uppercase(), "00".repeat(32)] {
+            let secret = serde_json::json!([
+                "PAY_TO_UNLOCK",
+                {
+                    "nonce": "01".repeat(32),
+                    "data": "02".repeat(32),
+                    "tags": [
+                        ["offer_keyset", KEYSET],
+                        ["expiry", "100"],
+                        ["refund", REFUND_KEY],
+                        ["coordinator_pubkey", malformed]
+                    ]
+                }
+            ])
+            .to_string();
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "condition_id": "11".repeat(32),
+                "participants": [
+                    {
+                        "inputs": [{
+                            "amount": 1,
+                            "id": KEYSET,
+                            "secret": secret,
+                            "C": PROOF_POINT
+                        }],
+                        "outputs": []
+                    },
+                    {"inputs": [], "outputs": []}
+                ]
+            }))
+            .expect("request bytes");
+            let request = cdk::nuts::nut_ctf::settlement::CtfSettlementRequest::decode(
+                &payload,
+                UNADVERTISED_MULTI_PARTY_LIMITS,
+            )
+            .expect("typed request");
+            let error = request
+                .verify_coordinator_authentication()
+                .expect_err("malformed coordinator key must be rejected");
+
+            assert_eq!(
+                decode_error(ctf_settlement_error_response(error))
+                    .await
+                    .code,
+                ErrorCode::Unknown(15015)
+            );
         }
     }
 

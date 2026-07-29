@@ -11,6 +11,7 @@ use crate::nuts::nut_ctf::tagged_hash;
 pub(crate) const CTF_RECEIVE_DOMAIN: &str = "Cashu/ctf/convert/recv";
 pub(crate) const CTF_MANIFEST_DOMAIN: &str = "Cashu/ctf/convert/manifest";
 pub(crate) const CTF_REQUEST_DOMAIN: &str = "Cashu/ctf/convert/request";
+pub(crate) const CTF_COORDINATOR_DOMAIN: &str = "Cashu/ctf/convert/coordinator";
 
 /// A canonical lowercase 32-byte hexadecimal value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

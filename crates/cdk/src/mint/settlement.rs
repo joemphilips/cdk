@@ -115,6 +115,7 @@ impl Mint {
         settings: NutCtfSettlementSettings,
         now: u64,
     ) -> Result<CtfSettlementResponse, CtfSettlementError> {
+        request.verify_coordinator_authentication()?;
         let request_digest = request.request_digest()?;
         if let Some(response) = self
             .localstore
