@@ -109,6 +109,10 @@ impl Settings {
         self.signatory = Some(self.signatory.clone().unwrap_or_default().from_env());
 
         self.mint_info = self.mint_info.clone().from_env();
+        #[cfg(feature = "conditional-tokens")]
+        if let Some(settlement) = ctf_settlement_from_env()? {
+            self.mint_info.ctf_settlement = Some(settlement);
+        }
         // CDK_MINTD_PAYMENT_BACKEND_* env vars only apply when there is exactly
         // one configured payment backend entry. Multi-backend setups must
         // choose units and backends in the config file so env overrides do not
