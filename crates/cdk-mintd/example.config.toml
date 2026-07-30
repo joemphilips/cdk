@@ -84,6 +84,14 @@ tti = 60
 # unit = "usd"
 # registration_fee_base = 10
 # registration_fee_per_keyset = 10
+#
+# [mint_info.ctf_settlement]
+# max_participants = 32
+# max_inputs = 512
+# max_outputs = 512
+# max_request_bytes = 1048576
+# max_expiry_seconds = 86400
+# max_pool_entries = 128
 
 
 [database]

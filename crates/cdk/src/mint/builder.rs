@@ -22,7 +22,10 @@ use crate::amount::Amount;
 use crate::cdk_database;
 use crate::mint::Mint;
 #[cfg(feature = "conditional-tokens")]
-use crate::nuts::nut_ctf::{RegistrationFeeSetting, MAX_OUTCOMES};
+use crate::nuts::nut_ctf::{
+    NutCtfSettlementSettings, NutCtfSettlementSettingsError, NutCtfSplitMergeSettings,
+    RegistrationFeeSetting, MAX_OUTCOMES,
+};
 use crate::nuts::{
     AuthRequired, ContactInfo, CurrencyUnit, MeltMethodSettings, MintInfo, MintMethodSettings,
     MintVersion, MppMethodSettings, PaymentMethod, ProtectedEndpoint,
@@ -356,6 +359,17 @@ impl MintBuilder {
         settings.registration_fees = fees;
         self.mint_info.nuts.nut_ctf = Some(settings);
         self
+    }
+
+    /// Advertise validated multi-party conditional-token settlement settings.
+    #[cfg(feature = "conditional-tokens")]
+    pub fn with_ctf_settlement_settings(
+        mut self,
+        settings: NutCtfSettlementSettings,
+    ) -> Result<Self, NutCtfSettlementSettingsError> {
+        self.mint_info.nuts.nut_ctf_split_merge =
+            Some(NutCtfSplitMergeSettings::single_party(true).with_multi_party(settings)?);
+        Ok(self)
     }
 
     /// Set batch minting settings (NUT-29)
@@ -981,6 +995,33 @@ mod tests {
             mint_info.nuts.nut29.is_empty(),
             "NUT-29 should have empty settings by default"
         );
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn ctf_settlement_settings_are_advertised_with_validated_limits() {
+        let localstore = Arc::new(memory::empty().await.expect("mint db"));
+        let settlement = NutCtfSettlementSettings::new(32, 512, 512, 1_048_576, 86_400, 128)
+            .expect("settlement settings");
+        let builder = MintBuilder::new(localstore)
+            .with_ctf_settlement_settings(settlement)
+            .expect("settlement advertisement");
+
+        let advertised = builder
+            .current_mint_info()
+            .nuts
+            .nut_ctf_split_merge
+            .expect("split/merge settings")
+            .multi_party()
+            .expect("multi-party settings");
+        let limits = advertised.structural_limits().expect("structural limits");
+
+        assert_eq!(limits.max_participants, 32);
+        assert_eq!(limits.max_inputs, 512);
+        assert_eq!(limits.max_outputs, 512);
+        assert_eq!(limits.max_request_bytes, 1_048_576);
+        assert_eq!(limits.max_pool_entries, 128);
+        assert_eq!(advertised.max_expiry_seconds(), 86_400);
     }
 
     #[tokio::test]

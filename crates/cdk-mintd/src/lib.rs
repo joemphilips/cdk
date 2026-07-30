@@ -29,7 +29,7 @@ use cdk::nuts::nut00::KnownMethod;
 use cdk::nuts::nut17::SupportedMethods;
 use cdk::nuts::nut19::{CachedEndpoint, Method as NUT19Method, Path as NUT19Path};
 #[cfg(feature = "conditional-tokens")]
-use cdk::nuts::nut_ctf::RegistrationFeeSetting;
+use cdk::nuts::nut_ctf::{NutCtfSettlementSettings, RegistrationFeeSetting};
 use cdk::nuts::CurrencyUnit;
 use cdk::nuts::{
     AuthRequired, ContactInfo, Method, MintVersion, PaymentMethod, ProtectedEndpoint, RoutePath,
@@ -780,7 +780,7 @@ async fn configure_mint_builder(
         .map_err(anyhow::Error::msg)?;
 
     // Configure basic mint information
-    let mint_builder = configure_basic_info(settings, mint_builder);
+    let mint_builder = configure_basic_info(settings, mint_builder)?;
 
     // Check that fake wallet is not used on mainnet
     #[cfg(feature = "fakewallet")]
@@ -852,7 +852,10 @@ async fn configure_mint_builder(
 }
 
 /// Configures basic mint information (name, contact info, descriptions, etc.)
-fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) -> MintBuilder {
+fn configure_basic_info(
+    settings: &config::Settings,
+    mint_builder: MintBuilder,
+) -> Result<MintBuilder> {
     // Add contact information
     let mut contacts = Vec::new();
     if let Some(nostr_key) = &settings.mint_info.contact_nostr_public_key {
@@ -936,10 +939,25 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
             .collect();
         builder = builder.with_ctf_registration_fees(fees);
     }
+    #[cfg(feature = "conditional-tokens")]
+    if let Some(settlement) = &settings.mint_info.ctf_settlement {
+        let settlement = NutCtfSettlementSettings::new(
+            settlement.max_participants,
+            settlement.max_inputs,
+            settlement.max_outputs,
+            settlement.max_request_bytes,
+            settlement.max_expiry_seconds,
+            settlement.max_pool_entries,
+        )
+        .map_err(anyhow::Error::msg)?;
+        builder = builder
+            .with_ctf_settlement_settings(settlement)
+            .map_err(anyhow::Error::msg)?;
+    }
 
     builder = builder.with_keyset_v2(settings.info.use_keyset_v2);
 
-    builder
+    Ok(builder)
 }
 /// Configures Lightning Network backend based on the specified backend type
 async fn configure_lightning_backend(

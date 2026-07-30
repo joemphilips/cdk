@@ -2,9 +2,11 @@
 
 use std::env;
 
-#[cfg(feature = "conditional-tokens")]
-use crate::config::CtfRegistrationFeeConfig;
+use anyhow::{anyhow, bail, Context, Result};
+
 use crate::config::MintInfo;
+#[cfg(feature = "conditional-tokens")]
+use crate::config::{CtfRegistrationFeeConfig, CtfSettlementConfig};
 
 // MintInfo environment variables
 pub const ENV_MINT_NAME: &str = "CDK_MINTD_MINT_NAME";
@@ -29,6 +31,22 @@ pub const ENV_MINT_CTF_REGISTRATION_FEE_USD_BASE: &str = "CDK_MINTD_CTF_REGISTRA
 #[cfg(feature = "conditional-tokens")]
 pub const ENV_MINT_CTF_REGISTRATION_FEE_USD_PER_KEYSET: &str =
     "CDK_MINTD_CTF_REGISTRATION_FEE_USD_PER_KEYSET";
+#[cfg(feature = "conditional-tokens")]
+pub const ENV_MINT_CTF_SETTLEMENT_MAX_PARTICIPANTS: &str =
+    "CDK_MINTD_CTF_SETTLEMENT_MAX_PARTICIPANTS";
+#[cfg(feature = "conditional-tokens")]
+pub const ENV_MINT_CTF_SETTLEMENT_MAX_INPUTS: &str = "CDK_MINTD_CTF_SETTLEMENT_MAX_INPUTS";
+#[cfg(feature = "conditional-tokens")]
+pub const ENV_MINT_CTF_SETTLEMENT_MAX_OUTPUTS: &str = "CDK_MINTD_CTF_SETTLEMENT_MAX_OUTPUTS";
+#[cfg(feature = "conditional-tokens")]
+pub const ENV_MINT_CTF_SETTLEMENT_MAX_REQUEST_BYTES: &str =
+    "CDK_MINTD_CTF_SETTLEMENT_MAX_REQUEST_BYTES";
+#[cfg(feature = "conditional-tokens")]
+pub const ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS: &str =
+    "CDK_MINTD_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS";
+#[cfg(feature = "conditional-tokens")]
+pub const ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES: &str =
+    "CDK_MINTD_CTF_SETTLEMENT_MAX_POOL_ENTRIES";
 
 #[cfg(feature = "conditional-tokens")]
 fn registration_fee_from_env(
@@ -51,6 +69,66 @@ fn registration_fee_from_env(
             "CTF registration fee for unit '{unit}': both {base_env} and {per_keyset_env} must be set"
         ),
         (None, None) => None,
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+pub(crate) fn ctf_settlement_from_env() -> Result<Option<CtfSettlementConfig>> {
+    let fields = [
+        (
+            ENV_MINT_CTF_SETTLEMENT_MAX_PARTICIPANTS,
+            read_optional_env(ENV_MINT_CTF_SETTLEMENT_MAX_PARTICIPANTS)?,
+        ),
+        (
+            ENV_MINT_CTF_SETTLEMENT_MAX_INPUTS,
+            read_optional_env(ENV_MINT_CTF_SETTLEMENT_MAX_INPUTS)?,
+        ),
+        (
+            ENV_MINT_CTF_SETTLEMENT_MAX_OUTPUTS,
+            read_optional_env(ENV_MINT_CTF_SETTLEMENT_MAX_OUTPUTS)?,
+        ),
+        (
+            ENV_MINT_CTF_SETTLEMENT_MAX_REQUEST_BYTES,
+            read_optional_env(ENV_MINT_CTF_SETTLEMENT_MAX_REQUEST_BYTES)?,
+        ),
+        (
+            ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS,
+            read_optional_env(ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS)?,
+        ),
+        (
+            ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES,
+            read_optional_env(ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES)?,
+        ),
+    ];
+    if fields.iter().all(|(_, value)| value.is_none()) {
+        return Ok(None);
+    }
+
+    let parse = |index: usize| -> Result<u64> {
+        let (name, value) = &fields[index];
+        value
+            .as_deref()
+            .ok_or_else(|| anyhow!("{name} must be set with every CTF settlement limit"))?
+            .parse()
+            .with_context(|| format!("{name} must be an unsigned integer"))
+    };
+
+    Ok(Some(CtfSettlementConfig {
+        max_participants: parse(0)?,
+        max_inputs: parse(1)?,
+        max_outputs: parse(2)?,
+        max_request_bytes: parse(3)?,
+        max_expiry_seconds: parse(4)?,
+        max_pool_entries: parse(5)?,
+    }))
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn read_optional_env(name: &str) -> Result<Option<String>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => bail!("{name} must be valid Unicode"),
     }
 }
 
@@ -137,6 +215,15 @@ mod tests {
         env::remove_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_PER_KEYSET);
         env::remove_var(ENV_MINT_CTF_REGISTRATION_FEE_USD_BASE);
         env::remove_var(ENV_MINT_CTF_REGISTRATION_FEE_USD_PER_KEYSET);
+    }
+
+    fn clear_settlement_env() {
+        env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_PARTICIPANTS);
+        env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_INPUTS);
+        env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_OUTPUTS);
+        env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_REQUEST_BYTES);
+        env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS);
+        env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES);
     }
 
     #[test]
@@ -226,5 +313,37 @@ mod tests {
         clear_registration_fee_env();
         assert!(fee.is_none());
         assert!(mint_info.ctf_registration_fees.is_none());
+    }
+
+    #[test]
+    fn ctf_settlement_env_requires_every_limit() {
+        let _guard = crate::test_utils::env_lock();
+        clear_settlement_env();
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_PARTICIPANTS, "32");
+
+        let result = ctf_settlement_from_env();
+
+        clear_settlement_env();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ctf_settlement_env_parses_complete_limits() {
+        let _guard = crate::test_utils::env_lock();
+        clear_settlement_env();
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_PARTICIPANTS, "32");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_INPUTS, "512");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_OUTPUTS, "512");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_REQUEST_BYTES, "1048576");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS, "86400");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES, "128");
+
+        let settlement = ctf_settlement_from_env()
+            .expect("settlement env")
+            .expect("configured settlement");
+
+        clear_settlement_env();
+        assert_eq!(settlement.max_inputs, 512);
+        assert_eq!(settlement.max_expiry_seconds, 86_400);
     }
 }

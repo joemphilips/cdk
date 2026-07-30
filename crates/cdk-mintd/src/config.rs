@@ -1201,6 +1201,9 @@ pub struct MintInfo {
     /// NUT-CTF per-unit registration fee policy.
     #[cfg(feature = "conditional-tokens")]
     pub ctf_registration_fees: Option<Vec<CtfRegistrationFeeConfig>>,
+    /// NUT-CTF multi-party settlement limits advertised through NUT-06.
+    #[cfg(feature = "conditional-tokens")]
+    pub ctf_settlement: Option<CtfSettlementConfig>,
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -1215,6 +1218,24 @@ pub struct CtfRegistrationFeeConfig {
     /// Additional registration fee per created keyset.
     #[serde(rename = "registration_fee_per_keyset")]
     pub per_keyset: u64,
+}
+
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CtfSettlementConfig {
+    /// Maximum participants in one settlement request.
+    pub max_participants: u64,
+    /// Maximum proofs consumed by one settlement request.
+    pub max_inputs: u64,
+    /// Maximum blinded outputs created by one settlement request.
+    pub max_outputs: u64,
+    /// Maximum serialized request size.
+    pub max_request_bytes: u64,
+    /// Maximum PAY_TO_UNLOCK authorization lifetime.
+    pub max_expiry_seconds: u64,
+    /// Maximum manifest entries for one pool participant.
+    pub max_pool_entries: u64,
 }
 
 #[cfg(feature = "management-rpc")]
@@ -1446,6 +1467,69 @@ registration_fee_per_keyset = 10000
             result.is_err(),
             "load_settings must propagate partial CTF registration fee config errors"
         );
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn ctf_settlement_config_requires_every_limit() {
+        let config_content = r#"
+[mint_info.ctf_settlement]
+max_participants = 32
+max_inputs = 512
+max_outputs = 512
+max_request_bytes = 1048576
+max_expiry_seconds = 86400
+"#;
+
+        let config = Config::builder()
+            .add_source(
+                Config::try_from(&Settings::default()).expect("default config should build"),
+            )
+            .add_source(config::File::from_str(
+                config_content,
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config source should build");
+
+        assert!(
+            config.try_deserialize::<Settings>().is_err(),
+            "partial settlement config must be rejected"
+        );
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn complete_ctf_settlement_config_deserializes() {
+        let config_content = r#"
+[mint_info.ctf_settlement]
+max_participants = 32
+max_inputs = 512
+max_outputs = 512
+max_request_bytes = 1048576
+max_expiry_seconds = 86400
+max_pool_entries = 128
+"#;
+
+        let settings = Config::builder()
+            .add_source(
+                Config::try_from(&Settings::default()).expect("default config should build"),
+            )
+            .add_source(config::File::from_str(
+                config_content,
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config source should build")
+            .try_deserialize::<Settings>()
+            .expect("complete settlement config should deserialize");
+
+        let settlement = settings
+            .mint_info
+            .ctf_settlement
+            .expect("settlement config");
+        assert_eq!(settlement.max_participants, 32);
+        assert_eq!(settlement.max_pool_entries, 128);
     }
 
     #[test]
