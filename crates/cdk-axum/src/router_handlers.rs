@@ -1291,7 +1291,7 @@ async fn process_single_party_ctf_convert(
     state: &MintState,
     payload: &[u8],
 ) -> Result<Response, Response> {
-    let Json(payload) = Json::<cdk::nuts::nut_ctf::CtfConvertRequest>::from_bytes(&payload)
+    let Json(payload) = Json::<cdk::nuts::nut_ctf::CtfConvertRequest>::from_bytes(payload)
         .map_err(|error| error.into_response())?;
     let response = state
         .mint
@@ -1413,6 +1413,9 @@ fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError)
             SettlementError::InvalidCondition("authorization exceeds refundable keyset lifetime"),
         ),
         CtfSettlementError::CollateralUnitMismatch => into_response(cdk::Error::UnitMismatch),
+        CtfSettlementError::Mint(cdk::Error::NUT11(_) | cdk::Error::NUT14(_)) => {
+            individual_condition_witness_error_response()
+        }
         CtfSettlementError::Mint(error) => into_response(error),
         CtfSettlementError::Settings(error) => {
             tracing::error!("Invalid multi-party CTF settings: {error}");
@@ -1424,6 +1427,18 @@ fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError)
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn individual_condition_witness_error_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            ErrorCode::WitnessMissingOrInvalid,
+            "individual condition witness is invalid".to_string(),
+        )),
+    )
+        .into_response()
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -1480,7 +1495,7 @@ mod ctf_convert_admission_tests {
     use cdk::amount::SplitTarget;
     use cdk::cdk_database::MintAuthDatabase;
     use cdk::dhke::construct_proofs;
-    use cdk::mint::{Mint, MintBuilder, MintMeltLimits};
+    use cdk::mint::{CtfSettlementError, Mint, MintBuilder, MintMeltLimits};
     use cdk::nuts::nut00::KnownMethod;
     use cdk::nuts::{BlindAuthToken, CurrencyUnit, PaymentMethod, PreMintSecrets};
     use cdk::types::FeeReserve;
@@ -1926,5 +1941,34 @@ mod ctf_convert_admission_tests {
             StatusCode::NOT_IMPLEMENTED,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn post_ctf_convert_maps_class_c_witness_failure_to_20008() {
+        let errors = [
+            CtfSettlementError::Mint(cdk::Error::NUT11(
+                cdk::nuts::nut11::Error::SignaturesNotProvided,
+            )),
+            CtfSettlementError::Mint(cdk::Error::NUT14(cdk::nuts::nut14::Error::Preimage)),
+        ];
+
+        for error in errors {
+            let response = decode_error(ctf_settlement_execution_error_response(error)).await;
+            assert_eq!(response.code, ErrorCode::WitnessMissingOrInvalid);
+            assert_eq!(response.detail, "individual condition witness is invalid");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_ctf_convert_r_is_accepted_and_not_exposed_in_error_detail() {
+        let response = decode_error(ctf_settlement_execution_error_response(
+            CtfSettlementError::Mint(cdk::Error::NUT11(cdk::nuts::nut11::Error::InvalidSignature)),
+        ))
+        .await;
+
+        assert_eq!(response.code, ErrorCode::WitnessMissingOrInvalid);
+        assert_eq!(response.detail, "individual condition witness is invalid");
+        assert!(!response.detail.contains("dleq"));
+        assert!(!response.detail.contains("secret"));
     }
 }
