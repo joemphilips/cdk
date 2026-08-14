@@ -5,8 +5,11 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::nuts::nut00::{BlindedMessage, Proof};
-use crate::nuts::nut01::PublicKey;
+use crate::nuts::nut01::{PublicKey, SecretKey as DleqSecretKey};
 use crate::nuts::nut02::Id;
+use crate::nuts::nut10::{Conditions, SpendingConditions};
+use crate::nuts::nut11::SigFlag;
+use crate::nuts::nut12::ProofDleq;
 use crate::secret::Secret;
 use crate::Amount;
 
@@ -772,6 +775,280 @@ fn request_rejects_duplicates_and_noncanonical_order() {
 }
 
 #[test]
+fn standard_locked_record_allows_individual_condition_input() {
+    let mut request = valid_standard_request();
+    request.participants[0]
+        .inputs
+        .push(p2pk_proof(KEYSET_A, POINT_C, SigFlag::SigInputs));
+    sort_request(&mut request);
+
+    request
+        .validate(limits())
+        .expect("standard locked records accept individual condition inputs");
+    assert_eq!(
+        request
+            .validated_authorizations(limits())
+            .expect("locked authorizations")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn bare_records_accept_ordinary_p2pk_and_htlc_inputs() {
+    let mut request = CtfSettlementRequest {
+        condition_id: CanonicalHash::parse(&"11".repeat(32), "condition_id").expect("hash"),
+        parent_collection_id: CanonicalHash::from_bytes([0; 32]),
+        participants: vec![
+            bare_participant(
+                vec![
+                    ordinary_proof(KEYSET_A, POINT_A, "ordinary-bare-a"),
+                    p2pk_proof(KEYSET_A, POINT_B, SigFlag::SigInputs),
+                    htlc_proof(KEYSET_A, POINT_C, SigFlag::SigInputs),
+                ],
+                output(1, KEYSET_A, POINT_D),
+            ),
+            bare_participant(
+                vec![ordinary_proof(KEYSET_B, POINT_B, "ordinary-bare-b")],
+                output(1, KEYSET_B, POINT_E),
+            ),
+        ],
+        coordinator_sig: None,
+    };
+    sort_request(&mut request);
+
+    request
+        .validate(limits())
+        .expect("all-bare records accept ordinary and individual inputs");
+    assert_eq!(
+        request
+            .validated_authorizations(limits())
+            .expect("bare records have no locked authorization"),
+        Vec::new()
+    );
+}
+
+#[test]
+fn pool_record_rejects_non_pool_inputs() {
+    let extra_inputs = [
+        ordinary_proof(KEYSET_A, POINT_C, "ordinary-pool"),
+        p2pk_proof(KEYSET_A, POINT_C, SigFlag::SigInputs),
+        htlc_proof(KEYSET_A, POINT_C, SigFlag::SigInputs),
+    ];
+
+    for extra in extra_inputs {
+        let mut request = valid_mixed_pool_request();
+        request.participants[1].inputs.push(extra);
+        sort_request(&mut request);
+        assert_eq!(
+            request.validate(limits()),
+            Err(Error::InvalidStructure(
+                "pool records require only pool PAY_TO_UNLOCK inputs"
+            )),
+            "pool records reject every bare or individual input before later validation"
+        );
+    }
+
+    let mut standard_authorization = valid_mixed_pool_request();
+    standard_authorization.participants[1].inputs =
+        vec![
+            standard_participant(KEYSET_A, KEYSET_B, POINT_C, POINT_D, 1, 1, "04").inputs[0]
+                .clone(),
+        ];
+    sort_request(&mut standard_authorization);
+    assert_eq!(
+        standard_authorization.validate(limits()),
+        Err(Error::InvalidStructure(
+            "participant wire mode does not match PAY_TO_UNLOCK tags"
+        )),
+        "a standard PAY_TO_UNLOCK authorization cannot use the pool wire mode"
+    );
+}
+
+#[test]
+fn pool_fields_reject_on_standard_locked_and_bare_records() {
+    let pool_mode = valid_mixed_pool_request().participants[1].mode.clone();
+
+    let mut standard = valid_standard_request();
+    standard.participants[0].mode = pool_mode.clone();
+    assert_eq!(
+        standard.validate(limits()),
+        Err(Error::InvalidStructure(
+            "participant wire mode does not match PAY_TO_UNLOCK tags"
+        ))
+    );
+
+    let mut bare = CtfSettlementRequest {
+        condition_id: CanonicalHash::parse(&"11".repeat(32), "condition_id").expect("hash"),
+        parent_collection_id: CanonicalHash::from_bytes([0; 32]),
+        participants: vec![
+            bare_participant(
+                vec![ordinary_proof(KEYSET_A, POINT_A, "ordinary-pool-fields")],
+                output(1, KEYSET_A, POINT_C),
+            ),
+            bare_participant(
+                vec![ordinary_proof(
+                    KEYSET_B,
+                    POINT_B,
+                    "ordinary-pool-fields-second",
+                )],
+                output(1, KEYSET_B, POINT_D),
+            ),
+        ],
+        coordinator_sig: None,
+    };
+    bare.participants[0].mode = pool_mode;
+    sort_request(&mut bare);
+    assert_eq!(
+        bare.validate(limits()),
+        Err(Error::InvalidStructure(
+            "pool records require only pool PAY_TO_UNLOCK inputs"
+        ))
+    );
+}
+
+#[test]
+fn p2pk_and_htlc_sig_all_are_endpoint_rejected() {
+    let p2pk = p2pk_proof(KEYSET_A, POINT_A, SigFlag::SigAll);
+    assert!(matches!(
+        p2pk.verify_p2pk(),
+        Err(crate::nuts::nut11::Error::SigAllNotSupportedHere)
+    ));
+
+    let htlc = htlc_proof(KEYSET_A, POINT_B, SigFlag::SigAll);
+    assert!(matches!(
+        htlc.verify_htlc(),
+        Err(crate::nuts::nut14::Error::SigAllNotSupportedHere)
+    ));
+}
+
+#[test]
+fn proof_dleq_r_round_trips_and_binds_ctf_digests() {
+    let mut request = valid_standard_request();
+    request.participants[0].inputs[0].dleq = Some(ProofDleq::new(
+        dleq_secret_key(1),
+        dleq_secret_key(2),
+        dleq_secret_key(3),
+    ));
+    let encoded = serde_json::to_vec(&request).expect("request wire");
+    let decoded = CtfSettlementRequest::decode(&encoded, limits()).expect("strict request");
+    assert_eq!(
+        decoded.participants[0].inputs[0].dleq,
+        request.participants[0].inputs[0].dleq
+    );
+    assert_eq!(
+        serde_json::to_value(&decoded).expect("request value")["participants"][0]["inputs"][0]
+            ["dleq"]["r"],
+        serde_json::to_value(&request).expect("request value")["participants"][0]["inputs"][0]
+            ["dleq"]["r"]
+    );
+
+    let mut removed = request.clone();
+    removed.participants[0].inputs[0].dleq = None;
+    let mut changed = request.clone();
+    changed.participants[0].inputs[0].dleq = Some(ProofDleq::new(
+        dleq_secret_key(1),
+        dleq_secret_key(2),
+        dleq_secret_key(4),
+    ));
+    for mutation in [removed, changed] {
+        assert_ne!(
+            request.request_digest().expect("request digest"),
+            mutation.request_digest().expect("changed digest")
+        );
+        assert_ne!(
+            request.coordinator_digest().expect("coordinator digest"),
+            mutation.coordinator_digest().expect("changed digest")
+        );
+    }
+}
+
+#[test]
+fn all_locked_and_pool_requests_retain_62d59b01_bytes_and_digests() {
+    let standard = valid_standard_request();
+    assert_eq!(
+        standard
+            .request_digest()
+            .expect("standard digest")
+            .to_string(),
+        "48f6e7b04945ed9fd11700f14740ca13714de6b7c68f45183e60df2565ef6c26"
+    );
+
+    let mut pool = valid_mixed_pool_request();
+    bind_participant(&mut pool.participants[1], COORDINATOR_KEY);
+    sign_request(&mut pool, [5; 32]);
+    assert_eq!(
+        pool.coordinator_digest().expect("pool digest").to_string(),
+        "08f81f67d68ba9cd0b8c50876e86d14a12a24d9afc3835fb6eaf3f5b612aa64f"
+    );
+}
+
+#[test]
+fn locked_and_bare_records_keep_authorization_order() {
+    let mut request = mixed_locked_and_bare_request();
+    sort_request(&mut request);
+    let expected = request.participants[1]
+        .inputs
+        .iter()
+        .find_map(|proof| PayToUnlockCondition::parse_optional(&proof.secret).expect("condition"))
+        .expect("locked input")
+        .authorization();
+
+    let authorizations = request
+        .validated_authorizations(limits())
+        .expect("mixed request is valid");
+    assert_eq!(authorizations, vec![expected]);
+}
+
+#[test]
+fn validated_authorizations_returns_locked_records_only() {
+    let mut request = mixed_locked_and_bare_request();
+    sort_request(&mut request);
+    assert_eq!(
+        request
+            .validated_authorizations(limits())
+            .expect("mixed request is valid")
+            .len(),
+        1
+    );
+
+    let mut all_bare = bare_request();
+    sort_request(&mut all_bare);
+    assert_eq!(
+        all_bare
+            .validated_authorizations(limits())
+            .expect("all-bare request is valid"),
+        Vec::new()
+    );
+}
+
+#[test]
+fn validate_mixed_records_is_separate_from_locked_authorization_extraction() {
+    let mut mixed = mixed_locked_and_bare_request();
+    sort_request(&mut mixed);
+    mixed.validate(limits()).expect("mixed request validates");
+    assert_eq!(
+        mixed
+            .validated_authorizations(limits())
+            .expect("locked extraction")
+            .len(),
+        1
+    );
+
+    let mut all_bare = bare_request();
+    sort_request(&mut all_bare);
+    all_bare
+        .validate(limits())
+        .expect("all-bare request validates");
+    assert_eq!(
+        all_bare
+            .validated_authorizations(limits())
+            .expect("all-bare extraction"),
+        Vec::new()
+    );
+}
+
+#[test]
 fn nut06_default_retains_legacy_single_party_only() {
     let settings = NutCtfSplitMergeSettings::default();
     let value = serde_json::to_value(&settings).expect("serialize settings");
@@ -1133,4 +1410,97 @@ fn pool_entry(
         keyset_id: Id::from_str(keyset).expect("valid keyset"),
         blinded_secret: PublicKey::from_str(point).expect("valid point"),
     }
+}
+
+fn dleq_secret_key(byte: u8) -> DleqSecretKey {
+    DleqSecretKey::from_slice(&[byte; 32]).expect("valid DLEQ secret key")
+}
+
+fn ordinary_proof(keyset: &str, point: &str, secret: &str) -> Proof {
+    Proof::new(
+        Amount::from(1),
+        Id::from_str(keyset).expect("valid keyset"),
+        Secret::new(secret),
+        PublicKey::from_str(point).expect("valid point"),
+    )
+}
+
+fn p2pk_proof(keyset: &str, point: &str, sig_flag: SigFlag) -> Proof {
+    let conditions = Conditions::new(None, None, None, None, Some(sig_flag), None)
+        .expect("valid P2PK conditions");
+    let secret = SpendingConditions::new_p2pk(
+        PublicKey::from_str(POINT_E).expect("valid P2PK public key"),
+        Some(conditions),
+    )
+    .try_into()
+    .expect("serializable P2PK secret");
+    Proof::new(
+        Amount::from(1),
+        Id::from_str(keyset).expect("valid keyset"),
+        secret,
+        PublicKey::from_str(point).expect("valid point"),
+    )
+}
+
+fn htlc_proof(keyset: &str, point: &str, sig_flag: SigFlag) -> Proof {
+    let conditions = Conditions::new(None, None, None, None, Some(sig_flag), None)
+        .expect("valid HTLC conditions");
+    let secret = SpendingConditions::new_htlc_hash(&"01".repeat(32), Some(conditions))
+        .expect("valid HTLC condition")
+        .try_into()
+        .expect("serializable HTLC secret");
+    Proof::new(
+        Amount::from(1),
+        Id::from_str(keyset).expect("valid keyset"),
+        secret,
+        PublicKey::from_str(point).expect("valid point"),
+    )
+}
+
+fn bare_participant(inputs: Vec<Proof>, output: BlindedMessage) -> CtfSettlementParticipant {
+    CtfSettlementParticipant {
+        inputs,
+        outputs: vec![output],
+        mode: ParticipantMode::Standard,
+    }
+}
+
+fn bare_request() -> CtfSettlementRequest {
+    CtfSettlementRequest {
+        condition_id: CanonicalHash::parse(&"11".repeat(32), "condition_id").expect("hash"),
+        parent_collection_id: CanonicalHash::from_bytes([0; 32]),
+        participants: vec![
+            bare_participant(
+                vec![ordinary_proof(KEYSET_A, POINT_A, "ordinary-bare-request-a")],
+                output(1, KEYSET_A, POINT_C),
+            ),
+            bare_participant(
+                vec![ordinary_proof(KEYSET_B, POINT_B, "ordinary-bare-request-b")],
+                output(1, KEYSET_B, POINT_D),
+            ),
+        ],
+        coordinator_sig: None,
+    }
+}
+
+fn mixed_locked_and_bare_request() -> CtfSettlementRequest {
+    let mut request = valid_standard_request();
+    request.participants.remove(0);
+    request.participants.push(bare_participant(
+        vec![ordinary_proof(KEYSET_B, POINT_B, "ordinary-mixed-bare")],
+        output(1, KEYSET_B, POINT_D),
+    ));
+    request
+}
+
+fn sort_request(request: &mut CtfSettlementRequest) {
+    for participant in &mut request.participants {
+        participant
+            .inputs
+            .sort_by_key(|proof| (proof.keyset_id.to_string(), proof.secret.to_string()));
+    }
+    request.participants.sort_by_key(|participant| {
+        let first = participant.inputs.first().expect("participant has input");
+        (first.keyset_id.to_string(), first.secret.to_string())
+    });
 }

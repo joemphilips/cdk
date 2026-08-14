@@ -17,6 +17,7 @@ use super::{
 use crate::nuts::nut00::{BlindSignature, BlindedMessage, Proof, Proofs, Witness};
 use crate::nuts::nut01::PublicKey;
 use crate::nuts::nut02::Id;
+use crate::nuts::nut10::SpendingConditions;
 use crate::nuts::nut12::ProofDleq;
 use crate::nuts::nut_ctf::CtfConvertRequest;
 use crate::secret::Secret;
@@ -259,6 +260,23 @@ pub struct CtfSettlementResponse {
     pub signatures: Vec<Vec<BlindSignature>>,
 }
 
+/// Private result for one fully validated participant record.
+#[derive(Clone, Copy)]
+enum ValidatedRecord {
+    StandardLocked(PayToUnlockAuthorization),
+    Pool(PayToUnlockAuthorization),
+    Bare,
+}
+
+impl ValidatedRecord {
+    const fn authorization(self) -> Option<PayToUnlockAuthorization> {
+        match self {
+            Self::StandardLocked(authorization) | Self::Pool(authorization) => Some(authorization),
+            Self::Bare => None,
+        }
+    }
+}
+
 impl fmt::Debug for CtfSettlementRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -301,7 +319,7 @@ impl CtfSettlementRequest {
     /// Validate protocol-pure structure, commitments, selections, and policies.
     pub fn validate(&self, limits: CtfSettlementLimits) -> Result<(), Error> {
         self.verify_coordinator_authentication()?;
-        self.validated_authorizations(limits).map(drop)
+        self.validate_records(limits).map(drop)
     }
 
     /// Compute the canonical idempotency key for this exact settlement request.
@@ -337,6 +355,9 @@ impl CtfSettlementRequest {
             .iter()
             .flat_map(|participant| participant.inputs.iter())
         {
+            if !is_pay_to_unlock_secret(&proof.secret) {
+                continue;
+            }
             if let Some(candidate) = PayToUnlockCondition::parse_coordinator_pubkey(&proof.secret)?
             {
                 merge_coordinator_key(&mut coordinator, candidate)?;
@@ -364,7 +385,7 @@ impl CtfSettlementRequest {
         Ok(canonical)
     }
 
-    /// Validate the request and return one shared authorization per participant.
+    /// Validate the request and return one authorization for each locked record.
     ///
     /// Returned authorizations preserve canonical participant order. Each
     /// authorization has already been checked against every input in its
@@ -373,6 +394,14 @@ impl CtfSettlementRequest {
         &self,
         limits: CtfSettlementLimits,
     ) -> Result<Vec<PayToUnlockAuthorization>, Error> {
+        Ok(self
+            .validate_records(limits)?
+            .into_iter()
+            .filter_map(ValidatedRecord::authorization)
+            .collect())
+    }
+
+    fn validate_records(&self, limits: CtfSettlementLimits) -> Result<Vec<ValidatedRecord>, Error> {
         limits.validate()?;
         if self.participants.len() < 2 {
             return Err(Error::InvalidStructure(
@@ -404,9 +433,9 @@ impl CtfSettlementRequest {
         let mut condition_nonces = HashSet::with_capacity(input_count);
         let mut output_points = HashSet::with_capacity(output_count);
         let mut previous_participant_key = None;
-        let mut authorizations = Vec::with_capacity(self.participants.len());
+        let mut records = Vec::with_capacity(self.participants.len());
         for participant in &self.participants {
-            let (participant_key, authorization) = validate_participant(
+            let (participant_key, record) = validate_participant(
                 participant,
                 limits.max_pool_entries,
                 &mut proof_secrets,
@@ -420,9 +449,9 @@ impl CtfSettlementRequest {
                 return Err(Error::NonCanonicalParticipantOrder);
             }
             previous_participant_key = Some(participant_key);
-            authorizations.push(authorization);
+            records.push(record);
         }
-        Ok(authorizations)
+        Ok(records)
     }
 
     /// Require every participating input keyset to advertise a positive fee.
@@ -805,7 +834,7 @@ fn validate_participant(
     proof_secrets: &mut HashSet<Secret>,
     condition_nonces: &mut HashSet<CanonicalHash>,
     output_points: &mut HashSet<PublicKey>,
-) -> Result<((String, String), PayToUnlockAuthorization), Error> {
+) -> Result<((String, String), ValidatedRecord), Error> {
     if participant.inputs.is_empty() || participant.outputs.is_empty() {
         return Err(Error::InvalidStructure(
             "each participant requires inputs and outputs",
@@ -813,8 +842,12 @@ fn validate_participant(
     }
     ensure_input_order(&participant.inputs)?;
     validate_unique_outputs(participant, output_points)?;
-    let authorization = parse_authorization(participant, proof_secrets, condition_nonces)?;
-    validate_participant_mode(participant, max_pool_entries, &authorization)?;
+    let record = classify_participant(
+        participant,
+        max_pool_entries,
+        proof_secrets,
+        condition_nonces,
+    )?;
 
     let participant_key = input_order_key(
         participant
@@ -822,7 +855,7 @@ fn validate_participant(
             .first()
             .ok_or(Error::InvalidStructure("participant inputs are empty"))?,
     );
-    Ok((participant_key, authorization.authorization()))
+    Ok((participant_key, record))
 }
 
 fn validate_unique_outputs(
@@ -842,12 +875,86 @@ fn validate_unique_outputs(
     Ok(())
 }
 
-fn parse_authorization(
+fn classify_participant(
     participant: &CtfSettlementParticipant,
+    max_pool_entries: usize,
     proof_secrets: &mut HashSet<Secret>,
     condition_nonces: &mut HashSet<CanonicalHash>,
+) -> Result<ValidatedRecord, Error> {
+    let mut locked_conditions = Vec::new();
+    for proof in &participant.inputs {
+        if !proof_secrets.insert(proof.secret.clone()) {
+            return Err(Error::DuplicateInput);
+        }
+        match PayToUnlockCondition::parse_optional(&proof.secret)? {
+            Some(condition) => {
+                if !condition_nonces.insert(condition.nonce) {
+                    return Err(Error::DuplicateInput);
+                }
+                if proof.keyset_id != condition.offer_keyset {
+                    return Err(Error::OfferKeysetMismatch);
+                }
+                locked_conditions.push(condition);
+            }
+            None => validate_non_pay_to_unlock_input(&proof.secret)?,
+        }
+    }
+
+    match (&participant.mode, locked_conditions.is_empty()) {
+        (ParticipantMode::Standard, true) => Ok(ValidatedRecord::Bare),
+        (ParticipantMode::Standard, false) => {
+            let authorization = shared_authorization(locked_conditions)?;
+            validate_participant_mode(participant, max_pool_entries, &authorization)?;
+            Ok(ValidatedRecord::StandardLocked(
+                authorization.authorization(),
+            ))
+        }
+        (ParticipantMode::Pool { .. }, false)
+            if locked_conditions.len() == participant.inputs.len() =>
+        {
+            let authorization = shared_authorization(locked_conditions)?;
+            validate_participant_mode(participant, max_pool_entries, &authorization)?;
+            Ok(ValidatedRecord::Pool(authorization.authorization()))
+        }
+        (ParticipantMode::Pool { .. }, _) => Err(Error::InvalidStructure(
+            "pool records require only pool PAY_TO_UNLOCK inputs",
+        )),
+    }
+}
+
+fn shared_authorization(
+    mut conditions: Vec<PayToUnlockCondition>,
 ) -> Result<PayToUnlockCondition, Error> {
-    parse_authorization_inputs(&participant.inputs, proof_secrets, condition_nonces)
+    let authorization = conditions
+        .pop()
+        .ok_or(Error::InvalidStructure("participant inputs are empty"))?;
+    if conditions
+        .iter()
+        .any(|condition| !condition.has_same_authorization(&authorization))
+    {
+        return Err(Error::InconsistentAuthorization);
+    }
+    Ok(authorization)
+}
+
+fn validate_non_pay_to_unlock_input(secret: &Secret) -> Result<(), Error> {
+    let value = match serde_json::from_slice::<Value>(secret.as_bytes()) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let kind = value
+        .as_array()
+        .and_then(|parts| parts.first())
+        .and_then(Value::as_str);
+    match kind {
+        Some("P2PK") | Some("HTLC") => SpendingConditions::try_from(secret)
+            .map(|_| ())
+            .map_err(|_| Error::InvalidCondition("individual NUT-10 condition is malformed")),
+        Some(_) => Err(Error::InvalidCondition(
+            "NUT-10 condition kind is unsupported",
+        )),
+        None => Ok(()),
+    }
 }
 
 fn parse_authorization_inputs(
@@ -881,6 +988,20 @@ fn parse_authorization_inputs(
         return Err(Error::InconsistentAuthorization);
     }
     Ok(authorization)
+}
+
+fn is_pay_to_unlock_secret(secret: &Secret) -> bool {
+    serde_json::from_slice::<Value>(secret.as_bytes())
+        .ok()
+        .and_then(|value| {
+            value
+                .as_array()
+                .and_then(|parts| parts.first())
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("PAY_TO_UNLOCK")
 }
 
 fn validate_participant_mode(
