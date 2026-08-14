@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
 use cdk_common::mint::MintKeySetInfo;
 use cdk_common::nuts::nut00::{BlindedMessage, Proofs, ProofsMethods};
 use cdk_common::nuts::nut02::Id;
+use cdk_common::nuts::nut10::SpendingConditions;
 use cdk_common::nuts::nut_ctf::settlement::{
     validate_ctf_range_authorization as validate_range_protocol, CanonicalHash,
     CtfSettlementRequest, CtfSettlementResponse, Error as SettlementError,
@@ -171,7 +172,9 @@ impl Mint {
         if !request.parent_collection_id.is_zero() {
             return Err(SettlementError::NonRootParentCollection.into());
         }
+        request.validate(limits)?;
         let authorizations = request.validated_authorizations(limits)?;
+        validate_individual_conditions(request)?;
         let condition_id = request.condition_id.to_string();
         let condition = self.load_pending_condition(&condition_id).await?;
         let collateral = condition
@@ -185,6 +188,11 @@ impl Mint {
         validate_authorization_expiries(&authorizations, now, effective_expiry_ceiling)?;
 
         let resolver = CtfCoverageResolver::new(self, &condition_id, &outcomes)?;
+        for participant in &request.participants {
+            if let ParticipantMode::Pool { manifest, .. } = &participant.mode {
+                self.validate_manifest_denominations(manifest)?;
+            }
+        }
         let coverages = self
             .resolve_settlement_keysets(request, &resolver, &collateral, now)
             .await?;
@@ -320,6 +328,27 @@ impl Mint {
         }
         Ok(())
     }
+}
+
+fn validate_individual_conditions(
+    request: &CtfSettlementRequest,
+) -> Result<(), CtfSettlementError> {
+    for proof in request
+        .participants
+        .iter()
+        .flat_map(|participant| participant.inputs.iter())
+    {
+        match SpendingConditions::try_from(&proof.secret) {
+            Ok(SpendingConditions::P2PKConditions { .. }) => {
+                proof.verify_p2pk().map_err(Error::NUT11)?;
+            }
+            Ok(SpendingConditions::HTLCConditions { .. }) => {
+                proof.verify_htlc().map_err(Error::NUT14)?;
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
 }
 
 struct FlatSettlement {
