@@ -332,6 +332,13 @@ struct StandardSettlementFixture {
     output_points: Vec<cdk_common::PublicKey>,
 }
 
+struct MixedKeysetSettlementFixture {
+    request: CtfSettlementRequest,
+    regular_keyset: Id,
+    yes_keyset: Id,
+    no_keyset: Id,
+}
+
 async fn standard_settlement_fixture(mint: &Mint, now: u64) -> StandardSettlementFixture {
     standard_settlement_fixture_for_coordinator(mint, now, None).await
 }
@@ -396,6 +403,54 @@ async fn standard_settlement_fixture_for_coordinator(
         output_only_keyset: yes_keyset,
         input_ys,
         output_points,
+    }
+}
+
+async fn mixed_keyset_locked_plus_bare_settlement_fixture(
+    mint: &Mint,
+    now: u64,
+) -> MixedKeysetSettlementFixture {
+    let regular_keyset = get_regular_keyset_id(mint);
+    let locked_source = mint_test_proofs_for_unit(mint, Amount::from(10), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let bare_source = mint_test_proofs_for_unit(mint, Amount::from(10), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+    let yes_keyset = *keysets.get("YES").expect("YES keyset");
+    let no_keyset = *keysets.get("NO").expect("NO keyset");
+
+    let (yes_outputs, _) = create_premint(mint, yes_keyset, Amount::from(6));
+    let locked = standard_settlement_participant(
+        mint,
+        locked_source,
+        regular_keyset,
+        yes_outputs,
+        now + 60,
+        1,
+        None,
+    )
+    .await;
+    let bare = CtfSettlementParticipant {
+        inputs: swap_to_conditional(mint, bare_source, no_keyset, Amount::from(8)).await,
+        outputs: create_premint(mint, no_keyset, Amount::from(14)).0,
+        mode: ParticipantMode::Standard,
+    };
+    let mut participants = vec![locked, bare];
+    canonicalize_settlement_participants(&mut participants);
+
+    MixedKeysetSettlementFixture {
+        request: CtfSettlementRequest {
+            condition_id: CanonicalHash::parse(&condition_id, "condition_id").unwrap(),
+            parent_collection_id: CanonicalHash::from_bytes([0; 32]),
+            participants,
+            coordinator_sig: None,
+        },
+        regular_keyset,
+        yes_keyset,
+        no_keyset,
     }
 }
 
@@ -584,6 +639,37 @@ async fn issue_locked_proof(
     construct_proofs(response.signatures, premint.rs(), premint.secrets(), &keys)
         .unwrap()
         .remove(0)
+}
+
+async fn standard_settlement_with_individual_input(
+    mint: &Mint,
+    now: u64,
+    secret: Secret,
+) -> StandardSettlementFixture {
+    let source = mint_test_proofs_for_unit(mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let mut fixture = standard_settlement_fixture(mint, now).await;
+    let keyset = fixture.request.participants[0].inputs[0].keyset_id;
+    fixture.request.participants[0].inputs =
+        vec![issue_locked_proof(mint, source, keyset, secret).await];
+    canonicalize_settlement_participants(&mut fixture.request.participants);
+    fixture
+}
+
+fn individual_p2pk_secret(key: &SecretKey, sig_flag: SigFlag) -> Secret {
+    let conditions = Conditions::new(None, None, None, None, Some(sig_flag), None).unwrap();
+    SpendingConditions::new_p2pk(key.public_key(), Some(conditions))
+        .try_into()
+        .unwrap()
+}
+
+fn individual_htlc_secret(preimage: &str, sig_flag: SigFlag) -> Secret {
+    let conditions = Conditions::new(None, None, None, None, Some(sig_flag), None).unwrap();
+    SpendingConditions::new_htlc(preimage.to_owned(), Some(conditions))
+        .unwrap()
+        .try_into()
+        .unwrap()
 }
 
 fn settlement_pay_to_unlock_secret(
@@ -2530,6 +2616,444 @@ async fn test_numeric_redemption_overspend_rejected() {
 // ============================================================================
 
 #[tokio::test]
+async fn test_ctf_settlement_validates_p2pk_and_htlc_individually() {
+    let now = unix_time();
+
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let p2pk_key = SecretKey::generate();
+    let mut p2pk = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_p2pk_secret(&p2pk_key, SigFlag::SigInputs),
+    )
+    .await;
+    p2pk.request.participants[0].inputs[0]
+        .sign_p2pk(p2pk_key)
+        .unwrap();
+    mint.process_ctf_settlement(&p2pk.request, settlement_settings(), now)
+        .await
+        .expect("a valid individual P2PK witness must settle");
+
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let preimage = "42".repeat(32);
+    let mut htlc = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_htlc_secret(&preimage, SigFlag::SigInputs),
+    )
+    .await;
+    htlc.request.participants[0].inputs[0].add_preimage(preimage);
+    mint.process_ctf_settlement(&htlc.request, settlement_settings(), now)
+        .await
+        .expect("a valid individual HTLC witness must settle");
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_rejects_class_c_invalid_witness_and_sig_all() {
+    let now = unix_time();
+
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let p2pk_key = SecretKey::generate();
+    let p2pk = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_p2pk_secret(&p2pk_key, SigFlag::SigInputs),
+    )
+    .await;
+    let signing_attempts = mint.blind_sign_attempts();
+    assert!(matches!(
+        mint.process_ctf_settlement(&p2pk.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::NUT11(
+            cdk_common::nuts::nut11::Error::SignaturesNotProvided
+        )))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let preimage = "42".repeat(32);
+    let mut htlc = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_htlc_secret(&preimage, SigFlag::SigInputs),
+    )
+    .await;
+    htlc.request.participants[0].inputs[0].add_preimage("24".repeat(32));
+    let signing_attempts = mint.blind_sign_attempts();
+    assert!(matches!(
+        mint.process_ctf_settlement(&htlc.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::NUT14(
+            cdk_common::nuts::nut14::Error::Preimage
+        )))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let p2pk_sig_all = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_p2pk_secret(&SecretKey::generate(), SigFlag::SigAll),
+    )
+    .await;
+    let signing_attempts = mint.blind_sign_attempts();
+    assert!(matches!(
+        mint.process_ctf_settlement(&p2pk_sig_all.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::NUT11(
+            cdk_common::nuts::nut11::Error::SigAllNotSupportedHere
+        )))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let htlc_sig_all = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_htlc_secret(&"42".repeat(32), SigFlag::SigAll),
+    )
+    .await;
+    let signing_attempts = mint.blind_sign_attempts();
+    assert!(matches!(
+        mint.process_ctf_settlement(&htlc_sig_all.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::NUT14(
+            cdk_common::nuts::nut14::Error::SigAllNotSupportedHere
+        )))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let malformed_nut10 = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        Secret::new("[\"P2PK\",{\"nonce\":\"01\",\"data\":\"not-a-public-key\"}]"),
+    )
+    .await;
+    let signing_attempts = mint.blind_sign_attempts();
+    assert!(matches!(
+        mint.process_ctf_settlement(&malformed_nut10.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Protocol(
+            cdk_common::nuts::nut_ctf::settlement::Error::InvalidCondition(
+                "individual NUT-10 condition is malformed"
+            )
+        ))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let unsupported_nut10 = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        Secret::new("[\"NUT-99\",{\"nonce\":\"01\",\"data\":\"unsupported\"}]"),
+    )
+    .await;
+    let signing_attempts = mint.blind_sign_attempts();
+    assert!(matches!(
+        mint.process_ctf_settlement(&unsupported_nut10.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Protocol(
+            cdk_common::nuts::nut_ctf::settlement::Error::InvalidCondition(
+                "NUT-10 condition kind is unsupported"
+            )
+        ))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_pool_enforces_offer_keyset_per_proof() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let mut fixture = mixed_pool_settlement_fixture(&mint, now).await;
+    let mismatched_keyset = fixture.request.participants[0].outputs[0].keyset_id;
+    let participant = &mut fixture.request.participants[fixture.pool_participant];
+    participant.inputs[0].keyset_id = mismatched_keyset;
+
+    assert!(matches!(
+        fixture
+            .request
+            .validate(settlement_settings().structural_limits().unwrap()),
+        Err(cdk_common::nuts::nut_ctf::settlement::Error::OfferKeysetMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_standard_locked_complete_outputs_apply_rules_6_7_12() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let p2pk_key = SecretKey::generate();
+    let mut fixture = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_p2pk_secret(&p2pk_key, SigFlag::SigInputs),
+    )
+    .await;
+    let output_keyset = fixture.request.participants[1].outputs[0].keyset_id;
+    let mut extra_outputs = create_premint(&mint, output_keyset, Amount::from(1)).0;
+    fixture.request.participants[1]
+        .outputs
+        .push(extra_outputs.remove(0));
+    canonicalize_settlement_participants(&mut fixture.request.participants);
+
+    assert!(matches!(
+        fixture
+            .request
+            .validate(settlement_settings().structural_limits().unwrap()),
+        Err(cdk_common::nuts::nut_ctf::settlement::Error::OutputCommitmentMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_bare_skips_locked_rules() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let p2pk_key = SecretKey::generate();
+    let mut fixture = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_p2pk_secret(&p2pk_key, SigFlag::SigInputs),
+    )
+    .await;
+    fixture.request.participants[0].inputs[0]
+        .sign_p2pk(p2pk_key)
+        .unwrap();
+    fixture
+        .request
+        .validate(settlement_settings().structural_limits().unwrap())
+        .expect("a bare record must not require PAY_TO_UNLOCK fields");
+    assert_eq!(
+        fixture
+            .request
+            .validated_authorizations(settlement_settings().structural_limits().unwrap())
+            .unwrap()
+            .len(),
+        1,
+        "only the locked record participates in locked authorization rules"
+    );
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_unselected_manifest_entries_still_validate() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let source = mint_test_proofs_for_unit(&mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let mut fixture = mixed_pool_settlement_fixture(&mint, now).await;
+    let participant = &mut fixture.request.participants[fixture.pool_participant];
+    let (selection, mut entries) = match &participant.mode {
+        ParticipantMode::Pool {
+            manifest,
+            selection,
+        } => (selection.clone(), manifest.entries().to_vec()),
+        ParticipantMode::Standard => panic!("fixture must include one pool participant"),
+    };
+    let entry = entries
+        .last_mut()
+        .expect("pool fixture must include an unselected change entry");
+    entry.amount = 3;
+    let manifest = PoolManifest::new(entries, 32).unwrap();
+    let offer_keyset = participant.inputs[0].keyset_id;
+    participant.inputs = vec![
+        issue_locked_proof(
+            &mint,
+            source,
+            offer_keyset,
+            settlement_pool_pay_to_unlock_secret(
+                offer_keyset,
+                manifest.commitment().to_string(),
+                now + 60,
+                99,
+            ),
+        )
+        .await,
+    ];
+    participant.mode = ParticipantMode::Pool {
+        manifest,
+        selection,
+    };
+    canonicalize_settlement_participants(&mut fixture.request.participants);
+
+    assert!(matches!(
+        mint.prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Protocol(
+            cdk_common::nuts::nut_ctf::settlement::Error::UnsupportedDenomination
+        ))
+    ));
+
+    let inactive_mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let inactive_fixture = mixed_pool_settlement_fixture(&inactive_mint, now).await;
+    let inactive_keyset =
+        match &inactive_fixture.request.participants[inactive_fixture.pool_participant].mode {
+            ParticipantMode::Pool {
+                manifest,
+                selection,
+            } => manifest
+                .entries()
+                .iter()
+                .enumerate()
+                .find(|(index, _)| !selection.is_selected(*index))
+                .map(|(_, entry)| entry.keyset_id)
+                .expect("pool fixture must retain an unselected manifest entry"),
+            ParticipantMode::Standard => panic!("fixture must include one pool participant"),
+        };
+    assert!(
+        inactive_fixture.request.participants[inactive_fixture.pool_participant]
+            .outputs
+            .iter()
+            .all(|output| output.keyset_id != inactive_keyset),
+        "the selected pool outputs must not include the targeted unselected entry keyset"
+    );
+    assert!(
+        inactive_fixture.request.participants[inactive_fixture.pool_participant]
+            .inputs
+            .iter()
+            .all(|proof| proof.keyset_id == inactive_keyset),
+        "an unselected change entry must retain the pool offer keyset"
+    );
+    rewrite_test_keyset(&inactive_mint, inactive_keyset, false, 1, None);
+    let inactive_result = inactive_mint
+        .prepare_ctf_settlement(&inactive_fixture.request, settlement_settings(), now)
+        .await;
+    let inactive_error = inactive_result.err();
+    let is_inactive = matches!(
+        &inactive_error,
+        Some(CtfSettlementError::Mint(Error::InactiveKeyset))
+    );
+    assert!(
+        is_inactive,
+        "expected the unselected manifest keyset to be inactive, got {inactive_error:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_class_c_replay_returns_exact_cached_response() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let p2pk_key = SecretKey::generate();
+    let mut fixture = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_p2pk_secret(&p2pk_key, SigFlag::SigInputs),
+    )
+    .await;
+    fixture.request.participants[0].inputs[0]
+        .sign_p2pk(p2pk_key)
+        .unwrap();
+    let response = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .unwrap();
+    let signing_attempts = mint.blind_sign_attempts();
+    assert_eq!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await
+            .unwrap(),
+        response
+    );
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_uses_public_validate_then_locked_extraction() {
+    let limits = settlement_settings().structural_limits().unwrap();
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let p2pk_key = SecretKey::generate();
+    let mut mixed = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_p2pk_secret(&p2pk_key, SigFlag::SigInputs),
+    )
+    .await;
+    mixed.request.participants[0].inputs[0]
+        .sign_p2pk(p2pk_key)
+        .unwrap();
+    mixed
+        .request
+        .validate(limits)
+        .expect("the public mixed-record validator must succeed first");
+    assert_eq!(
+        mixed
+            .request
+            .validated_authorizations(limits)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let second_key = SecretKey::generate();
+    let first_key = SecretKey::generate();
+    let mut bare = standard_settlement_with_individual_input(
+        &mint,
+        now,
+        individual_p2pk_secret(&first_key, SigFlag::SigInputs),
+    )
+    .await;
+    let keyset = bare.request.participants[1].inputs[0].keyset_id;
+    let source = mint_test_proofs_for_unit(&mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    bare.request.participants[1].inputs = vec![
+        issue_locked_proof(
+            &mint,
+            source,
+            keyset,
+            individual_p2pk_secret(&second_key, SigFlag::SigInputs),
+        )
+        .await,
+    ];
+    bare.request.participants[0].inputs[0]
+        .sign_p2pk(first_key)
+        .unwrap();
+    bare.request.participants[1].inputs[0]
+        .sign_p2pk(second_key)
+        .unwrap();
+    canonicalize_settlement_participants(&mut bare.request.participants);
+    bare.request
+        .validate(limits)
+        .expect("all-bare records must use the same public validator");
+    assert!(bare
+        .request
+        .validated_authorizations(limits)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn test_ctf_settlement_preparation_retains_exact_verified_artifacts_without_writes() {
     let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
         .await
@@ -2957,6 +3481,160 @@ async fn test_ctf_settlement_preparation_uses_rotated_keyset_expiry() {
             .await,
         Err(CtfSettlementError::AuthorizationBeyondKeysetExpiry)
     ));
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_expiry_uses_all_registered_keysets() {
+    for (offset, accepts) in [(60, false), (61, true)] {
+        let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+            .await
+            .unwrap();
+        let now = unix_time();
+        let fixture = standard_settlement_fixture(&mint, now).await;
+        let mut rotated = mint
+            .localstore()
+            .get_conditional_keyset_infos_for_condition(&fixture.request.condition_id.to_string())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|keyset| keyset.id == fixture.output_only_keyset)
+            .expect("fixture keyset should exist");
+        rotated.id = Id::from_str(if accepts {
+            "001711afb1de20d1"
+        } else {
+            "001711afb1de20d2"
+        })
+        .unwrap();
+        rotated.active = false;
+        rotated.final_expiry = Some(now + offset);
+        let mut transaction = mint.localstore().begin_transaction().await.unwrap();
+        transaction
+            .add_conditional_keyset(rotated, now - 1)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let result = mint
+            .prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await;
+        if accepts {
+            result.expect("one second before the earliest registered expiry must settle");
+        } else {
+            assert!(matches!(
+                result,
+                Err(CtfSettlementError::AuthorizationBeyondKeysetExpiry)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_mixed_keysets_lock_bare_fee_and_outcome_conservation() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = mixed_keyset_locked_plus_bare_settlement_fixture(&mint, now).await;
+    let mut unknown_actual_keyset = fixture.request.clone();
+    let absent_keyset = Id::from_str("001711afb1de20d0").unwrap();
+    assert!(mint.get_keyset_info(&absent_keyset).is_none());
+    let bare_participant = unknown_actual_keyset
+        .participants
+        .iter_mut()
+        .find(|participant| {
+            participant
+                .inputs
+                .iter()
+                .any(|proof| proof.keyset_id == fixture.no_keyset)
+        })
+        .expect("fixture has one bare conditional participant");
+    bare_participant.inputs[0].keyset_id = absent_keyset;
+    canonicalize_settlement_participants(&mut unknown_actual_keyset.participants);
+
+    let signing_attempts = mint.blind_sign_attempts();
+    let prepared = mint
+        .prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .expect("locked and bare inputs across registered keysets must conserve");
+    assert_eq!(
+        mint.get_keyset_info(&fixture.regular_keyset)
+            .expect("registered regular input keyset")
+            .input_fee_ppk,
+        1000
+    );
+    assert_eq!(
+        mint.get_keyset_info(&fixture.no_keyset)
+            .expect("registered bare input keyset")
+            .input_fee_ppk,
+        1
+    );
+    assert_eq!(prepared.inputs.len(), 2);
+    assert_eq!(
+        prepared
+            .inputs
+            .iter()
+            .filter(|proof| proof.keyset_id == fixture.regular_keyset)
+            .map(|proof| u64::from(proof.amount))
+            .sum::<u64>(),
+        8
+    );
+    assert_eq!(
+        prepared
+            .inputs
+            .iter()
+            .filter(|proof| proof.keyset_id == fixture.no_keyset)
+            .map(|proof| u64::from(proof.amount))
+            .sum::<u64>(),
+        8
+    );
+    assert_eq!(prepared.fee.total, Amount::from(2));
+    assert_eq!(
+        prepared
+            .fee
+            .per_keyset
+            .values()
+            .map(|fee| u64::from(*fee))
+            .sum::<u64>(),
+        2,
+        "per-keyset allocation must account for the complete settlement fee"
+    );
+    assert_eq!(prepared.fee.per_keyset.len(), 2);
+    assert_eq!(
+        prepared
+            .outputs
+            .iter()
+            .filter(|output| output.keyset_id == fixture.yes_keyset)
+            .map(|output| u64::from(output.amount))
+            .sum::<u64>(),
+        6,
+        "YES has the locked collateral input minus the full settlement fee"
+    );
+    assert_eq!(
+        prepared
+            .outputs
+            .iter()
+            .filter(|output| output.keyset_id == fixture.no_keyset)
+            .map(|output| u64::from(output.amount))
+            .sum::<u64>(),
+        14,
+        "NO has both inputs minus the full settlement fee"
+    );
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+
+    assert!(matches!(
+        mint.prepare_ctf_settlement(&unknown_actual_keyset, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::UnknownKeySet))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+
+    rewrite_test_keyset(&mint, fixture.no_keyset, false, 1000, None);
+    assert!(matches!(
+        mint.prepare_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::Mint(Error::InactiveKeyset))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
 }
 
 #[tokio::test]
