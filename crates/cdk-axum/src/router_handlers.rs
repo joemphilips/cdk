@@ -1387,15 +1387,21 @@ fn ctf_settlement_error_response(error: cdk::nuts::nut_ctf::settlement::Error) -
         SettlementError::InvalidPoolPolicy(_) | SettlementError::ArithmeticOverflow => {
             ErrorCode::Unknown(15014)
         }
-        SettlementError::CoordinatorAuthentication => ErrorCode::Unknown(15015),
+        SettlementError::CoordinatorAuthentication => ErrorCode::CoordinatorAuthentication,
         SettlementError::SettlementAfterExpiry => ErrorCode::SettlementAfterExpiry,
         SettlementError::RefundBeforeExpiry => ErrorCode::RefundBeforeExpiry,
         SettlementError::RefundWitnessMissingOrInvalid => ErrorCode::RefundWitnessMissingOrInvalid,
         _ => ErrorCode::PayToUnlockInvalidCondition,
     };
+    let detail = match &error {
+        SettlementError::CoordinatorAuthentication => {
+            "Coordinator authentication failed".to_owned()
+        }
+        _ => error.to_string(),
+    };
     (
         StatusCode::BAD_REQUEST,
-        Json(ErrorResponse::new(code, error.to_string())),
+        Json(ErrorResponse::new(code, detail)),
     )
         .into_response()
 }
@@ -1818,7 +1824,7 @@ mod ctf_convert_admission_tests {
             ),
             (
                 SettlementError::CoordinatorAuthentication,
-                ErrorCode::Unknown(15015),
+                ErrorCode::CoordinatorAuthentication,
             ),
             (
                 SettlementError::ZeroFeeKeyset,
@@ -1853,7 +1859,7 @@ mod ctf_convert_admission_tests {
             decode_error(ctf_settlement_error_response(error))
                 .await
                 .code,
-            ErrorCode::Unknown(15015)
+            ErrorCode::CoordinatorAuthentication
         );
     }
 
@@ -1910,9 +1916,20 @@ mod ctf_convert_admission_tests {
                 decode_error(ctf_settlement_error_response(error))
                     .await
                     .code,
-                ErrorCode::Unknown(15015)
+                ErrorCode::CoordinatorAuthentication
             );
         }
+    }
+
+    #[tokio::test]
+    async fn coordinator_authentication_uses_finalized_display_text() {
+        let error = decode_error(ctf_settlement_error_response(
+            SettlementError::CoordinatorAuthentication,
+        ))
+        .await;
+
+        assert_eq!(error.code, ErrorCode::CoordinatorAuthentication);
+        assert_eq!(error.detail, "Coordinator authentication failed");
     }
 
     #[tokio::test]
