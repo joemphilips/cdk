@@ -768,6 +768,33 @@ mod tests {
         assert_eq!(response.code, ErrorCode::BlindedMessageAlreadySigned);
         assert_eq!(response.detail, "Blinded message already signed or pending");
     }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn coordinator_authentication_error_code_round_trips_and_serializes() {
+        let code = ErrorCode::from_code(15015);
+        assert_eq!(code, ErrorCode::CoordinatorAuthentication);
+        assert_eq!(code.to_code(), 15015);
+        assert_eq!(code.to_string(), "15015");
+
+        let response = ErrorResponse::new(
+            ErrorCode::CoordinatorAuthentication,
+            "Coordinator authentication failed".to_owned(),
+        );
+        let json = serde_json::to_string(&response).expect("error response JSON");
+        assert_eq!(
+            json,
+            r#"{"code":15015,"detail":"Coordinator authentication failed"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ErrorResponse>(&json).expect("error response"),
+            response
+        );
+        assert_eq!(
+            response.to_string(),
+            "code: 15015, detail: Coordinator authentication failed"
+        );
+    }
 }
 
 impl Error {
@@ -1683,6 +1710,9 @@ pub enum ErrorCode {
     /// PAY_TO_UNLOCK refund witness was missing or invalid (15007)
     #[cfg(feature = "conditional-tokens")]
     RefundWitnessMissingOrInvalid,
+    /// Coordinator authentication failed (15015)
+    #[cfg(feature = "conditional-tokens")]
+    CoordinatorAuthentication,
     /// Hash to curve failed (13045)
     #[cfg(feature = "conditional-tokens")]
     HashToCurveFailed,
@@ -1819,6 +1849,8 @@ impl ErrorCode {
             15006 => Self::RefundBeforeExpiry,
             #[cfg(feature = "conditional-tokens")]
             15007 => Self::RefundWitnessMissingOrInvalid,
+            #[cfg(feature = "conditional-tokens")]
+            15015 => Self::CoordinatorAuthentication,
             // 20xxx - Quote/Payment errors
             20001 => Self::QuoteNotPaid,
             20002 => Self::TokensAlreadyIssued,
@@ -1926,6 +1958,8 @@ impl ErrorCode {
             Self::RefundBeforeExpiry => 15006,
             #[cfg(feature = "conditional-tokens")]
             Self::RefundWitnessMissingOrInvalid => 15007,
+            #[cfg(feature = "conditional-tokens")]
+            Self::CoordinatorAuthentication => 15015,
             // 20xxx - Quote/Payment errors
             Self::QuoteNotPaid => 20001,
             Self::TokensAlreadyIssued => 20002,
