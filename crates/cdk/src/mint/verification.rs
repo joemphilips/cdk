@@ -62,6 +62,23 @@ impl Mint {
     /// Checks that the outputs are all of the same unit and the keyset is active
     #[instrument(skip_all)]
     pub fn verify_outputs_keyset(&self, outputs: &[BlindedMessage]) -> Result<CurrencyUnit, Error> {
+        self.verify_outputs_keyset_with_lifecycle(outputs, true)
+    }
+
+    /// Verify output keysets without requiring them to be active now.
+    #[instrument(skip_all)]
+    pub(super) fn verify_outputs_keyset_historically(
+        &self,
+        outputs: &[BlindedMessage],
+    ) -> Result<CurrencyUnit, Error> {
+        self.verify_outputs_keyset_with_lifecycle(outputs, false)
+    }
+
+    fn verify_outputs_keyset_with_lifecycle(
+        &self,
+        outputs: &[BlindedMessage],
+        require_current_lifecycle: bool,
+    ) -> Result<CurrencyUnit, Error> {
         let mut keyset_units = HashSet::new();
 
         let output_keyset_ids: HashSet<Id> = outputs.iter().map(|p| p.keyset_id).collect();
@@ -69,14 +86,14 @@ impl Mint {
         for id in &output_keyset_ids {
             match self.get_keyset_info(id) {
                 Some(keyset) => {
-                    if !keyset.active {
+                    if require_current_lifecycle && !keyset.active {
                         tracing::debug!(
                             "Transaction attempted with inactive keyset in outputs: {}.",
                             id
                         );
                         return Err(Error::InactiveKeyset);
                     }
-                    if keyset.is_expired() {
+                    if require_current_lifecycle && keyset.is_expired() {
                         tracing::debug!(
                             "Transaction attempted with expired keyset in outputs: {}.",
                             id
@@ -114,6 +131,27 @@ impl Mint {
     /// Checks that the inputs are all of the same unit
     #[instrument(skip_all)]
     pub async fn verify_inputs_keyset(&self, inputs: &Proofs) -> Result<CurrencyUnit, Error> {
+        self.verify_inputs_keyset_with_lifecycle(inputs, true).await
+    }
+
+    /// Verify input keysets without applying their current lifecycle policy.
+    ///
+    /// CTF terminal rejection uses this after its authorization cutoff. It still
+    /// requires every keyset to be known and every proof to be authentic.
+    #[instrument(skip_all)]
+    pub(super) async fn verify_inputs_keyset_historically(
+        &self,
+        inputs: &Proofs,
+    ) -> Result<CurrencyUnit, Error> {
+        self.verify_inputs_keyset_with_lifecycle(inputs, false)
+            .await
+    }
+
+    async fn verify_inputs_keyset_with_lifecycle(
+        &self,
+        inputs: &Proofs,
+        require_current_lifecycle: bool,
+    ) -> Result<CurrencyUnit, Error> {
         let mut keyset_units = HashSet::new();
 
         let inputs_keyset_ids: HashSet<Id> = inputs.iter().map(|p| p.keyset_id).collect();
@@ -121,7 +159,7 @@ impl Mint {
         for id in &inputs_keyset_ids {
             match self.get_keyset_info(id) {
                 Some(keyset) => {
-                    if keyset.is_expired() {
+                    if require_current_lifecycle && keyset.is_expired() {
                         tracing::debug!(
                             "Transaction attempted with expired keyset in inputs: {}.",
                             id
@@ -161,6 +199,26 @@ impl Mint {
     /// empty outputs before calling this function.
     #[instrument(skip_all)]
     pub fn verify_outputs(&self, outputs: &[BlindedMessage]) -> Result<Verification, Error> {
+        self.verify_outputs_with_lifecycle(outputs, true)
+    }
+
+    /// Verify output structure without applying the current keyset lifecycle policy.
+    ///
+    /// CTF terminal rejection uses this after its authorization cutoff. It never
+    /// signs these outputs.
+    #[instrument(skip_all)]
+    pub(super) fn verify_outputs_historically(
+        &self,
+        outputs: &[BlindedMessage],
+    ) -> Result<Verification, Error> {
+        self.verify_outputs_with_lifecycle(outputs, false)
+    }
+
+    fn verify_outputs_with_lifecycle(
+        &self,
+        outputs: &[BlindedMessage],
+        require_current_lifecycle: bool,
+    ) -> Result<Verification, Error> {
         if outputs.is_empty() {
             tracing::debug!("verify_outputs called with empty outputs");
             return Err(Error::TransactionUnbalanced(0, 0, 0));
@@ -182,7 +240,11 @@ impl Mint {
 
         Mint::check_outputs_unique(outputs)?;
 
-        let unit = self.verify_outputs_keyset(outputs)?;
+        let unit = if require_current_lifecycle {
+            self.verify_outputs_keyset(outputs)?
+        } else {
+            self.verify_outputs_keyset_historically(outputs)?
+        };
 
         let amount = Amount::try_sum(outputs.iter().map(|o| o.amount))?.with_unit(unit);
 
@@ -195,6 +257,25 @@ impl Mint {
     /// **NOTE: This does not check if inputs have been spent
     #[instrument(skip_all)]
     pub async fn verify_inputs(&self, inputs: &Proofs) -> Result<Verification, Error> {
+        self.verify_inputs_with_lifecycle(inputs, true).await
+    }
+
+    /// Verify input structure and DHKE proofs without current keyset lifecycle checks.
+    ///
+    /// This is limited to CTF terminal rejection after an authorization cutoff.
+    #[instrument(skip_all)]
+    pub(super) async fn verify_inputs_historically(
+        &self,
+        inputs: &Proofs,
+    ) -> Result<Verification, Error> {
+        self.verify_inputs_with_lifecycle(inputs, false).await
+    }
+
+    async fn verify_inputs_with_lifecycle(
+        &self,
+        inputs: &Proofs,
+        require_current_lifecycle: bool,
+    ) -> Result<Verification, Error> {
         // Check max inputs limit
         let inputs_count = inputs.len();
         if inputs_count > self.max_inputs {
@@ -242,7 +323,11 @@ impl Mint {
         }
 
         Mint::check_inputs_unique(inputs)?;
-        let unit = self.verify_inputs_keyset(inputs).await?;
+        let unit = if require_current_lifecycle {
+            self.verify_inputs_keyset(inputs).await?
+        } else {
+            self.verify_inputs_keyset_historically(inputs).await?
+        };
 
         if unit == CurrencyUnit::Auth {
             return Err(Error::UnsupportedUnit);

@@ -11,6 +11,7 @@ use bitcoin::secp256k1::{
     Keypair, Message, Secp256k1, SecretKey as CoordinatorSecretKey, XOnlyPublicKey,
 };
 use cdk_common::amount::SplitTarget;
+use cdk_common::database::mint::CtfSettlementReplay;
 use cdk_common::dhke::construct_proofs;
 use cdk_common::error::{ErrorCode, ErrorResponse};
 use cdk_common::mint::Operation;
@@ -694,6 +695,30 @@ fn settlement_pay_to_unlock_secret(
                 "nonce": format!("{nonce:02x}").repeat(32),
                 "data": data,
                 "tags": tags
+            }
+        ])
+        .to_string(),
+    )
+}
+
+fn settlement_pay_to_unlock_secret_for_refund(
+    keyset: Id,
+    data: String,
+    expiry: u64,
+    nonce: u8,
+    refund_key: &SecretKey,
+) -> Secret {
+    Secret::new(
+        serde_json::json!([
+            "PAY_TO_UNLOCK",
+            {
+                "nonce": format!("{nonce:02x}").repeat(32),
+                "data": data,
+                "tags": [
+                    ["offer_keyset", keyset.to_string()],
+                    ["expiry", expiry.to_string()],
+                    ["refund", refund_key.public_key().x_only_public_key().to_string()]
+                ]
             }
         ])
         .to_string(),
@@ -3783,7 +3808,7 @@ async fn test_ctf_settlement_commits_once_and_replays_after_attestation() {
             .get_ctf_settlement_replay(digest)
             .await
             .unwrap(),
-        Some(response.clone())
+        Some(CtfSettlementReplay::Committed(response.clone()))
     );
 
     let signing_attempts = mint.blind_sign_attempts();
@@ -3807,6 +3832,324 @@ async fn test_ctf_settlement_commits_once_and_replays_after_attestation() {
         signing_attempts,
         "completed replay trusts the persisted successor without signing again"
     );
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_committed_response_replays_after_cutoff() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let response = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now)
+        .await
+        .expect("pre-cutoff settlement should commit");
+
+    let replay = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), now + 60)
+        .await
+        .expect("committed request should replay after its cutoff");
+
+    assert_eq!(replay, response);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_cutoff_rejection_is_durable_and_side_effect_free() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let digest = fixture.request.request_digest().unwrap();
+    let cutoff = now + 60;
+    let completed_before = completed_swap_count(&mint).await;
+    let signing_before = mint.blind_sign_attempts();
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    assert_eq!(
+        mint.localstore()
+            .get_ctf_settlement_replay(digest)
+            .await
+            .unwrap(),
+        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+    );
+    assert_ctf_settlement_has_no_persistent_mutations(&mint, &fixture, completed_before).await;
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), cutoff + 1)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    assert_ctf_settlement_has_no_persistent_mutations(&mint, &fixture, completed_before).await;
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_cutoff_rejection_after_attestation_is_durable() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let cutoff = now + 60;
+    let completed_before = completed_swap_count(&mint).await;
+    let signing_before = mint.blind_sign_attempts();
+    assert!(mint
+        .localstore()
+        .update_condition_attestation(
+            &fixture.request.condition_id.to_string(),
+            "attested",
+            Some("YES"),
+            Some(now + 1),
+        )
+        .await
+        .unwrap());
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    assert_eq!(
+        mint.localstore()
+            .get_ctf_settlement_replay(fixture.request.request_digest().unwrap())
+            .await
+            .unwrap(),
+        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+    );
+    assert_ctf_settlement_has_no_persistent_mutations(&mint, &fixture, completed_before).await;
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), cutoff + 1)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    assert_ctf_settlement_has_no_persistent_mutations(&mint, &fixture, completed_before).await;
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_expired_invalid_requests_store_no_outcome() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let cutoff = now + 60;
+
+    let mut unknown_keyset = fixture.request.clone();
+    unknown_keyset.participants[0].inputs[0].keyset_id =
+        Id::from_str("001711afb1de20d0").expect("syntactically valid unknown keyset");
+    assert!(matches!(
+        mint.process_ctf_settlement(&unknown_keyset, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::Protocol(_)) | Err(CtfSettlementError::Mint(Error::UnknownKeySet))
+    ));
+    assert_ctf_settlement_replay_absent(&mint, &unknown_keyset).await;
+
+    let mut invalid_signature = fixture.request.clone();
+    invalid_signature.participants[0].inputs[0].c = invalid_signature.participants[1].inputs[0].c;
+    assert!(matches!(
+        mint.process_ctf_settlement(&invalid_signature, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::Mint(_))
+    ));
+    assert_ctf_settlement_replay_absent(&mint, &invalid_signature).await;
+
+    let mut malformed = fixture.request.clone();
+    malformed.participants.pop();
+    assert!(matches!(
+        mint.process_ctf_settlement(&malformed, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::Protocol(_))
+    ));
+    assert_ctf_settlement_replay_absent(&mint, &malformed).await;
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_expired_unsupported_output_stores_no_outcome() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let cutoff = now + 60;
+    let completed_before = completed_swap_count(&mint).await;
+    let signing_before = mint.blind_sign_attempts();
+    let output = &fixture.request.participants[0].outputs[0];
+    remove_test_keyset_amount(&mint, output.keyset_id, output.amount.to_u64());
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::Protocol(
+            cdk_common::nuts::nut_ctf::settlement::Error::UnsupportedDenomination
+        ))
+    ));
+    assert_ctf_settlement_replay_absent(&mint, &fixture.request).await;
+    assert_ctf_settlement_has_no_persistent_mutations(&mint, &fixture, completed_before).await;
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_cutoff_rejection_allows_refunded_input() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let source = mint_test_proofs_for_unit(&mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let mut fixture = standard_settlement_fixture(&mint, now).await;
+    let refund_key = SecretKey::generate();
+    let offer_keyset = fixture.request.participants[0].inputs[0].keyset_id;
+    let commitment = ctf_receive_commitment(&fixture.request.participants[0].outputs).unwrap();
+    let cutoff = now.saturating_sub(1);
+    let refunded_input = issue_locked_proof(
+        &mint,
+        source,
+        offer_keyset,
+        settlement_pay_to_unlock_secret_for_refund(
+            offer_keyset,
+            commitment.to_string(),
+            cutoff,
+            42,
+            &refund_key,
+        ),
+    )
+    .await;
+    fixture.request.participants[0].inputs = vec![refunded_input.clone()];
+    canonicalize_settlement_participants(&mut fixture.request.participants);
+
+    let refunded_inputs = vec![refunded_input];
+    let refunded_ys = refunded_inputs.ys().unwrap();
+    let refund_fee = mint.get_proofs_fee(&refunded_inputs).await.unwrap().total;
+    let refund_amount = refunded_inputs[0].amount - refund_fee;
+    let (refund_outputs, _) = create_premint(&mint, offer_keyset, refund_amount);
+    let mut refund = SwapRequest::new(refunded_inputs, refund_outputs);
+    sign_pay_to_unlock_refund(&mut refund, 0, &refund_key).unwrap();
+    mint.process_swap_request(refund)
+        .await
+        .expect("post-expiry refund should spend the settlement input");
+
+    let completed_before = completed_swap_count(&mint).await;
+    let signing_before = mint.blind_sign_attempts();
+    let refunded_states_before = mint
+        .localstore()
+        .get_proofs_states(&refunded_ys)
+        .await
+        .unwrap();
+    assert!(refunded_states_before
+        .iter()
+        .all(|state| matches!(state, Some(State::Spent))));
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), now)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    assert_eq!(
+        mint.localstore()
+            .get_ctf_settlement_replay(fixture.request.request_digest().unwrap())
+            .await
+            .unwrap(),
+        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+    );
+    assert_eq!(
+        mint.localstore()
+            .get_proofs_states(&refunded_ys)
+            .await
+            .unwrap(),
+        refunded_states_before
+    );
+    assert!(mint
+        .localstore()
+        .get_blind_signatures(&fixture.output_points)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert_eq!(completed_swap_count(&mint).await, completed_before);
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), now + 1)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_cutoff_rejection_accepts_inactive_historical_keysets() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let cutoff = now + 60;
+    rewrite_test_keyset(&mint, fixture.output_only_keyset, false, 1, None);
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    assert_eq!(
+        mint.localstore()
+            .get_ctf_settlement_replay(fixture.request.request_digest().unwrap())
+            .await
+            .unwrap(),
+        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+    );
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_cutoff_rejection_accepts_expired_historical_keysets() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&mint, now).await;
+    let cutoff = now + 60;
+    let completed_before = completed_swap_count(&mint).await;
+    let signing_before = mint.blind_sign_attempts();
+    let involved_keysets = fixture
+        .request
+        .participants
+        .iter()
+        .flat_map(|participant| {
+            participant
+                .inputs
+                .iter()
+                .map(|proof| proof.keyset_id)
+                .chain(participant.outputs.iter().map(|output| output.keyset_id))
+        })
+        .collect::<HashSet<_>>();
+    for keyset in involved_keysets {
+        rewrite_test_keyset(&mint, keyset, false, 1, Some(now - 1));
+    }
+
+    assert!(matches!(
+        mint.process_ctf_settlement(&fixture.request, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    assert_eq!(
+        mint.localstore()
+            .get_ctf_settlement_replay(fixture.request.request_digest().unwrap())
+            .await
+            .unwrap(),
+        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+    );
+    assert_ctf_settlement_has_no_persistent_mutations(&mint, &fixture, completed_before).await;
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
 }
 
 #[tokio::test]
@@ -4039,6 +4382,89 @@ async fn test_ctf_settlement_cross_instance_sqlite_replays_one_commit() {
 }
 
 #[tokio::test]
+async fn test_ctf_settlement_cross_instance_cutoff_rejection_prevents_paused_commit() {
+    let path = std::env::temp_dir().join(format!(
+        "cdk-settlement-cutoff-race-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Arc::new(
+        cdk_sqlite::mint::MintSqliteDatabase::new(path.clone())
+            .await
+            .unwrap(),
+    );
+    let mnemonic = Mnemonic::generate(12).unwrap();
+    let seed = mnemonic.to_seed_normalized("");
+    let first_mint = build_test_mint_with_unit(db.clone(), &seed, CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = standard_settlement_fixture(&first_mint, now).await;
+    let second_mint = build_test_mint_with_unit(db.clone(), &seed, CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let digest = fixture.request.request_digest().unwrap();
+    let cutoff = now + 60;
+    let completed_before = completed_swap_count(&first_mint).await;
+    let signing_before = first_mint.blind_sign_attempts();
+    let (reached, release) = first_mint.arm_atomic_ctf_test_pause().await;
+    let first_request = fixture.request.clone();
+    let first_runner = first_mint.clone();
+    let first = tokio::spawn(async move {
+        first_runner
+            .process_ctf_settlement(&first_request, settlement_settings(), now)
+            .await
+    });
+
+    timeout(Duration::from_secs(2), reached)
+        .await
+        .expect("first instance should reach its pre-transaction pause")
+        .expect("settlement pause sender");
+    let second_request = fixture.request.clone();
+    let second_runner = second_mint.clone();
+    assert!(matches!(
+        second_runner
+            .process_ctf_settlement(&second_request, settlement_settings(), cutoff)
+            .await,
+        Err(CtfSettlementError::AuthorizationExpired)
+    ));
+    release
+        .send(())
+        .expect("first settlement should remain paused");
+    assert!(matches!(
+        timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first instance should finish after release")
+            .expect("first settlement task"),
+        Err(CtfSettlementError::Mint(Error::SettlementAfterExpiry))
+    ));
+
+    assert_eq!(
+        first_mint
+            .localstore()
+            .get_ctf_settlement_replay(digest)
+            .await
+            .unwrap(),
+        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+    );
+    assert_ctf_settlement_has_no_persistent_mutations(&first_mint, &fixture, completed_before)
+        .await;
+    assert_eq!(first_mint.blind_sign_attempts(), signing_before + 1);
+
+    first_mint.stop().await.unwrap();
+    second_mint.stop().await.unwrap();
+    drop(first_mint);
+    drop(second_mint);
+    drop(db);
+    for artifact in [
+        path.clone(),
+        path.with_extension("db-shm"),
+        path.with_extension("db-wal"),
+    ] {
+        let _ = std::fs::remove_file(artifact);
+    }
+}
+
+#[tokio::test]
 async fn test_ctf_settlement_replay_write_failure_rolls_back_everything() {
     let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
         .await
@@ -4073,6 +4499,24 @@ async fn assert_ctf_settlement_absent(
     fixture: &StandardSettlementFixture,
     completed_before: usize,
 ) {
+    assert_ctf_settlement_has_no_persistent_mutations(mint, fixture, completed_before).await;
+    assert_ctf_settlement_replay_absent(mint, &fixture.request).await;
+}
+
+async fn assert_ctf_settlement_replay_absent(mint: &Mint, request: &CtfSettlementRequest) {
+    assert!(mint
+        .localstore()
+        .get_ctf_settlement_replay(request.request_digest().unwrap())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+async fn assert_ctf_settlement_has_no_persistent_mutations(
+    mint: &Mint,
+    fixture: &StandardSettlementFixture,
+    completed_before: usize,
+) {
     assert!(mint
         .localstore()
         .get_proofs_states(&fixture.input_ys)
@@ -4087,12 +4531,6 @@ async fn assert_ctf_settlement_absent(
         .unwrap()
         .iter()
         .all(Option::is_none));
-    assert!(mint
-        .localstore()
-        .get_ctf_settlement_replay(fixture.request.request_digest().unwrap())
-        .await
-        .unwrap()
-        .is_none());
     assert_eq!(completed_swap_count(mint).await, completed_before);
 }
 

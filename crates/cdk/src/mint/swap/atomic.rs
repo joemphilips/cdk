@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(any(test, feature = "conditional-tokens"))]
 use cdk_common::database;
 use cdk_common::database::mint::Acquired;
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::database::mint::CtfSettlementReplay;
 use cdk_common::database::DynMintTransaction;
 use cdk_common::mint::{Operation, OperationKind, ProofsWithState};
 use cdk_common::nuts::{BlindSignature, BlindedMessage};
@@ -345,12 +347,12 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
     request_digest: CanonicalHash,
     settlement: PreparedCtfSettlement,
 ) -> Result<CtfSettlementResponse, Error> {
-    if let Some(response) = mint
+    if let Some(replay) = mint
         .localstore()
         .get_ctf_settlement_replay(request_digest)
         .await?
     {
-        return Ok(response);
+        return replay_response_or_expiry(replay);
     }
 
     let PreparedCtfSettlement {
@@ -386,6 +388,37 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
         response,
     )
     .await
+}
+
+/// Persist or replay a cutoff rejection under the same condition lock as commits.
+#[cfg(feature = "conditional-tokens")]
+pub(in crate::mint) async fn reject_atomic_ctf_settlement(
+    mint: &Mint,
+    condition_id: &str,
+    request_digest: CanonicalHash,
+    cutoff: u64,
+) -> Result<CtfSettlementReplay, Error> {
+    if let Some(replay) = mint
+        .localstore()
+        .get_ctf_settlement_replay(request_digest)
+        .await?
+    {
+        return Ok(replay);
+    }
+
+    let mut tx = mint.localstore().begin_transaction().await?;
+    let outcome =
+        persist_ctf_settlement_rejection_transaction(&mut tx, condition_id, request_digest, cutoff)
+            .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(error);
+        }
+    };
+    tx.commit().await?;
+    Ok(outcome)
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -505,7 +538,7 @@ async fn persist_atomic_ctf_settlement_transaction(
     response: &CtfSettlementResponse,
 ) -> Result<AtomicSettlementOutcome, Error> {
     if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
-        return Ok(AtomicSettlementOutcome::Replayed(replay));
+        return replay_atomic_outcome(replay);
     }
 
     let condition = tx
@@ -513,7 +546,7 @@ async fn persist_atomic_ctf_settlement_transaction(
         .await?
         .ok_or(Error::ConditionNotFound)?;
     if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
-        return Ok(AtomicSettlementOutcome::Replayed(replay));
+        return replay_atomic_outcome(replay);
     }
     if condition.attestation_status != STATUS_PENDING {
         return Err(Error::ConvertNotPermitted);
@@ -525,6 +558,45 @@ async fn persist_atomic_ctf_settlement_transaction(
     tx.add_ctf_settlement_replay(request_digest, &operation_id, response)
         .await?;
     Ok(AtomicSettlementOutcome::Committed)
+}
+
+#[cfg(feature = "conditional-tokens")]
+async fn persist_ctf_settlement_rejection_transaction(
+    tx: &mut DynMintTransaction,
+    condition_id: &str,
+    request_digest: CanonicalHash,
+    cutoff: u64,
+) -> Result<CtfSettlementReplay, Error> {
+    if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
+        return Ok(replay);
+    }
+
+    tx.get_condition_for_update(condition_id)
+        .await?
+        .ok_or(Error::ConditionNotFound)?;
+    if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
+        return Ok(replay);
+    }
+
+    tx.add_ctf_settlement_rejection(request_digest, cutoff)
+        .await?;
+    Ok(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn replay_response_or_expiry(replay: CtfSettlementReplay) -> Result<CtfSettlementResponse, Error> {
+    match replay {
+        CtfSettlementReplay::Committed(response) => Ok(response),
+        CtfSettlementReplay::RejectedAfterCutoff { .. } => Err(Error::SettlementAfterExpiry),
+    }
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn replay_atomic_outcome(replay: CtfSettlementReplay) -> Result<AtomicSettlementOutcome, Error> {
+    match replay {
+        CtfSettlementReplay::Committed(response) => Ok(AtomicSettlementOutcome::Replayed(response)),
+        CtfSettlementReplay::RejectedAfterCutoff { .. } => Err(Error::SettlementAfterExpiry),
+    }
 }
 
 #[cfg(feature = "conditional-tokens")]

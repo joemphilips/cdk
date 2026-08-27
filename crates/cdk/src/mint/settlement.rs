@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 
+use cdk_common::database::mint::CtfSettlementReplay;
 use cdk_common::mint::MintKeySetInfo;
 use cdk_common::nuts::nut00::{BlindedMessage, Proofs, ProofsMethods};
 use cdk_common::nuts::nut02::Id;
@@ -20,7 +21,7 @@ use super::conditions::STATUS_PENDING;
 use super::ctf_conservation::{
     condition_outcomes, CtfCoverageResolver, OutcomeConservation, ResolvedCoverage,
 };
-use super::swap::atomic::execute_atomic_ctf_settlement;
+use super::swap::atomic::{execute_atomic_ctf_settlement, reject_atomic_ctf_settlement};
 use super::{Mint, Verification};
 use crate::fees::ProofsFeeBreakdown;
 use crate::Error;
@@ -34,6 +35,19 @@ pub(super) struct PreparedCtfSettlement {
     pub(super) input_verification: Verification,
     pub(super) output_verification: Verification,
     pub(super) fee: ProofsFeeBreakdown,
+}
+
+/// The result of preparation before the settlement commit transaction starts.
+pub(super) enum CtfSettlementPreparation {
+    /// The settlement can enter its commit transaction.
+    Ready(PreparedCtfSettlement),
+    /// The request reached its earliest authorization expiry before first commit.
+    Expired {
+        /// The condition that supplies the shared commit-or-reject lock.
+        condition_id: String,
+        /// The earliest authorization expiry in the request.
+        cutoff: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -101,7 +115,7 @@ impl Mint {
 
         let resolver = CtfCoverageResolver::new(self, &condition_id, &outcomes)?;
         let keysets = range_authorization_keysets(inputs, manifest);
-        self.resolve_involved_keysets(keysets, &resolver, &collateral, now)
+        self.resolve_involved_keysets(keysets, &resolver, &collateral, Some(now))
             .await?;
         self.validate_manifest_denominations(manifest)?;
         self.verify_inputs(inputs).await?;
@@ -118,31 +132,47 @@ impl Mint {
     ) -> Result<CtfSettlementResponse, CtfSettlementError> {
         request.verify_coordinator_authentication()?;
         let request_digest = request.request_digest()?;
-        if let Some(response) = self
+        if let Some(replay) = self
             .localstore
             .get_ctf_settlement_replay(request_digest)
             .await
             .map_err(Error::from)?
         {
-            return Ok(response);
+            return replay_ctf_settlement_result(replay);
         }
 
         let flight = self.ctf_settlement_flight(request_digest);
         let _flight_guard = flight.lock().await;
-        if let Some(response) = self
+        if let Some(replay) = self
             .localstore
             .get_ctf_settlement_replay(request_digest)
             .await
             .map_err(Error::from)?
         {
-            return Ok(response);
+            return replay_ctf_settlement_result(replay);
         }
 
         let _keyset_snapshot = self.keyset_store_lock.read().await;
-        let prepared = self.prepare_ctf_settlement(request, settings, now).await?;
-        execute_atomic_ctf_settlement(self, request_digest, prepared)
-            .await
-            .map_err(CtfSettlementError::Mint)
+        match self
+            .prepare_ctf_settlement_for_execution(request, settings, now)
+            .await?
+        {
+            CtfSettlementPreparation::Ready(prepared) => {
+                execute_atomic_ctf_settlement(self, request_digest, prepared)
+                    .await
+                    .map_err(CtfSettlementError::Mint)
+            }
+            CtfSettlementPreparation::Expired {
+                condition_id,
+                cutoff,
+            } => {
+                let replay =
+                    reject_atomic_ctf_settlement(self, &condition_id, request_digest, cutoff)
+                        .await
+                        .map_err(CtfSettlementError::Mint)?;
+                replay_ctf_settlement_result(replay)
+            }
+        }
     }
 
     fn ctf_settlement_flight(
@@ -162,12 +192,30 @@ impl Mint {
         flight
     }
 
+    #[cfg(test)]
     pub(super) async fn prepare_ctf_settlement(
         &self,
         request: &CtfSettlementRequest,
         settings: NutCtfSettlementSettings,
         now: u64,
     ) -> Result<PreparedCtfSettlement, CtfSettlementError> {
+        match self
+            .prepare_ctf_settlement_for_execution(request, settings, now)
+            .await?
+        {
+            CtfSettlementPreparation::Ready(prepared) => Ok(prepared),
+            CtfSettlementPreparation::Expired { .. } => {
+                Err(CtfSettlementError::AuthorizationExpired)
+            }
+        }
+    }
+
+    async fn prepare_ctf_settlement_for_execution(
+        &self,
+        request: &CtfSettlementRequest,
+        settings: NutCtfSettlementSettings,
+        now: u64,
+    ) -> Result<CtfSettlementPreparation, CtfSettlementError> {
         let limits = settings.structural_limits()?;
         if !request.parent_collection_id.is_zero() {
             return Err(SettlementError::NonRootParentCollection.into());
@@ -176,16 +224,23 @@ impl Mint {
         let authorizations = request.validated_authorizations(limits)?;
         validate_individual_conditions(request)?;
         let condition_id = request.condition_id.to_string();
-        let condition = self.load_pending_condition(&condition_id).await?;
+        let cutoff = authorization_cutoff(&authorizations);
+        let expired_cutoff = cutoff.filter(|cutoff| *cutoff <= now);
+        let condition = self.load_condition(&condition_id).await?;
+        if expired_cutoff.is_none() && condition.attestation_status != STATUS_PENDING {
+            return Err(Error::ConvertNotPermitted.into());
+        }
         let collateral = condition
             .collateral
             .clone()
             .ok_or(CtfSettlementError::MissingCollateralUnit)?;
         let outcomes = condition_outcomes(&condition)?;
-        let effective_expiry_ceiling = self
-            .settlement_expiry_ceiling(&condition_id, settings, now)
-            .await?;
-        validate_authorization_expiries(&authorizations, now, effective_expiry_ceiling)?;
+        if expired_cutoff.is_none() {
+            let effective_expiry_ceiling = self
+                .settlement_expiry_ceiling(&condition_id, settings, now)
+                .await?;
+            validate_authorization_expiry_ceiling(&authorizations, effective_expiry_ceiling)?;
+        }
 
         let resolver = CtfCoverageResolver::new(self, &condition_id, &outcomes)?;
         for participant in &request.participants {
@@ -194,15 +249,37 @@ impl Mint {
             }
         }
         let coverages = self
-            .resolve_settlement_keysets(request, &resolver, &collateral, now)
+            .resolve_settlement_keysets(
+                request,
+                &resolver,
+                &collateral,
+                expired_cutoff.is_none().then_some(now),
+            )
             .await?;
         let flat = flatten_settlement(request, &coverages, &outcomes)?;
+        self.validate_output_denominations(&flat.outputs)?;
         let fee = self.get_proofs_fee(&flat.inputs).await?;
         flat.conservation.validate(fee.total.into())?;
-        let input_verification = self.verify_inputs(&flat.inputs).await?;
-        let output_verification = self.verify_outputs(&flat.outputs)?;
+        let input_verification = match expired_cutoff {
+            Some(_) => self.verify_inputs_historically(&flat.inputs).await?,
+            None => self.verify_inputs(&flat.inputs).await?,
+        };
+        if expired_cutoff.is_none() {
+            self.require_inputs_unspent(&flat.inputs).await?;
+        }
+        let output_verification = match expired_cutoff {
+            Some(_) => self.verify_outputs_historically(&flat.outputs)?,
+            None => self.verify_outputs(&flat.outputs)?,
+        };
 
-        Ok(PreparedCtfSettlement {
+        if let Some(cutoff) = expired_cutoff {
+            return Ok(CtfSettlementPreparation::Expired {
+                condition_id,
+                cutoff,
+            });
+        }
+
+        Ok(CtfSettlementPreparation::Ready(PreparedCtfSettlement {
             condition_id,
             participant_output_ranges: flat.output_ranges,
             inputs: flat.inputs,
@@ -210,10 +287,21 @@ impl Mint {
             input_verification,
             output_verification,
             fee,
-        })
+        }))
     }
 
     async fn load_pending_condition(
+        &self,
+        condition_id: &str,
+    ) -> Result<cdk_common::mint::StoredCondition, CtfSettlementError> {
+        let condition = self.load_condition(condition_id).await?;
+        if condition.attestation_status != STATUS_PENDING {
+            return Err(Error::ConvertNotPermitted.into());
+        }
+        Ok(condition)
+    }
+
+    async fn load_condition(
         &self,
         condition_id: &str,
     ) -> Result<cdk_common::mint::StoredCondition, CtfSettlementError> {
@@ -223,9 +311,6 @@ impl Mint {
             .await
             .map_err(Error::from)?
             .ok_or(Error::ConditionNotFound)?;
-        if condition.attestation_status != STATUS_PENDING {
-            return Err(Error::ConvertNotPermitted.into());
-        }
         Ok(condition)
     }
 
@@ -270,9 +355,9 @@ impl Mint {
         request: &CtfSettlementRequest,
         resolver: &CtfCoverageResolver<'_>,
         collateral: &CurrencyUnit,
-        now: u64,
+        active_at: Option<u64>,
     ) -> Result<HashMap<Id, ResolvedCoverage>, CtfSettlementError> {
-        self.resolve_involved_keysets(involved_keysets(request), resolver, collateral, now)
+        self.resolve_involved_keysets(involved_keysets(request), resolver, collateral, active_at)
             .await
     }
 
@@ -281,13 +366,17 @@ impl Mint {
         keysets: BTreeSet<Id>,
         resolver: &CtfCoverageResolver<'_>,
         collateral: &CurrencyUnit,
-        now: u64,
+        active_at: Option<u64>,
     ) -> Result<HashMap<Id, ResolvedCoverage>, CtfSettlementError> {
         let mut resolved = HashMap::new();
         for id in keysets {
             let info = self.get_keyset_info(&id).ok_or(Error::UnknownKeySet)?;
             validate_involved_keyset(&info, collateral)?;
-            resolved.insert(id, resolver.resolve_keyset_at(&id, now).await?);
+            let coverage = match active_at {
+                Some(now) => resolver.resolve_keyset_at(&id, now).await?,
+                None => resolver.resolve_keyset_historically(&id).await?,
+            };
+            resolved.insert(id, coverage);
         }
         Ok(resolved)
     }
@@ -301,6 +390,21 @@ impl Mint {
                 .get_keyset_info(&entry.keyset_id)
                 .ok_or(Error::UnknownKeySet)?;
             if !info.amounts.contains(&entry.amount) {
+                return Err(SettlementError::UnsupportedDenomination.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_output_denominations(
+        &self,
+        outputs: &[BlindedMessage],
+    ) -> Result<(), CtfSettlementError> {
+        for output in outputs {
+            let info = self
+                .get_keyset_info(&output.keyset_id)
+                .ok_or(Error::UnknownKeySet)?;
+            if !info.amounts.contains(&output.amount.to_u64()) {
                 return Err(SettlementError::UnsupportedDenomination.into());
             }
         }
@@ -327,6 +431,17 @@ impl Mint {
             }
         }
         Ok(())
+    }
+}
+
+fn replay_ctf_settlement_result(
+    replay: CtfSettlementReplay,
+) -> Result<CtfSettlementResponse, CtfSettlementError> {
+    match replay {
+        CtfSettlementReplay::Committed(response) => Ok(response),
+        CtfSettlementReplay::RejectedAfterCutoff { .. } => {
+            Err(CtfSettlementError::AuthorizationExpired)
+        }
     }
 }
 
@@ -455,6 +570,14 @@ fn validate_authorization_expiries(
     {
         return Err(CtfSettlementError::AuthorizationExpired);
     }
+    validate_authorization_expiry_ceiling(authorizations, ceiling)?;
+    Ok(())
+}
+
+fn validate_authorization_expiry_ceiling(
+    authorizations: &[PayToUnlockAuthorization],
+    ceiling: u64,
+) -> Result<(), CtfSettlementError> {
     if authorizations
         .iter()
         .any(|authorization| authorization.expiry >= ceiling)
@@ -462,6 +585,13 @@ fn validate_authorization_expiries(
         return Err(CtfSettlementError::AuthorizationBeyondKeysetExpiry);
     }
     Ok(())
+}
+
+fn authorization_cutoff(authorizations: &[PayToUnlockAuthorization]) -> Option<u64> {
+    authorizations
+        .iter()
+        .map(|authorization| authorization.expiry)
+        .min()
 }
 
 #[cfg(test)]

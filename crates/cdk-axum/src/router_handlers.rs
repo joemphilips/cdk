@@ -1839,6 +1839,33 @@ mod ctf_convert_admission_tests {
     }
 
     #[tokio::test]
+    async fn durable_settlement_cutoff_errors_use_http_400_and_15005() {
+        let cases = [
+            (
+                "initial rejection",
+                CtfSettlementError::AuthorizationExpired,
+            ),
+            (
+                "exact rejected replay",
+                CtfSettlementError::AuthorizationExpired,
+            ),
+            (
+                "resumed losing request",
+                CtfSettlementError::Mint(cdk::Error::SettlementAfterExpiry),
+            ),
+        ];
+
+        for (_, error) in cases {
+            let response = ctf_settlement_execution_error_response(error);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                decode_error(response).await.code,
+                ErrorCode::SettlementAfterExpiry
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_coordinator_signature_uses_15015() {
         let payload = serde_json::to_vec(&serde_json::json!({
             "condition_id": "11".repeat(32),

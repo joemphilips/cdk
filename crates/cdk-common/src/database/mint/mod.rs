@@ -724,6 +724,19 @@ pub trait ConditionsDatabase {
     ) -> Result<Option<(String, String, String)>, Self::Err>;
 }
 
+/// Durable terminal outcomes for multi-party CTF settlement.
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CtfSettlementReplay {
+    /// The settlement committed with this exact response.
+    Committed(CtfSettlementResponse),
+    /// The mint rejected the first commit after this authorization cutoff.
+    RejectedAfterCutoff {
+        /// The earliest authorization expiry in the request.
+        cutoff: u64,
+    },
+}
+
 /// Atomic idempotency records for multi-party CTF settlement.
 #[cfg(feature = "conditional-tokens")]
 #[async_trait]
@@ -731,11 +744,11 @@ pub trait CtfSettlementReplayTransaction {
     /// Database error.
     type Err: Into<Error> + From<Error>;
 
-    /// Read a committed response inside the current transaction.
+    /// Read a terminal settlement outcome inside the current transaction.
     async fn get_ctf_settlement_replay(
         &mut self,
         request_digest: CanonicalHash,
-    ) -> Result<Option<CtfSettlementResponse>, Self::Err>;
+    ) -> Result<Option<CtfSettlementReplay>, Self::Err>;
 
     /// Persist the exact response after its swap operation has completed.
     async fn add_ctf_settlement_replay(
@@ -743,6 +756,13 @@ pub trait CtfSettlementReplayTransaction {
         request_digest: CanonicalHash,
         operation_id: &uuid::Uuid,
         response: &CtfSettlementResponse,
+    ) -> Result<(), Self::Err>;
+
+    /// Persist a terminal cutoff rejection without settlement mutations.
+    async fn add_ctf_settlement_rejection(
+        &mut self,
+        request_digest: CanonicalHash,
+        cutoff: u64,
     ) -> Result<(), Self::Err>;
 }
 
@@ -753,11 +773,11 @@ pub trait CtfSettlementReplayDatabase {
     /// Database error.
     type Err: Into<Error> + From<Error>;
 
-    /// Read the exact committed response for a request digest.
+    /// Read the terminal settlement outcome for a request digest.
     async fn get_ctf_settlement_replay(
         &self,
         request_digest: CanonicalHash,
-    ) -> Result<Option<CtfSettlementResponse>, Self::Err>;
+    ) -> Result<Option<CtfSettlementReplay>, Self::Err>;
 }
 
 /// Base database writer

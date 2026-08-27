@@ -106,7 +106,26 @@ impl<'a> CtfCoverageResolver<'a> {
         keyset: &Id,
         now: u64,
     ) -> Result<ResolvedCoverage, Error> {
-        let keyset_info = self.active_keyset_info(keyset, now)?;
+        self.resolve_keyset_with_lifecycle(keyset, Some(now)).await
+    }
+
+    /// Resolve a known historical keyset without requiring it to be active now.
+    ///
+    /// This supports a terminal cutoff rejection. The request still proves its
+    /// keyset identity and condition binding. It cannot produce new signatures.
+    pub(super) async fn resolve_keyset_historically(
+        &self,
+        keyset: &Id,
+    ) -> Result<ResolvedCoverage, Error> {
+        self.resolve_keyset_with_lifecycle(keyset, None).await
+    }
+
+    async fn resolve_keyset_with_lifecycle(
+        &self,
+        keyset: &Id,
+        now: Option<u64>,
+    ) -> Result<ResolvedCoverage, Error> {
+        let keyset_info = self.keyset_info(keyset, now)?;
         let binding = self
             .mint
             .localstore
@@ -156,16 +175,18 @@ impl<'a> CtfCoverageResolver<'a> {
         }
     }
 
-    fn active_keyset_info(&self, keyset: &Id, now: u64) -> Result<MintKeySetInfo, Error> {
+    fn keyset_info(&self, keyset: &Id, now: Option<u64>) -> Result<MintKeySetInfo, Error> {
         let info = self
             .mint
             .get_keyset_info(keyset)
             .ok_or(Error::UnknownKeySet)?;
-        if !info.active {
-            return Err(Error::InactiveKeyset);
-        }
-        if info.final_expiry.is_some_and(|expiry| expiry < now) {
-            return Err(Error::ExpiredKeyset);
+        if let Some(now) = now {
+            if !info.active {
+                return Err(Error::InactiveKeyset);
+            }
+            if info.final_expiry.is_some_and(|expiry| expiry < now) {
+                return Err(Error::ExpiredKeyset);
+            }
         }
         Ok(info)
     }

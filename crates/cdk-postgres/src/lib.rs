@@ -410,11 +410,17 @@ mod test {
     use std::time::Duration;
 
     #[cfg(feature = "conditional-tokens")]
-    use cdk_common::database::mint::{ConditionsDatabase, Database};
+    use cdk_common::database::mint::{ConditionsDatabase, CtfSettlementReplay, Database};
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::mint::Operation;
     #[cfg(feature = "conditional-tokens")]
     use cdk_common::mint::StoredCondition;
     #[cfg(feature = "conditional-tokens")]
     use cdk_common::mint_db_conditional_test;
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse};
+    #[cfg(feature = "conditional-tokens")]
+    use cdk_common::Amount;
     use cdk_common::{mint_db_test, wallet_db_test};
 
     use super::*;
@@ -494,6 +500,129 @@ mod test {
             .expect("attestation should resume after commit")
             .expect("attestation task")
             .unwrap());
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn condition_lock_serializes_terminal_settlement_outcomes_across_pools() {
+        let schema = format!("settlement_outcome_{}", uuid::Uuid::new_v4().simple());
+        let winning_db = provide_mint_db(schema.clone()).await;
+        let waiting_db = provide_mint_db(schema).await;
+        let condition = test_condition();
+        winning_db.add_condition(condition.clone()).await.unwrap();
+        let digest = CanonicalHash::from_bytes([0x42; 32]);
+        let response = CtfSettlementResponse {
+            signatures: vec![Vec::new(), Vec::new()],
+        };
+        let operation = Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO);
+
+        let mut winning_tx = winning_db.begin_transaction().await.unwrap();
+        winning_tx
+            .get_condition_for_update(&condition.condition_id)
+            .await
+            .unwrap()
+            .unwrap();
+        winning_tx
+            .add_completed_operation(&operation, &std::collections::HashMap::new())
+            .await
+            .unwrap();
+        winning_tx
+            .add_ctf_settlement_replay(digest, operation.id(), &response)
+            .await
+            .unwrap();
+
+        let condition_id = condition.condition_id.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut waiting = tokio::spawn(async move {
+            let mut transaction = waiting_db.begin_transaction().await?;
+            assert!(transaction
+                .get_ctf_settlement_replay(digest)
+                .await?
+                .is_none());
+            started_tx
+                .send(())
+                .expect("waiting transaction start signal");
+            transaction.get_condition_for_update(&condition_id).await?;
+            let outcome = transaction
+                .get_ctf_settlement_replay(digest)
+                .await?
+                .expect("condition lock winner must publish one terminal outcome");
+            transaction.rollback().await?;
+            Ok::<_, Error>(outcome)
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "second pool must wait on the condition lock before selecting an outcome"
+        );
+
+        winning_tx.commit().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .expect("waiting transaction should resume")
+                .expect("waiting task")
+                .expect("waiting transaction"),
+            CtfSettlementReplay::Committed(response)
+        );
+
+        let schema = format!("settlement_rejection_{}", uuid::Uuid::new_v4().simple());
+        let winning_db = provide_mint_db(schema.clone()).await;
+        let waiting_db = provide_mint_db(schema).await;
+        let condition = test_condition();
+        winning_db.add_condition(condition.clone()).await.unwrap();
+        let digest = CanonicalHash::from_bytes([0x24; 32]);
+        let cutoff = 1_723_456_789;
+
+        let mut winning_tx = winning_db.begin_transaction().await.unwrap();
+        winning_tx
+            .get_condition_for_update(&condition.condition_id)
+            .await
+            .unwrap()
+            .unwrap();
+        winning_tx
+            .add_ctf_settlement_rejection(digest, cutoff)
+            .await
+            .unwrap();
+
+        let condition_id = condition.condition_id.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut waiting = tokio::spawn(async move {
+            let mut transaction = waiting_db.begin_transaction().await?;
+            assert!(transaction
+                .get_ctf_settlement_replay(digest)
+                .await?
+                .is_none());
+            started_tx
+                .send(())
+                .expect("waiting transaction start signal");
+            transaction.get_condition_for_update(&condition_id).await?;
+            let outcome = transaction
+                .get_ctf_settlement_replay(digest)
+                .await?
+                .expect("condition lock winner must publish one terminal outcome");
+            transaction.rollback().await?;
+            Ok::<_, Error>(outcome)
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "second pool must wait on the condition lock before selecting an outcome"
+        );
+
+        winning_tx.commit().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .expect("waiting transaction should resume")
+                .expect("waiting task")
+                .expect("waiting transaction"),
+            CtfSettlementReplay::RejectedAfterCutoff { cutoff }
+        );
     }
 
     #[cfg(feature = "conditional-tokens")]

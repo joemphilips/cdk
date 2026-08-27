@@ -6,7 +6,8 @@ use bitcoin::bip32::DerivationPath;
 use cashu::{CurrencyUnit, Id};
 
 use crate::database::mint::{
-    ConditionsDatabase, CtfSettlementReplayDatabase, Database, Error, KeysDatabase,
+    ConditionsDatabase, CtfSettlementReplay, CtfSettlementReplayDatabase, Database, Error,
+    KeysDatabase,
 };
 use crate::mint::{MintKeySetInfo, Operation, StoredCondition};
 use crate::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse};
@@ -324,13 +325,37 @@ where
         .unwrap();
     assert_eq!(
         transaction.get_ctf_settlement_replay(digest).await.unwrap(),
-        Some(response.clone())
+        Some(CtfSettlementReplay::Committed(response.clone()))
     );
     transaction.commit().await.unwrap();
 
     assert_eq!(
         db.get_ctf_settlement_replay(digest).await.unwrap(),
-        Some(response)
+        Some(CtfSettlementReplay::Committed(response))
+    );
+}
+
+/// Test that a cutoff rejection commits without a completed swap operation.
+pub async fn ctf_settlement_rejection_round_trip<DB>(db: DB)
+where
+    DB: Database<Error> + CtfSettlementReplayDatabase<Err = Error>,
+{
+    let digest = CanonicalHash::from_bytes([0x24; 32]);
+    let cutoff = 1_723_456_789;
+    let mut transaction = db.begin_transaction().await.unwrap();
+    transaction
+        .add_ctf_settlement_rejection(digest, cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        transaction.get_ctf_settlement_replay(digest).await.unwrap(),
+        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+    );
+    transaction.commit().await.unwrap();
+
+    assert_eq!(
+        db.get_ctf_settlement_replay(digest).await.unwrap(),
+        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
     );
 }
 
