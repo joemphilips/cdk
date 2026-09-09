@@ -2207,12 +2207,16 @@ impl PreparedMintd {
         {
             if let Some(rpc_settings) = settings.mint_management_rpc.clone() {
                 if rpc_settings.enabled {
+                    let peer_policy = rpc_settings.build_peer_policy()?;
                     let addr = rpc_settings.address.unwrap_or("127.0.0.1".to_string());
                     let port = rpc_settings.port.unwrap_or(8086);
                     let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(&addr, port, mint.clone())?
                         .with_mint_quote_payment_override(
                             rpc_settings.allow_mint_quote_payment_override,
                         );
+                    if let Some(peer_policy) = peer_policy {
+                        mint_rpc = mint_rpc.with_peer_policy(peer_policy);
+                    }
                     if let Some(activation) = activation.as_ref() {
                         mint_rpc =
                             mint_rpc.with_mutation_guard(Arc::new(ConfigurationMutationGuard {
@@ -2228,6 +2232,8 @@ impl PreparedMintd {
 
                     let tls_dir = if tls_dir.exists() {
                         Some(tls_dir)
+                    } else if rpc_settings.strict_tls {
+                        bail!("Management RPC TLS directory is missing; strict TLS requires certificates");
                     } else if rpc_settings.allow_insecure {
                         tracing::warn!(
                         "TLS directory does not exist: {}. Starting RPC server in INSECURE mode without TLS encryption because allow_insecure is true",
@@ -4605,6 +4611,15 @@ backend = "fakewallet"
             "CDK_MINTD_SIGNATORY_PORT",
             "CDK_MINTD_SIGNATORY_TLS_DIR",
             "CDK_MINTD_SIGNATORY_ALLOW_INSECURE",
+            "CDK_MINTD_MANAGEMENT_ENABLED",
+            "CDK_MINTD_MINT_MANAGEMENT_ENABLED",
+            "CDK_MINTD_MANAGEMENT_ADDRESS",
+            "CDK_MINTD_MANAGEMENT_PORT",
+            "CDK_MINTD_MANAGEMENT_TLS_DIR",
+            "CDK_MINTD_MANAGEMENT_ALLOW_INSECURE",
+            "CDK_MINTD_MANAGEMENT_STRICT_TLS",
+            "CDK_MINTD_MANAGEMENT_EXPECTED_CLIENT_DNS_NAME",
+            "CDK_MINTD_MANAGEMENT_EXPECTED_CLIENT_SPKI_PIN_PATH",
             "CDK_MINTD_LISTEN_HOST",
             "CDK_MINTD_LISTEN_PORT",
             "CDK_MINTD_PAYMENT_BACKEND",
