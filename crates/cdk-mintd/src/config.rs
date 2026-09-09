@@ -1,5 +1,10 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "management-rpc")]
+use anyhow::{anyhow, Context};
+#[cfg(feature = "management-rpc")]
+use std::fs;
+
 use bitcoin::hashes::{sha256, Hash};
 use cdk::nuts::{CurrencyUnit, PublicKey};
 use cdk::Amount;
@@ -1250,6 +1255,49 @@ pub struct MintManagementRpc {
     pub tls_dir: Option<PathBuf>,
     #[serde(default)]
     pub allow_insecure: bool,
+    /// Require TLS and an authenticated client identity for management RPC.
+    #[serde(default)]
+    pub strict_tls: bool,
+    /// DNS SAN required in the authenticated client certificate.
+    #[serde(default)]
+    pub expected_client_dns_name: Option<String>,
+    /// File containing the lowercase SHA-256 digest of the client SPKI DER.
+    #[serde(default)]
+    pub expected_client_spki_pin_path: Option<PathBuf>,
+}
+
+#[cfg(feature = "management-rpc")]
+impl MintManagementRpc {
+    /// Build the immutable peer identity policy for strict management RPC.
+    ///
+    /// The pin file is read only when strict TLS is enabled. Its contents are
+    /// validated by the RPC crate before the listener is started.
+    pub(crate) fn build_peer_policy(&self) -> anyhow::Result<Option<cdk_mint_rpc::PeerPolicy>> {
+        if !self.strict_tls {
+            return Ok(None);
+        }
+
+        let expected_dns_name = self
+            .expected_client_dns_name
+            .as_deref()
+            .ok_or_else(|| anyhow!("strict management RPC requires an expected client DNS SAN"))?;
+        let pin_path = self
+            .expected_client_spki_pin_path
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow!("strict management RPC requires an expected client SPKI pin file path")
+            })?;
+        let pin = fs::read_to_string(pin_path).with_context(|| {
+            format!(
+                "failed to read expected client SPKI pin file {}",
+                pin_path.display()
+            )
+        })?;
+
+        cdk_mint_rpc::PeerPolicy::new(expected_dns_name, pin.trim())
+            .map(Some)
+            .map_err(|error| anyhow!("invalid expected client peer policy: {error}"))
+    }
 }
 
 impl Settings {
@@ -1370,6 +1418,131 @@ impl Settings {
 mod tests {
 
     use super::*;
+
+    #[cfg(feature = "management-rpc")]
+    const VALID_CLIENT_SPKI_PIN: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[cfg(feature = "management-rpc")]
+    fn strict_management_rpc(pin_path: PathBuf, dns_name: &str) -> MintManagementRpc {
+        MintManagementRpc {
+            enabled: true,
+            strict_tls: true,
+            expected_client_dns_name: Some(dns_name.to_string()),
+            expected_client_spki_pin_path: Some(pin_path),
+            ..MintManagementRpc::default()
+        }
+    }
+
+    #[cfg(feature = "management-rpc")]
+    #[test]
+    fn strict_management_rpc_requires_expected_dns_name() {
+        let pin_path = crate::test_utils::unique_temp_path("cdk_mintd_peer_pin");
+        std::fs::write(&pin_path, VALID_CLIENT_SPKI_PIN).expect("write test pin");
+        let settings = MintManagementRpc {
+            strict_tls: true,
+            expected_client_spki_pin_path: Some(pin_path.clone()),
+            ..MintManagementRpc::default()
+        };
+
+        let error = settings
+            .build_peer_policy()
+            .expect_err("strict policy without DNS SAN must fail");
+
+        assert!(error.to_string().contains("expected client DNS SAN"));
+        let _ = std::fs::remove_file(pin_path);
+    }
+
+    #[cfg(feature = "management-rpc")]
+    #[test]
+    fn strict_management_rpc_requires_expected_pin_path() {
+        let settings = MintManagementRpc {
+            strict_tls: true,
+            expected_client_dns_name: Some("management-client".to_string()),
+            ..MintManagementRpc::default()
+        };
+
+        let error = settings
+            .build_peer_policy()
+            .expect_err("strict policy without pin path must fail");
+
+        assert!(error
+            .to_string()
+            .contains("expected client SPKI pin file path"));
+    }
+
+    #[cfg(feature = "management-rpc")]
+    #[test]
+    fn strict_management_rpc_rejects_unreadable_pin_file() {
+        let pin_path = crate::test_utils::unique_temp_path("cdk_mintd_missing_peer_pin");
+        let settings = strict_management_rpc(pin_path.clone(), "management-client");
+
+        let error = settings
+            .build_peer_policy()
+            .expect_err("missing pin file must fail");
+
+        assert!(error
+            .to_string()
+            .contains("failed to read expected client SPKI pin file"));
+        let _ = std::fs::remove_file(pin_path);
+    }
+
+    #[cfg(feature = "management-rpc")]
+    #[test]
+    fn strict_management_rpc_rejects_invalid_dns_name() {
+        let pin_path = crate::test_utils::unique_temp_path("cdk_mintd_peer_pin");
+        std::fs::write(&pin_path, VALID_CLIENT_SPKI_PIN).expect("write test pin");
+        let settings = strict_management_rpc(pin_path.clone(), "not a DNS name");
+
+        let error = settings
+            .build_peer_policy()
+            .expect_err("invalid DNS SAN must fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid expected client peer policy"));
+        let _ = std::fs::remove_file(pin_path);
+    }
+
+    #[cfg(feature = "management-rpc")]
+    #[test]
+    fn strict_management_rpc_rejects_invalid_pin_contents() {
+        let pin_path = crate::test_utils::unique_temp_path("cdk_mintd_peer_pin");
+        std::fs::write(&pin_path, "not-a-pin").expect("write test pin");
+        let settings = strict_management_rpc(pin_path.clone(), "management-client");
+
+        let error = settings
+            .build_peer_policy()
+            .expect_err("invalid pin must fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid expected client peer policy"));
+        let _ = std::fs::remove_file(pin_path);
+    }
+
+    #[cfg(feature = "management-rpc")]
+    #[test]
+    fn strict_management_rpc_builds_policy_from_dns_and_pin_file() {
+        let pin_path = crate::test_utils::unique_temp_path("cdk_mintd_peer_pin");
+        std::fs::write(&pin_path, format!(" {VALID_CLIENT_SPKI_PIN}\n")).expect("write test pin");
+        let settings = strict_management_rpc(pin_path.clone(), "management-client");
+
+        assert!(settings
+            .build_peer_policy()
+            .expect("valid strict policy should build")
+            .is_some());
+        let _ = std::fs::remove_file(pin_path);
+    }
+
+    #[cfg(feature = "management-rpc")]
+    #[test]
+    fn non_strict_management_rpc_keeps_generic_policy_absent() {
+        assert!(MintManagementRpc::default()
+            .build_peer_policy()
+            .expect("non-strict policy should be absent")
+            .is_none());
+    }
 
     #[cfg(feature = "bdk")]
     fn clear_bdk_env_vars() {

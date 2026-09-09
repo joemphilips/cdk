@@ -20,6 +20,7 @@ path = "src/bin/mint_rpc_cli.rs"
 
 [dependencies]
 anyhow.workspace = true
+bitcoin.workspace = true
 cdk = { workspace = true, features = [
     "mint",
 ] }
@@ -37,12 +38,14 @@ tonic-prost.workspace = true
 prost.workspace = true
 home.workspace = true
 rustls.workspace = true
+rustls-webpki = { version = "0.103.13", default-features = false, features = ["alloc"] }
 
 
 [dev-dependencies]
 cdk-sqlite = { workspace = true }
 cdk-fake-wallet = { workspace = true }
 bip39.workspace = true
+tempfile = "3.17.1"
 
 [build-dependencies]
 tonic-prost-build.workspace = true

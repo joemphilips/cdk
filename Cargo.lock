@@ -1622,6 +1622,7 @@ version = "0.17.0"
 dependencies = [
  "anyhow",
  "bip39",
+ "bitcoin 0.32.102",
  "cdk",
  "cdk-common",
  "cdk-fake-wallet",
@@ -1631,8 +1632,10 @@ dependencies = [
  "home",
  "prost 0.14.4",
  "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tonic 0.14.6",

@@ -11,6 +11,11 @@ pub const ENV_MINT_MANAGEMENT_ADDRESS: &str = "CDK_MINTD_MANAGEMENT_ADDRESS";
 pub const ENV_MINT_MANAGEMENT_PORT: &str = "CDK_MINTD_MANAGEMENT_PORT";
 pub const ENV_MINT_MANAGEMENT_TLS_DIR: &str = "CDK_MINTD_MANAGEMENT_TLS_DIR";
 pub const ENV_MINT_MANAGEMENT_ALLOW_INSECURE: &str = "CDK_MINTD_MANAGEMENT_ALLOW_INSECURE";
+pub const ENV_MINT_MANAGEMENT_STRICT_TLS: &str = "CDK_MINTD_MANAGEMENT_STRICT_TLS";
+pub const ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_DNS_NAME: &str =
+    "CDK_MINTD_MANAGEMENT_EXPECTED_CLIENT_DNS_NAME";
+pub const ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_SPKI_PIN_PATH: &str =
+    "CDK_MINTD_MANAGEMENT_EXPECTED_CLIENT_SPKI_PIN_PATH";
 
 impl MintManagementRpc {
     pub fn from_env(mut self) -> Self {
@@ -42,6 +47,30 @@ impl MintManagementRpc {
             }
         }
 
+        if let Ok(strict_tls) = env::var(ENV_MINT_MANAGEMENT_STRICT_TLS) {
+            match strict_tls.parse() {
+                Ok(strict_tls) => self.strict_tls = strict_tls,
+                Err(_) => {
+                    tracing::error!(
+                        "{} must be true or false; refusing insecure management RPC startup",
+                        ENV_MINT_MANAGEMENT_STRICT_TLS
+                    );
+                    self.strict_tls = true;
+                }
+            }
+        }
+
+        if let Ok(expected_client_dns_name) = env::var(ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_DNS_NAME)
+        {
+            self.expected_client_dns_name = Some(expected_client_dns_name);
+        }
+
+        if let Ok(expected_client_spki_pin_path) =
+            env::var(ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_SPKI_PIN_PATH)
+        {
+            self.expected_client_spki_pin_path = Some(expected_client_spki_pin_path.into());
+        }
+
         self
     }
 }
@@ -60,6 +89,9 @@ mod tests {
         env::remove_var(ENV_MINT_MANAGEMENT_PORT);
         env::remove_var(ENV_MINT_MANAGEMENT_TLS_DIR);
         env::remove_var(ENV_MINT_MANAGEMENT_ALLOW_INSECURE);
+        env::remove_var(ENV_MINT_MANAGEMENT_STRICT_TLS);
+        env::remove_var(ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_DNS_NAME);
+        env::remove_var(ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_SPKI_PIN_PATH);
     }
 
     #[test]
@@ -70,6 +102,9 @@ mod tests {
             ENV_MINT_MANAGEMENT_PORT,
             ENV_MINT_MANAGEMENT_TLS_DIR,
             ENV_MINT_MANAGEMENT_ALLOW_INSECURE,
+            ENV_MINT_MANAGEMENT_STRICT_TLS,
+            ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_DNS_NAME,
+            ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_SPKI_PIN_PATH,
         ];
 
         let prefixes: BTreeSet<&str> = names
@@ -99,6 +134,15 @@ mod tests {
         env::set_var(ENV_MINT_MANAGEMENT_PORT, "10000");
         env::set_var(ENV_MINT_MANAGEMENT_TLS_DIR, "/var/lib/cdk/tls");
         env::set_var(ENV_MINT_MANAGEMENT_ALLOW_INSECURE, "true");
+        env::set_var(ENV_MINT_MANAGEMENT_STRICT_TLS, "true");
+        env::set_var(
+            ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_DNS_NAME,
+            "management-client",
+        );
+        env::set_var(
+            ENV_MINT_MANAGEMENT_EXPECTED_CLIENT_SPKI_PIN_PATH,
+            "/var/lib/cdk/client.spki.sha256",
+        );
 
         let management_rpc = MintManagementRpc::default().from_env();
 
@@ -110,6 +154,29 @@ mod tests {
             Some(PathBuf::from("/var/lib/cdk/tls"))
         );
         assert!(management_rpc.allow_insecure);
+        assert!(management_rpc.strict_tls);
+        assert_eq!(
+            management_rpc.expected_client_dns_name.as_deref(),
+            Some("management-client")
+        );
+        assert_eq!(
+            management_rpc.expected_client_spki_pin_path,
+            Some(PathBuf::from("/var/lib/cdk/client.spki.sha256"))
+        );
+
+        clear_env_vars();
+    }
+
+    #[test]
+    fn malformed_strict_env_var_fails_closed() {
+        let _guard = crate::test_utils::env_lock();
+        clear_env_vars();
+
+        env::set_var(ENV_MINT_MANAGEMENT_STRICT_TLS, "sometimes");
+
+        let management_rpc = MintManagementRpc::default().from_env();
+
+        assert!(management_rpc.strict_tls);
 
         clear_env_vars();
     }

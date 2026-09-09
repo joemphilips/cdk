@@ -1757,14 +1757,24 @@ async fn start_services_with_shutdown(
     {
         if let Some(rpc_settings) = settings.mint_management_rpc.clone() {
             if rpc_settings.enabled {
+                let peer_policy = rpc_settings.build_peer_policy()?;
                 let addr = rpc_settings.address.unwrap_or("127.0.0.1".to_string());
                 let port = rpc_settings.port.unwrap_or(8086);
                 let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(&addr, port, mint.clone())?;
+
+                if let Some(peer_policy) = peer_policy {
+                    mint_rpc = mint_rpc.with_peer_policy(peer_policy);
+                }
 
                 let tls_dir = rpc_settings.tls_dir.unwrap_or(_work_dir.join("tls"));
 
                 let tls_dir = if tls_dir.exists() {
                     Some(tls_dir)
+                } else if rpc_settings.strict_tls {
+                    bail!(
+                        "Management RPC TLS directory does not exist: {}. Strict TLS requires [mint_management_rpc].tls_dir to contain the server certificate, server key, and CA certificate",
+                        tls_dir.display()
+                    );
                 } else if rpc_settings.allow_insecure {
                     tracing::warn!(
                         "TLS directory does not exist: {}. Starting RPC server in INSECURE mode without TLS encryption because allow_insecure is true",
@@ -3134,6 +3144,15 @@ ln_backend = "fakewallet"
             "CDK_MINTD_SIGNATORY_PORT",
             "CDK_MINTD_SIGNATORY_TLS_DIR",
             "CDK_MINTD_SIGNATORY_ALLOW_INSECURE",
+            "CDK_MINTD_MANAGEMENT_ENABLED",
+            "CDK_MINTD_MINT_MANAGEMENT_ENABLED",
+            "CDK_MINTD_MANAGEMENT_ADDRESS",
+            "CDK_MINTD_MANAGEMENT_PORT",
+            "CDK_MINTD_MANAGEMENT_TLS_DIR",
+            "CDK_MINTD_MANAGEMENT_ALLOW_INSECURE",
+            "CDK_MINTD_MANAGEMENT_STRICT_TLS",
+            "CDK_MINTD_MANAGEMENT_EXPECTED_CLIENT_DNS_NAME",
+            "CDK_MINTD_MANAGEMENT_EXPECTED_CLIENT_SPKI_PIN_PATH",
             "CDK_MINTD_LISTEN_HOST",
             "CDK_MINTD_LISTEN_PORT",
             "CDK_MINTD_LN_BACKEND",
