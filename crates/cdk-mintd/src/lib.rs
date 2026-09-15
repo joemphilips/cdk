@@ -67,6 +67,7 @@ pub mod env_vars;
 pub mod setup;
 
 mod canonical_payment_event_owner;
+mod monetary_units;
 
 use canonical_payment_event_owner::{canonical_sat_msat_backends, CanonicalPaymentEventOwner};
 
@@ -311,7 +312,12 @@ fn load_settings_from_sources(
 ) -> Result<config::Settings> {
     // get config file name from args
     let config_file_arg = match config_path {
-        Some(c) => c,
+        Some(c) => {
+            if !c.is_file() {
+                bail!("Explicit mint config file does not exist: {}", c.display());
+            }
+            c
+        }
         None => work_dir.join("config.toml"),
     };
 
@@ -1760,7 +1766,12 @@ async fn start_services_with_shutdown(
                 let peer_policy = rpc_settings.build_peer_policy()?;
                 let addr = rpc_settings.address.unwrap_or("127.0.0.1".to_string());
                 let port = rpc_settings.port.unwrap_or(8086);
-                let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(&addr, port, mint.clone())?;
+                let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(
+                    &addr,
+                    port,
+                    mint.clone(),
+                    monetary_units::configured_units(settings)?,
+                )?;
 
                 if let Some(peer_policy) = peer_policy {
                     mint_rpc = mint_rpc.with_peer_policy(peer_policy);
@@ -2215,10 +2226,15 @@ pub async fn run_mintd_with_shutdown(
     routers: Vec<Router>,
 ) -> Result<()> {
     validate_settings(settings)?;
+    let monetary_units = monetary_units::configured_units(settings)?;
 
     let (localstore, keystore, kv) = initial_setup(work_dir, settings, db_password.clone()).await?;
 
     let mint_builder = MintBuilder::new(localstore.clone());
+    mint_builder
+        .validate_stored_monetary_units(keystore.as_ref(), &monetary_units)
+        .await
+        .context("Stored mint metadata is incompatible with the configured monetary units")?;
 
     // If RPC is enabled and DB contains mint_info already, initialize the builder from DB.
     // This ensures subsequent builder modifications (like version injection) can respect stored values.
@@ -2367,6 +2383,62 @@ mod tests {
 
         assert!(error.to_string().contains("Invalid mint listen address"));
         assert!(!work_dir_created, "validation must precede database setup");
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "fakewallet", not(feature = "sqlcipher")))]
+    #[tokio::test]
+    async fn monetary_startup_guard_preserves_incompatible_metadata_before_creating_keys() {
+        use cdk::cdk_database::KVStoreDatabase;
+
+        let work_dir = crate::test_utils::unique_temp_path("monetary_startup_guard");
+        fs::create_dir_all(&work_dir).unwrap();
+        let store = setup_sqlite_database(&work_dir, None).await.unwrap();
+        let mut info = cdk::nuts::MintInfo::default();
+        info.nuts.nut04.methods.push(cdk::nuts::MintMethodSettings {
+            unit: CurrencyUnit::Sat,
+            method: PaymentMethod::Known(KnownMethod::Bolt11),
+            method_name: None,
+            min_amount: None,
+            max_amount: None,
+            options: None,
+        });
+        let bytes = serde_json::to_vec(&info).unwrap();
+        let mut tx = MintDatabase::begin_transaction(store.as_ref())
+            .await
+            .unwrap();
+        tx.kv_write("cdk_mint", "config", "mint_info", &bytes)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bitcaster.config.toml");
+        let mut settings = config::Settings::try_new(Some(path)).unwrap();
+        settings.info.mnemonic = Some(TEST_MNEMONIC.to_string());
+        settings.info.listen_port = 0;
+        let error = run_mintd_with_shutdown(
+            &work_dir,
+            &settings,
+            std::future::ready(()),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect_err("incompatible monetary metadata must stop startup");
+
+        assert!(error
+            .to_string()
+            .contains("Stored mint metadata is incompatible"));
+        assert!(store.get_keyset_infos().await.unwrap().is_empty());
+        assert_eq!(
+            store
+                .kv_read("cdk_mint", "config", "mint_info")
+                .await
+                .unwrap(),
+            Some(bytes)
+        );
+        drop(store);
+        fs::remove_dir_all(&work_dir).unwrap();
     }
 
     #[cfg(feature = "bdk")]
@@ -3191,6 +3263,39 @@ ln_backend = "fakewallet"
         ] {
             std::env::remove_var(var);
         }
+    }
+
+    #[test]
+    fn explicit_missing_config_does_not_fall_back_to_environment_defaults() {
+        let work_dir = crate::test_utils::unique_temp_path("missing_explicit_config");
+        let result = load_settings_from_sources(&work_dir, Some(work_dir.join("missing.toml")));
+        let error = result.expect_err("an explicit config must not silently change unit policy");
+        assert!(error
+            .to_string()
+            .contains("Explicit mint config file does not exist"));
+        assert!(!work_dir.exists());
+    }
+
+    #[test]
+    fn operated_config_uses_msat_with_unchanged_economic_limits() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bitcaster.config.toml");
+        let settings = config::Settings::try_new(Some(path)).expect("operated config must parse");
+        assert_eq!(settings.ln.len(), 1);
+        let rail = &settings.ln[0];
+        assert_eq!(rail.unit, cdk::nuts::CurrencyUnit::Msat);
+        assert_eq!(rail.min_mint, 1_000.into());
+        assert_eq!(rail.max_mint, 500_000_000.into());
+        assert_eq!(rail.min_melt, 1_000.into());
+        assert_eq!(rail.max_melt, 500_000_000.into());
+        #[cfg(feature = "conditional-tokens")]
+        assert_eq!(
+            settings.mint_info.ctf_registration_fees,
+            Some(vec![config::CtfRegistrationFeeConfig {
+                unit: "msat".to_string(),
+                base: 1_000,
+                per_keyset: 1_000,
+            }])
+        );
     }
 
     fn load_settings_from_toml(name: &str, config_content: &str) -> Result<config::Settings> {

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -69,6 +70,7 @@ fn create_management_interceptor(
 pub struct MintRPCServer {
     socket_addr: SocketAddr,
     mint: Arc<Mint>,
+    allowed_monetary_units: Arc<HashSet<CurrencyUnit>>,
     peer_policy: Option<PeerPolicy>,
     shutdown: Arc<Notify>,
     handle: Option<Arc<JoinHandle<Result<(), Error>>>>,
@@ -81,10 +83,17 @@ impl MintRPCServer {
     /// * `addr` - The address to bind to
     /// * `port` - The port to listen on
     /// * `mint` - The Mint instance to serve
-    pub fn new(addr: &str, port: u16, mint: Arc<Mint>) -> Result<Self, Error> {
+    /// * `allowed_monetary_units` - Immutable units that management RPCs may create or configure
+    pub fn new(
+        addr: &str,
+        port: u16,
+        mint: Arc<Mint>,
+        allowed_monetary_units: HashSet<CurrencyUnit>,
+    ) -> Result<Self, Error> {
         Ok(Self {
             socket_addr: format!("{addr}:{port}").parse()?,
             mint,
+            allowed_monetary_units: Arc::new(allowed_monetary_units),
             peer_policy: None,
             shutdown: Arc::new(Notify::new()),
             handle: None,
@@ -96,6 +105,26 @@ impl MintRPCServer {
     pub fn with_peer_policy(mut self, peer_policy: PeerPolicy) -> Self {
         self.peer_policy = Some(peer_policy);
         self
+    }
+
+    fn ensure_monetary_unit_allowed(&self, unit: &CurrencyUnit) -> Result<(), Status> {
+        if *unit != CurrencyUnit::Auth && self.allowed_monetary_units.contains(unit) {
+            return Ok(());
+        }
+
+        Err(Status::failed_precondition(format!(
+            "Currency unit {unit} is not allowed by mint management policy"
+        )))
+    }
+
+    fn ensure_keyset_unit_allowed(&self, unit: &CurrencyUnit) -> Result<(), Status> {
+        // Auth is a non-monetary capability unit. Keep auth keyset management
+        // available without making Auth an escape hatch for monetary mutators.
+        if *unit == CurrencyUnit::Auth {
+            return Ok(());
+        }
+
+        self.ensure_monetary_unit_allowed(unit)
     }
 
     /// Starts the RPC server
@@ -550,6 +579,15 @@ impl CdkMint for MintRPCServer {
         &self,
         request: Request<UpdateNut04Request>,
     ) -> Result<Response<UpdateResponse>, Status> {
+        let request_inner = request.into_inner();
+
+        let unit = CurrencyUnit::from_str(&request_inner.unit)
+            .map_err(|_| Status::invalid_argument("Invalid unit".to_string()))?;
+        self.ensure_monetary_unit_allowed(&unit)?;
+
+        let payment_method = PaymentMethod::from_str(&request_inner.method)
+            .map_err(|_| Status::invalid_argument("Invalid method".to_string()))?;
+
         let mut info = self
             .mint
             .mint_info()
@@ -557,14 +595,6 @@ impl CdkMint for MintRPCServer {
             .map_err(|err| Status::internal(err.to_string()))?;
 
         let mut nut04_settings = info.nuts.nut04.clone();
-
-        let request_inner = request.into_inner();
-
-        let unit = CurrencyUnit::from_str(&request_inner.unit)
-            .map_err(|_| Status::invalid_argument("Invalid unit".to_string()))?;
-
-        let payment_method = PaymentMethod::from_str(&request_inner.method)
-            .map_err(|_| Status::invalid_argument("Invalid method".to_string()))?;
 
         self.mint
             .get_payment_processor(unit.clone(), payment_method.clone())
@@ -627,20 +657,21 @@ impl CdkMint for MintRPCServer {
         &self,
         request: Request<UpdateNut05Request>,
     ) -> Result<Response<UpdateResponse>, Status> {
+        let request_inner = request.into_inner();
+
+        let unit = CurrencyUnit::from_str(&request_inner.unit)
+            .map_err(|_| Status::invalid_argument("Invalid unit".to_string()))?;
+        self.ensure_monetary_unit_allowed(&unit)?;
+
+        let payment_method = PaymentMethod::from_str(&request_inner.method)
+            .map_err(|_| Status::invalid_argument("Invalid method".to_string()))?;
+
         let mut info = self
             .mint
             .mint_info()
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         let mut nut05_settings = info.nuts.nut05.clone();
-
-        let request_inner = request.into_inner();
-
-        let unit = CurrencyUnit::from_str(&request_inner.unit)
-            .map_err(|_| Status::invalid_argument("Invalid unit".to_string()))?;
-
-        let payment_method = PaymentMethod::from_str(&request_inner.method)
-            .map_err(|_| Status::invalid_argument("Invalid method".to_string()))?;
 
         self.mint
             .get_payment_processor(unit.clone(), payment_method.clone())
@@ -865,6 +896,7 @@ impl CdkMint for MintRPCServer {
 
         let unit = CurrencyUnit::from_str(&request.unit)
             .map_err(|_| Status::invalid_argument("Invalid unit".to_string()))?;
+        self.ensure_keyset_unit_allowed(&unit)?;
 
         let keyset_info = self
             .rotate_keyset(
@@ -896,6 +928,7 @@ impl KeysetService for MintRPCServer {
 
         let unit = CurrencyUnit::from_str(&request.unit)
             .map_err(|_| Status::invalid_argument("Invalid unit".to_string()))?;
+        self.ensure_keyset_unit_allowed(&unit)?;
 
         let keyset_info = self
             .rotate_keyset(
@@ -943,12 +976,19 @@ mod tests {
     use super::*;
     use crate::cdk_mint_server::CdkMint;
     use crate::keyset::keyset_service_client::KeysetServiceClient;
-    use crate::{CdkMintClient, GetInfoRequest, UpdateTosUrlRequest};
+    use crate::{
+        CdkMintClient, GetInfoRequest, RotateNextKeysetRequest, UpdateNut04Request,
+        UpdateNut05Request, UpdateTosUrlRequest,
+    };
 
     type TestCdkClient = CdkMintClient<InterceptedService<Channel, VersionInterceptor>>;
     type TestKeysetClient = KeysetServiceClient<InterceptedService<Channel, VersionInterceptor>>;
 
-    async fn create_test_rpc_server() -> MintRPCServer {
+    async fn create_test_rpc_server_with_units(
+        configured_unit: CurrencyUnit,
+        allowed_monetary_units: HashSet<CurrencyUnit>,
+        auth_enabled: bool,
+    ) -> MintRPCServer {
         let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
 
         let mut mint_builder = MintBuilder::new(db.clone());
@@ -963,12 +1003,12 @@ mod tests {
             HashMap::default(),
             HashSet::default(),
             2,
-            CurrencyUnit::Sat,
+            configured_unit.clone(),
         );
 
         mint_builder
             .add_payment_processor(
-                CurrencyUnit::Sat,
+                configured_unit,
                 PaymentMethod::Known(KnownMethod::Bolt11),
                 MintMeltLimits::new(1, 10_000),
                 Arc::new(ln_fake),
@@ -981,6 +1021,20 @@ mod tests {
         mint_builder = mint_builder
             .with_name("test mint".to_string())
             .with_description("test mint".to_string());
+
+        if auth_enabled {
+            let auth_db = Arc::new(
+                cdk_sqlite::mint::MintSqliteAuthDatabase::new(":memory:")
+                    .await
+                    .unwrap(),
+            );
+            mint_builder = mint_builder.with_auth(
+                auth_db,
+                "https://example.com/.well-known/openid-configuration".to_string(),
+                "test-client".to_string(),
+                vec![],
+            );
+        }
 
         let mint = mint_builder
             .build_with_seed(db.clone(), &mnemonic.to_seed_normalized(""))
@@ -996,10 +1050,20 @@ mod tests {
         MintRPCServer {
             socket_addr: "127.0.0.1:0".parse().unwrap(),
             mint: Arc::new(mint),
+            allowed_monetary_units: Arc::new(allowed_monetary_units),
             peer_policy: None,
             shutdown: Arc::new(Notify::new()),
             handle: None,
         }
+    }
+
+    async fn create_test_rpc_server() -> MintRPCServer {
+        create_test_rpc_server_with_units(
+            CurrencyUnit::Sat,
+            HashSet::from([CurrencyUnit::Sat]),
+            false,
+        )
+        .await
     }
 
     struct TlsFixtures {
@@ -1639,6 +1703,20 @@ mod tests {
     async fn test_keyset_service_rotate_next_keyset() {
         let server = create_test_rpc_server().await;
 
+        let legacy_response = CdkMint::rotate_next_keyset(
+            &server,
+            Request::new(RotateNextKeysetRequest {
+                unit: "sat".to_string(),
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: Some(1),
+                use_keyset_v2: Some(true),
+                final_expiry: None,
+            }),
+        )
+        .await
+        .expect("configured sat must remain supported by the generic CDK");
+        assert_eq!(legacy_response.into_inner().unit, "sat");
+
         let response = KeysetService::rotate_next_keyset(
             &server,
             Request::new(crate::keyset::RotateNextKeysetRequest {
@@ -1657,6 +1735,253 @@ mod tests {
         assert_eq!(response.unit, "sat");
         assert_eq!(response.amounts, vec![1, 2, 4, 8]);
         assert_eq!(response.input_fee_ppk, 1);
+    }
+
+    #[tokio::test]
+    async fn test_forbidden_monetary_units_are_rejected_before_any_mutation() {
+        let server = create_test_rpc_server_with_units(
+            CurrencyUnit::Msat,
+            HashSet::from([CurrencyUnit::Msat]),
+            false,
+        )
+        .await;
+        let before_info = server.mint.mint_info().await.unwrap();
+        let before_keysets = server.mint.get_active_keysets();
+
+        let legacy_error = CdkMint::rotate_next_keyset(
+            &server,
+            Request::new(RotateNextKeysetRequest {
+                unit: "sat".to_string(),
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: Some(1),
+                use_keyset_v2: Some(true),
+                final_expiry: None,
+            }),
+        )
+        .await
+        .expect_err("legacy rotation must reject sat");
+        assert_eq!(legacy_error.code(), Code::FailedPrecondition);
+
+        let keyset_error = KeysetService::rotate_next_keyset(
+            &server,
+            Request::new(crate::keyset::RotateNextKeysetRequest {
+                unit: "sat".to_string(),
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: Some(1),
+                use_keyset_v2: Some(true),
+                final_expiry: None,
+            }),
+        )
+        .await
+        .expect_err("KeysetService rotation must reject sat");
+        assert_eq!(keyset_error.code(), Code::FailedPrecondition);
+
+        let nut04_error = CdkMint::update_nut04(
+            &server,
+            Request::new(UpdateNut04Request {
+                unit: "sat".to_string(),
+                method: "bolt11".to_string(),
+                disabled: Some(false),
+                min_amount: Some(1),
+                max_amount: Some(100),
+                options: None,
+                method_name: None,
+            }),
+        )
+        .await
+        .expect_err("NUT-04 must reject sat");
+        assert_eq!(nut04_error.code(), Code::FailedPrecondition);
+
+        let nut05_error = CdkMint::update_nut05(
+            &server,
+            Request::new(UpdateNut05Request {
+                unit: "sat".to_string(),
+                method: "bolt11".to_string(),
+                disabled: Some(false),
+                min_amount: Some(1),
+                max_amount: Some(100),
+                options: None,
+                method_name: None,
+            }),
+        )
+        .await
+        .expect_err("NUT-05 must reject sat");
+        assert_eq!(nut05_error.code(), Code::FailedPrecondition);
+
+        assert_eq!(server.mint.mint_info().await.unwrap(), before_info);
+        assert_eq!(server.mint.get_active_keysets(), before_keysets);
+    }
+
+    #[tokio::test]
+    async fn test_allowed_msat_reaches_both_rotation_services_and_nut_mutators() {
+        let server = create_test_rpc_server_with_units(
+            CurrencyUnit::Msat,
+            HashSet::from([CurrencyUnit::Msat]),
+            false,
+        )
+        .await;
+
+        let legacy_response = CdkMint::rotate_next_keyset(
+            &server,
+            Request::new(RotateNextKeysetRequest {
+                unit: "msat".to_string(),
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: Some(1),
+                use_keyset_v2: Some(true),
+                final_expiry: None,
+            }),
+        )
+        .await
+        .expect("legacy rotation must allow configured msat");
+        assert_eq!(legacy_response.into_inner().unit, "msat");
+
+        let keyset_response = KeysetService::rotate_next_keyset(
+            &server,
+            Request::new(crate::keyset::RotateNextKeysetRequest {
+                unit: "msat".to_string(),
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: Some(1),
+                use_keyset_v2: Some(true),
+                final_expiry: None,
+            }),
+        )
+        .await
+        .expect("KeysetService rotation must allow configured msat");
+        assert_eq!(keyset_response.into_inner().unit, "msat");
+
+        CdkMint::update_nut04(
+            &server,
+            Request::new(UpdateNut04Request {
+                unit: "msat".to_string(),
+                method: "bolt11".to_string(),
+                disabled: Some(false),
+                min_amount: Some(2),
+                max_amount: Some(200),
+                options: None,
+                method_name: None,
+            }),
+        )
+        .await
+        .expect("NUT-04 must allow configured msat");
+
+        CdkMint::update_nut05(
+            &server,
+            Request::new(UpdateNut05Request {
+                unit: "msat".to_string(),
+                method: "bolt11".to_string(),
+                disabled: Some(false),
+                min_amount: Some(2),
+                max_amount: Some(200),
+                options: None,
+                method_name: None,
+            }),
+        )
+        .await
+        .expect("NUT-05 must allow configured msat");
+
+        let info = server.mint.mint_info().await.unwrap();
+        let nut04_settings = info
+            .nuts
+            .nut04
+            .methods
+            .iter()
+            .find(|settings| settings.unit == CurrencyUnit::Msat)
+            .expect("NUT-04 must retain the configured msat method");
+        assert_eq!(nut04_settings.min_amount, Some(2.into()));
+        assert_eq!(nut04_settings.max_amount, Some(200.into()));
+
+        let nut05_settings = info
+            .nuts
+            .nut05
+            .methods
+            .iter()
+            .find(|settings| settings.unit == CurrencyUnit::Msat)
+            .expect("NUT-05 must retain the configured msat method");
+        assert_eq!(nut05_settings.min_amount, Some(2.into()));
+        assert_eq!(nut05_settings.max_amount, Some(200.into()));
+    }
+
+    #[tokio::test]
+    async fn test_auth_rotation_remains_available_without_monetary_allowlist() {
+        let server =
+            create_test_rpc_server_with_units(CurrencyUnit::Msat, HashSet::new(), true).await;
+        let before_info = server.mint.mint_info().await.unwrap();
+
+        let legacy_response = CdkMint::rotate_next_keyset(
+            &server,
+            Request::new(RotateNextKeysetRequest {
+                unit: "auth".to_string(),
+                amounts: vec![1],
+                input_fee_ppk: Some(0),
+                use_keyset_v2: Some(true),
+                final_expiry: None,
+            }),
+        )
+        .await
+        .expect("legacy auth rotation must remain available");
+        assert_eq!(legacy_response.into_inner().unit, "auth");
+
+        let keyset_response = KeysetService::rotate_next_keyset(
+            &server,
+            Request::new(crate::keyset::RotateNextKeysetRequest {
+                unit: "auth".to_string(),
+                amounts: vec![1],
+                input_fee_ppk: Some(0),
+                use_keyset_v2: Some(true),
+                final_expiry: None,
+            }),
+        )
+        .await
+        .expect("KeysetService auth rotation must remain available");
+        assert_eq!(keyset_response.into_inner().unit, "auth");
+
+        let auth_nut04_error = CdkMint::update_nut04(
+            &server,
+            Request::new(UpdateNut04Request {
+                unit: "auth".to_string(),
+                method: "bolt11".to_string(),
+                disabled: Some(false),
+                min_amount: Some(1),
+                max_amount: Some(100),
+                options: None,
+                method_name: None,
+            }),
+        )
+        .await
+        .expect_err("NUT-04 must not treat Auth as a monetary unit");
+        assert_eq!(auth_nut04_error.code(), Code::FailedPrecondition);
+
+        let auth_nut05_error = CdkMint::update_nut05(
+            &server,
+            Request::new(UpdateNut05Request {
+                unit: "auth".to_string(),
+                method: "bolt11".to_string(),
+                disabled: Some(false),
+                min_amount: Some(1),
+                max_amount: Some(100),
+                options: None,
+                method_name: None,
+            }),
+        )
+        .await
+        .expect_err("NUT-05 must not treat Auth as a monetary unit");
+        assert_eq!(auth_nut05_error.code(), Code::FailedPrecondition);
+
+        assert_eq!(server.mint.mint_info().await.unwrap(), before_info);
+
+        let monetary_error = CdkMint::rotate_next_keyset(
+            &server,
+            Request::new(RotateNextKeysetRequest {
+                unit: "sat".to_string(),
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: Some(1),
+                use_keyset_v2: Some(true),
+                final_expiry: None,
+            }),
+        )
+        .await
+        .expect_err("Auth must not bypass the monetary allow-list");
+        assert_eq!(monetary_error.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test]

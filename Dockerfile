@@ -28,6 +28,7 @@ RUN apt-get update && \
 
 # Copy the built application from the build stage
 COPY --from=builder /usr/src/app/target/release/cdk-mintd /usr/local/bin/cdk-mintd
+COPY bitcaster.config.toml /etc/cdk-mintd/bitcaster.toml
 
 # Detect the architecture and set the interpreter accordingly
 RUN ARCH=$(uname -m) && \
@@ -40,4 +41,4 @@ RUN ARCH=$(uname -m) && \
     fi
 
 # Set the entry point for the container
-CMD ["cdk-mintd"]
+CMD ["cdk-mintd", "--config", "/etc/cdk-mintd/bitcaster.toml"]

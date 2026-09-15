@@ -1,8 +1,6 @@
 //! Mint Builder
 
-use std::collections::HashMap;
-#[cfg(feature = "conditional-tokens")]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bitcoin::bip32::DerivationPath;
@@ -161,6 +159,61 @@ impl MintBuilder {
             protected_endpoints,
         ));
         self
+    }
+
+    /// Checks stored monetary units without initializing keys or changing MintInfo.
+    pub async fn validate_stored_monetary_units(
+        &self,
+        keystore: &(dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync),
+        allowed_units: &HashSet<CurrencyUnit>,
+    ) -> Result<(), Error> {
+        #[cfg_attr(not(feature = "conditional-tokens"), allow(unused_mut))]
+        let mut keysets = keystore.get_keyset_infos().await?;
+        #[cfg(feature = "conditional-tokens")]
+        keysets.extend(keystore.get_all_conditional_mint_keyset_infos().await?);
+        if keysets.iter().any(|keyset| {
+            keyset.unit != CurrencyUnit::Auth && !allowed_units.contains(&keyset.unit)
+        }) {
+            return Err(Error::UnsupportedUnit);
+        }
+
+        if let Some(bytes) = self
+            .localstore
+            .kv_read(
+                super::CDK_MINT_PRIMARY_NAMESPACE,
+                super::CDK_MINT_CONFIG_SECONDARY_NAMESPACE,
+                super::CDK_MINT_CONFIG_KV_KEY,
+            )
+            .await?
+        {
+            let info: MintInfo = serde_json::from_slice(&bytes)?;
+            if info
+                .nuts
+                .nut04
+                .methods
+                .iter()
+                .any(|method| !allowed_units.contains(&method.unit))
+                || info
+                    .nuts
+                    .nut05
+                    .methods
+                    .iter()
+                    .any(|method| !allowed_units.contains(&method.unit))
+            {
+                return Err(Error::UnsupportedUnit);
+            }
+            #[cfg(feature = "conditional-tokens")]
+            if info.nuts.nut_ctf.as_ref().is_some_and(|ctf| {
+                ctf.registration_fees.iter().any(|fee| {
+                    !allowed_units
+                        .iter()
+                        .any(|unit| unit.to_string() == fee.unit)
+                })
+            }) {
+                return Err(Error::UnsupportedUnit);
+            }
+        }
+        Ok(())
     }
 
     /// Initialize builder's MintInfo from the database if present.
@@ -951,6 +1004,147 @@ mod tests {
             .expect("mnemonic")
             .to_seed_normalized("")
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn monetary_guard_accepts_empty_storage_without_creating_keys() {
+        let store = Arc::new(memory::empty().await.unwrap());
+        let builder = MintBuilder::new(store.clone());
+        builder
+            .validate_stored_monetary_units(store.as_ref(), &HashSet::from([CurrencyUnit::Msat]))
+            .await
+            .unwrap();
+        assert!(store.get_keyset_infos().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monetary_guard_rejects_sat_keys_without_rotating_them() {
+        let (builder, store) = builder_with_bolt11_processor().await;
+        let _mint = builder
+            .build_with_seed(store.clone(), &seed())
+            .await
+            .unwrap();
+        let before = store.get_active_keysets().await.unwrap();
+        let error = MintBuilder::new(store.clone())
+            .validate_stored_monetary_units(store.as_ref(), &HashSet::from([CurrencyUnit::Msat]))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::UnsupportedUnit));
+        assert_eq!(store.get_active_keysets().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn monetary_guard_accepts_auth_keysets() {
+        let store = Arc::new(memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(store.clone());
+        builder
+            .supported_units
+            .insert(CurrencyUnit::Msat, (0, vec![1]));
+        builder
+            .supported_units
+            .insert(CurrencyUnit::Auth, (0, vec![1]));
+        let _mint = builder
+            .build_with_seed(store.clone(), &seed())
+            .await
+            .unwrap();
+        MintBuilder::new(store.clone())
+            .validate_stored_monetary_units(store.as_ref(), &HashSet::from([CurrencyUnit::Msat]))
+            .await
+            .unwrap();
+        assert!(store
+            .get_active_keysets()
+            .await
+            .unwrap()
+            .contains_key(&CurrencyUnit::Auth));
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn monetary_guard_rejects_ctf_fee_unit_without_a_payment_rail() {
+        let store = Arc::new(memory::empty().await.unwrap());
+        let mut info = MintInfo::default();
+        info.nuts.nut_ctf = Some(crate::nuts::nut_ctf::NutCtfSettings {
+            registration_fees: vec![RegistrationFeeSetting {
+                unit: "sat".to_string(),
+                registration_fee_base: 1,
+                registration_fee_per_keyset: 1,
+            }],
+            ..Default::default()
+        });
+        let mut tx = crate::cdk_database::MintDatabase::begin_transaction(store.as_ref())
+            .await
+            .unwrap();
+        tx.kv_write(
+            "cdk_mint",
+            "config",
+            "mint_info",
+            &serde_json::to_vec(&info).unwrap(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(matches!(
+            MintBuilder::new(store.clone())
+                .validate_stored_monetary_units(
+                    store.as_ref(),
+                    &HashSet::from([CurrencyUnit::Msat])
+                )
+                .await,
+            Err(Error::UnsupportedUnit)
+        ));
+    }
+
+    #[tokio::test]
+    async fn monetary_guard_rejects_payment_metadata_and_malformed_json_without_rewriting() {
+        use crate::cdk_database::KVStoreDatabase;
+
+        let store = Arc::new(memory::empty().await.unwrap());
+        let mut info = MintInfo::default();
+        info.nuts.nut04.methods.push(MintMethodSettings {
+            unit: CurrencyUnit::Sat,
+            method: PaymentMethod::Known(KnownMethod::Bolt11),
+            method_name: None,
+            min_amount: None,
+            max_amount: None,
+            options: None,
+        });
+        let mut melt_info = MintInfo::default();
+        melt_info.nuts.nut05.methods.push(MeltMethodSettings {
+            unit: CurrencyUnit::Sat,
+            method: PaymentMethod::Known(KnownMethod::Bolt11),
+            method_name: None,
+            min_amount: None,
+            max_amount: None,
+            options: None,
+        });
+        for bytes in [
+            serde_json::to_vec(&info).unwrap(),
+            serde_json::to_vec(&melt_info).unwrap(),
+            b"not-json".to_vec(),
+        ] {
+            let mut tx = crate::cdk_database::MintDatabase::begin_transaction(store.as_ref())
+                .await
+                .unwrap();
+            tx.kv_write("cdk_mint", "config", "mint_info", &bytes)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            assert!(MintBuilder::new(store.clone())
+                .validate_stored_monetary_units(
+                    store.as_ref(),
+                    &HashSet::from([CurrencyUnit::Msat])
+                )
+                .await
+                .is_err());
+            assert_eq!(
+                store
+                    .kv_read("cdk_mint", "config", "mint_info")
+                    .await
+                    .unwrap(),
+                Some(bytes)
+            );
+            assert!(store.get_keyset_infos().await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
