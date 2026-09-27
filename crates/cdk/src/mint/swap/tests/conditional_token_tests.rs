@@ -4836,6 +4836,343 @@ async fn test_ctf_split_msat_input_fee_charged_in_msat() {
     );
 }
 
+struct MixedInputCtfConvertFixture {
+    condition_id: String,
+    offer_keyset: Id,
+    regular_keyset: Id,
+    conditional_inputs: cdk_common::Proofs,
+    regular_inputs: cdk_common::Proofs,
+    locked_premint: PreMintSecrets,
+    locked_secret: Secret,
+    manifest: PoolManifest,
+}
+
+async fn mixed_input_ctf_convert_fixture(
+    mint: &Mint,
+    regular_input_amount: Amount,
+) -> MixedInputCtfConvertFixture {
+    let offer_amount = Amount::from(8);
+    let regular_keyset = get_regular_keyset_id_for_unit(mint, &CurrencyUnit::Msat);
+    let conditional_funding = mint_test_proofs_for_unit(mint, Amount::from(10), CurrencyUnit::Msat)
+        .await
+        .unwrap();
+    let regular_inputs = mint_test_proofs_for_unit(mint, regular_input_amount, CurrencyUnit::Msat)
+        .await
+        .unwrap();
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Msat).await;
+    let offer_keyset = *keysets.get("YES").expect("YES keyset");
+    let receive_keyset = *keysets.get("NO").expect("NO keyset");
+    let conditional_inputs =
+        swap_to_conditional(mint, conditional_funding, offer_keyset, offer_amount).await;
+
+    let (receive_candidates, _) = create_premint(mint, receive_keyset, offer_amount);
+    let (change_candidates, _) = create_premint(mint, offer_keyset, offer_amount);
+    let manifest = PoolManifest::new(
+        vec![
+            pool_entry(0, PoolEntryRole::Receive, &receive_candidates[0]),
+            pool_entry(1, PoolEntryRole::Change, &change_candidates[0]),
+        ],
+        32,
+    )
+    .unwrap();
+    let expiry = unix_time() + 60;
+    let locked_secret = settlement_pool_pay_to_unlock_secret_for_range(
+        offer_keyset,
+        manifest.commitment().to_string(),
+        expiry,
+        7,
+        offer_amount,
+    );
+    let locked_premint = PreMintSecrets::from_secrets(
+        offer_keyset,
+        vec![offer_amount],
+        vec![locked_secret.clone()],
+    )
+    .unwrap();
+
+    MixedInputCtfConvertFixture {
+        condition_id,
+        offer_keyset,
+        regular_keyset,
+        conditional_inputs,
+        regular_inputs,
+        locked_premint,
+        locked_secret,
+        manifest,
+    }
+}
+
+fn assert_mixed_input_fee_schedule(mint: &Mint, fixture: &MixedInputCtfConvertFixture) {
+    let regular_keyset = mint
+        .get_keyset_info(&fixture.regular_keyset)
+        .expect("regular keyset info");
+    let conditional_keyset = mint
+        .get_keyset_info(&fixture.offer_keyset)
+        .expect("conditional keyset info");
+    assert_eq!(regular_keyset.unit, CurrencyUnit::Msat);
+    assert_eq!(conditional_keyset.unit, CurrencyUnit::Msat);
+    assert_eq!(regular_keyset.input_fee_ppk, 1000);
+    assert_eq!(conditional_keyset.input_fee_ppk, 1);
+    assert_eq!(fixture.regular_inputs.len(), 1);
+    assert_eq!(fixture.conditional_inputs.len(), 1);
+    assert!(fixture
+        .regular_inputs
+        .iter()
+        .all(|proof| proof.keyset_id == fixture.regular_keyset));
+    assert!(fixture
+        .conditional_inputs
+        .iter()
+        .all(|proof| proof.keyset_id == fixture.offer_keyset));
+}
+
+fn settlement_pool_pay_to_unlock_secret_for_range(
+    keyset: Id,
+    data: String,
+    expiry: u64,
+    nonce: u8,
+    max_debit: Amount,
+) -> Secret {
+    Secret::new(
+        serde_json::json!([
+            "PAY_TO_UNLOCK",
+            {
+                "nonce": format!("{nonce:02x}").repeat(32),
+                "data": data,
+                "tags": [
+                    ["offer_keyset", keyset.to_string()],
+                    ["expiry", expiry.to_string()],
+                    ["refund", SETTLEMENT_REFUND_KEY],
+                    ["rate_n", "1"],
+                    ["rate_d", "1"],
+                    ["min_receive", "1"],
+                    ["max_debit", max_debit.to_string()]
+                ]
+            }
+        ])
+        .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn test_ctf_convert_mixed_conditional_and_regular_inputs_preserve_full_exit() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 1000)
+        .await
+        .unwrap();
+    let fixture = mixed_input_ctf_convert_fixture(&mint, Amount::from(8)).await;
+    let offer_amount = Amount::from(8);
+    let input_proofs = fixture
+        .conditional_inputs
+        .iter()
+        .chain(&fixture.regular_inputs)
+        .cloned()
+        .collect::<Vec<_>>();
+    let input_fee = mint.get_proofs_fee(&input_proofs).await.unwrap().total;
+    assert_mixed_input_fee_schedule(&mint, &fixture);
+    assert_eq!(input_fee, Amount::from(2));
+    assert_eq!(
+        fixture
+            .conditional_inputs
+            .iter()
+            .map(|proof| u64::from(proof.amount))
+            .sum::<u64>(),
+        u64::from(offer_amount),
+        "held conditional value must cover the complete offer"
+    );
+    assert_eq!(
+        fixture
+            .regular_inputs
+            .iter()
+            .map(|proof| u64::from(proof.amount))
+            .sum::<u64>(),
+        8,
+        "regular collateral must fund the current input fee"
+    );
+    assert!(input_fee < Amount::from(8));
+    let regular_change_amount = Amount::from(8) - input_fee;
+    assert_eq!(regular_change_amount, Amount::from(6));
+
+    let (regular_change_outputs, regular_change_premint) =
+        create_premint(&mint, fixture.regular_keyset, regular_change_amount);
+    let request = CtfConvertRequest {
+        condition_id: fixture.condition_id.clone(),
+        parent_collection_id: None,
+        inputs: HashMap::from([
+            ("*".to_string(), fixture.regular_inputs.clone()),
+            ("YES".to_string(), fixture.conditional_inputs.clone()),
+        ]),
+        outputs: HashMap::from([
+            ("*".to_string(), regular_change_outputs),
+            (
+                "YES".to_string(),
+                fixture.locked_premint.blinded_messages().to_vec(),
+            ),
+        ]),
+    };
+
+    let response = mint
+        .process_ctf_convert(request)
+        .await
+        .expect("regular collateral should pay the mixed input fee");
+    let mut signatures = response.signatures;
+    let locked_signatures = signatures
+        .remove("YES")
+        .expect("convert should sign the locked offered output");
+    let locked_keys = mint
+        .keyset_pubkeys(&fixture.offer_keyset)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+    let locked_proofs = construct_proofs(
+        locked_signatures,
+        fixture.locked_premint.rs(),
+        fixture.locked_premint.secrets(),
+        &locked_keys,
+    )
+    .unwrap();
+    assert_eq!(locked_proofs.len(), 1);
+    assert_eq!(locked_proofs[0].amount, offer_amount);
+    assert_eq!(locked_proofs[0].keyset_id, fixture.offer_keyset);
+    assert_eq!(locked_proofs[0].secret, fixture.locked_secret);
+
+    let regular_change_signatures = signatures
+        .remove("*")
+        .expect("convert should sign regular change");
+    assert!(
+        signatures.is_empty(),
+        "convert should return only requested groups"
+    );
+    let regular_keys = mint
+        .keyset_pubkeys(&fixture.regular_keyset)
+        .unwrap()
+        .keysets
+        .first()
+        .unwrap()
+        .keys
+        .clone();
+    let regular_change_proofs = construct_proofs(
+        regular_change_signatures,
+        regular_change_premint.rs(),
+        regular_change_premint.secrets(),
+        &regular_keys,
+    )
+    .unwrap();
+    assert_eq!(
+        regular_change_proofs
+            .iter()
+            .map(|proof| u64::from(proof.amount))
+            .sum::<u64>(),
+        u64::from(regular_change_amount)
+    );
+    assert!(regular_change_proofs
+        .iter()
+        .all(|proof| proof.keyset_id == fixture.regular_keyset));
+
+    let authorization = mint
+        .validate_ctf_range_authorization(
+            CanonicalHash::parse(&fixture.condition_id, "condition_id").unwrap(),
+            CanonicalHash::from_bytes([0; 32]),
+            &locked_proofs,
+            &fixture.manifest,
+            settlement_settings(),
+            unix_time(),
+        )
+        .await
+        .expect("the unblinded PAY_TO_UNLOCK proof must authorize its range manifest");
+    assert_eq!(authorization.offer_keyset, fixture.offer_keyset);
+    assert!(matches!(
+        authorization.mode,
+        cdk_common::nuts::nut_ctf::settlement::PayToUnlockMode::Pool(_)
+    ));
+
+    assert_eq!(
+        mint.localstore()
+            .get_proofs_states(&fixture.conditional_inputs.ys().unwrap())
+            .await
+            .unwrap(),
+        vec![Some(State::Spent); fixture.conditional_inputs.len()]
+    );
+    assert_eq!(
+        mint.localstore()
+            .get_proofs_states(&fixture.regular_inputs.ys().unwrap())
+            .await
+            .unwrap(),
+        vec![Some(State::Spent); fixture.regular_inputs.len()]
+    );
+}
+
+#[tokio::test]
+async fn test_ctf_convert_mixed_inputs_reject_insufficient_regular_fee_without_spending() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 1000)
+        .await
+        .unwrap();
+    let fixture = mixed_input_ctf_convert_fixture(&mint, Amount::from(1)).await;
+    let input_proofs = fixture
+        .conditional_inputs
+        .iter()
+        .chain(&fixture.regular_inputs)
+        .cloned()
+        .collect::<Vec<_>>();
+    let input_fee = mint.get_proofs_fee(&input_proofs).await.unwrap().total;
+    assert_mixed_input_fee_schedule(&mint, &fixture);
+    assert_eq!(input_fee, Amount::from(2));
+    assert_eq!(
+        fixture
+            .conditional_inputs
+            .iter()
+            .map(|proof| u64::from(proof.amount))
+            .sum::<u64>(),
+        8,
+        "collateral must not make up missing offered shares"
+    );
+    assert_eq!(
+        fixture
+            .regular_inputs
+            .iter()
+            .map(|proof| u64::from(proof.amount))
+            .sum::<u64>(),
+        1
+    );
+    assert!(Amount::from(1) < input_fee);
+
+    let request = CtfConvertRequest {
+        condition_id: fixture.condition_id,
+        parent_collection_id: None,
+        inputs: HashMap::from([
+            ("*".to_string(), fixture.regular_inputs.clone()),
+            ("YES".to_string(), fixture.conditional_inputs.clone()),
+        ]),
+        outputs: HashMap::from([(
+            "YES".to_string(),
+            fixture.locked_premint.blinded_messages().to_vec(),
+        )]),
+    };
+    let signing_attempts = mint.blind_sign_attempts();
+
+    assert!(matches!(
+        mint.process_ctf_convert(request).await,
+        Err(Error::ConvertPayoffFeeViolation)
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_attempts);
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&fixture.conditional_inputs.ys().unwrap())
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&fixture.regular_inputs.ys().unwrap())
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+}
+
 #[tokio::test]
 async fn test_atomic_ctf_convert_commits_spent_signatures_and_operation() {
     let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
