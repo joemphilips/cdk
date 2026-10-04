@@ -197,6 +197,9 @@ impl MeltSaga<Initial> {
         input_verification: Verification,
         payment_method: cdk_common::PaymentMethod,
     ) -> Result<MeltSaga<SetupComplete>, Error> {
+        #[cfg(feature = "conditional-tokens")]
+        self.mint.verify_melt_keysets(melt_request).await?;
+
         let Verification {
             amount: input_amount,
         } = input_verification;

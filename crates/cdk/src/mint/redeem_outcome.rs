@@ -201,6 +201,7 @@ impl Mint {
             return Err(Error::TransactionUnbalanced(0, 0, 0));
         }
         super::reject_pay_to_unlock_spend(inputs)?;
+        super::verify_individual_spending_conditions(inputs)?;
 
         // 1. Verify all inputs use the same conditional keyset
         let input_keyset_ids: HashSet<_> = inputs.iter().map(|p| p.keyset_id).collect();

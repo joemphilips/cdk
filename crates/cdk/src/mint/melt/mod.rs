@@ -900,6 +900,35 @@ impl Mint {
         Ok(quotes)
     }
 
+    #[cfg(feature = "conditional-tokens")]
+    async fn verify_melt_keysets(&self, request: &MeltRequest<QuoteId>) -> Result<(), Error> {
+        let keyset_ids: std::collections::HashSet<_> = request
+            .inputs()
+            .iter()
+            .map(|proof| proof.keyset_id)
+            .chain(
+                request
+                    .outputs()
+                    .into_iter()
+                    .flatten()
+                    .map(|output| output.keyset_id),
+            )
+            .collect();
+        for id in keyset_ids {
+            self.get_keyset_info(&id).ok_or(Error::UnknownKeySet)?;
+            // Equal currency units do not make conditional assets payment collateral.
+            if self
+                .localstore
+                .get_condition_for_keyset(&id)
+                .await?
+                .is_some()
+            {
+                return Err(Error::OutputsMustUseRegularKeyset);
+            }
+        }
+        Ok(())
+    }
+
     /// Melt
     ///
     /// Uses MeltSaga typestate pattern for atomic transaction handling with automatic rollback on failure.
@@ -922,6 +951,9 @@ impl Mint {
         }
 
         let verification = self.verify_inputs(melt_request.inputs()).await?;
+
+        #[cfg(feature = "conditional-tokens")]
+        self.verify_melt_keysets(melt_request).await?;
 
         // Fetch the quote to get payment_method for operation tracking
         let quote_id = melt_request.quote().clone();

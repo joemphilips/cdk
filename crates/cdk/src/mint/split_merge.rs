@@ -10,7 +10,7 @@ use cdk_common::nuts::nut_ctf::{CtfConvertRequest, CtfConvertResponse, ZERO_COLL
 use tracing::instrument;
 
 use super::conditions::STATUS_PENDING;
-use super::ctf_conservation::{condition_outcomes, CtfCoverageResolver, OutcomeConservation};
+use super::ctf_conservation::{CtfCoverageResolver, OutcomeConservation};
 use super::swap::atomic::execute_atomic_ctf_convert;
 use super::Mint;
 use crate::Error;
@@ -48,12 +48,12 @@ impl Mint {
         if parent_collection_id != ZERO_COLLECTION_ID {
             return Err(Error::ConvertPayoffFeeViolation);
         }
-        let outcomes = condition_outcomes(&condition)?;
-        let resolver = CtfCoverageResolver::new(self, &request.condition_id, &outcomes)?;
-        let mut conservation = OutcomeConservation::new(&outcomes);
+        let resolver = CtfCoverageResolver::new(self, &condition)?;
+        let mut conservation = OutcomeConservation::new(resolver.outcomes());
         let all_input_proofs =
             collect_inputs(&resolver, &request.inputs, &mut conservation).await?;
         super::reject_pay_to_unlock_spend(&all_input_proofs)?;
+        super::verify_individual_spending_conditions(&all_input_proofs)?;
         let collected_outputs =
             collect_outputs(&resolver, &request.outputs, &mut conservation).await?;
 

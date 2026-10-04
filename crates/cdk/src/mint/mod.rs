@@ -18,6 +18,8 @@ use cdk_common::database::{self, DynMintAuthDatabase, DynMintDatabase};
 #[cfg(feature = "conditional-tokens")]
 use cdk_common::nuts::nut_ctf::settlement::CanonicalHash;
 use cdk_common::nuts::{BlindSignature, BlindedMessage, CurrencyUnit, Id};
+#[cfg(feature = "conditional-tokens")]
+use cdk_common::nuts::{Kind, Nut10Secret};
 use cdk_common::payment::{DynMintPayment, WaitPaymentResponse};
 pub use cdk_common::quote_id::QuoteId;
 use cdk_common::stream::{BackoffPolicy, SupervisedStream};
@@ -64,6 +66,23 @@ mod verification;
 fn reject_pay_to_unlock_spend(inputs: &cdk_common::Proofs) -> Result<(), Error> {
     cdk_common::nuts::nut_ctf::settlement::reject_pay_to_unlock_inputs(inputs)
         .map_err(|_| Error::PayToUnlockInvalidCondition)
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn verify_individual_spending_conditions(inputs: &cdk_common::Proofs) -> Result<(), Error> {
+    for proof in inputs {
+        if let Ok(secret) = Nut10Secret::try_from(&proof.secret) {
+            match secret.kind() {
+                Kind::P2PK => {
+                    proof.verify_p2pk().map_err(Error::NUT11)?;
+                }
+                Kind::HTLC => {
+                    proof.verify_htlc().map_err(Error::NUT14)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub use builder::{KeysetRotation, MintBuilder, MintMeltLimits, UnitConfig};
@@ -1290,7 +1309,7 @@ impl Mint {
             .load()
             .iter()
             .filter_map(|keyset| {
-                if keyset.active {
+                if keyset.active && Self::is_regular_keyset(keyset) {
                     Some((keyset.unit.clone(), keyset.id))
                 } else {
                     None

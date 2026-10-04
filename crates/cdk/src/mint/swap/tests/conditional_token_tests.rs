@@ -12,6 +12,7 @@ use bitcoin::secp256k1::{
 };
 use cdk_common::amount::SplitTarget;
 use cdk_common::database::mint::CtfSettlementReplay;
+use cdk_common::database::MintKeysDatabase;
 use cdk_common::dhke::construct_proofs;
 use cdk_common::error::{ErrorCode, ErrorResponse};
 use cdk_common::mint::Operation;
@@ -101,12 +102,8 @@ async fn create_test_mint_without_registration_fees() -> Result<Mint, Error> {
 }
 
 /// Get the regular (non-conditional) active keyset ID for SAT.
-/// Must be called BEFORE registering any conditions.
 fn get_regular_keyset_id(mint: &crate::mint::Mint) -> Id {
-    *mint
-        .get_active_keysets()
-        .get(&CurrencyUnit::Sat)
-        .expect("mint should have an active SAT keyset")
+    get_regular_keyset_id_for_unit(mint, &CurrencyUnit::Sat)
 }
 
 /// Register a test condition, returning (condition_id, keysets map)
@@ -164,36 +161,43 @@ async fn build_test_mint_with_unit(
     unit: CurrencyUnit,
     input_fee_ppk: u64,
 ) -> Result<Mint, Error> {
+    build_test_mint_with_units(db, seed, &[(unit, input_fee_ppk)]).await
+}
+
+async fn build_test_mint_with_units(
+    db: Arc<cdk_sqlite::mint::MintSqliteDatabase>,
+    seed: &[u8],
+    units: &[(CurrencyUnit, u64)],
+) -> Result<Mint, Error> {
     let mut mint_builder = MintBuilder::new(db.clone());
-
-    mint_builder.configure_unit(
-        unit.clone(),
-        UnitConfig {
-            amounts: (0..32).map(|i| 2_u64.pow(i)).collect(),
-            input_fee_ppk,
-        },
-    )?;
-
-    let fee_reserve = FeeReserve {
-        min_fee_reserve: Amount::from(1),
-        percent_fee_reserve: 1.0,
-    };
-    let ln_fake_backend = FakeWallet::new(
-        fee_reserve,
-        HashMap::default(),
-        HashSet::default(),
-        2,
-        unit.clone(),
-    );
-
-    mint_builder
-        .add_payment_processor(
+    for (unit, input_fee_ppk) in units {
+        mint_builder.configure_unit(
             unit.clone(),
-            PaymentMethod::Known(KnownMethod::Bolt11),
-            MintMeltLimits::new(1, 10_000_000),
-            Arc::new(ln_fake_backend),
-        )
-        .await?;
+            UnitConfig {
+                amounts: (0..32).map(|i| 2_u64.pow(i)).collect(),
+                input_fee_ppk: *input_fee_ppk,
+            },
+        )?;
+        let fee_reserve = FeeReserve {
+            min_fee_reserve: Amount::from(1),
+            percent_fee_reserve: 1.0,
+        };
+        let ln_fake_backend = FakeWallet::new(
+            fee_reserve,
+            HashMap::default(),
+            HashSet::default(),
+            2,
+            unit.clone(),
+        );
+        mint_builder
+            .add_payment_processor(
+                unit.clone(),
+                PaymentMethod::Known(KnownMethod::Bolt11),
+                MintMeltLimits::new(1, 10_000_000),
+                Arc::new(ln_fake_backend),
+            )
+            .await?;
+    }
 
     let quote_ttl = QuoteTTL::new(10000, 10000);
     let mint = mint_builder
@@ -206,7 +210,10 @@ async fn build_test_mint_with_unit(
     mint.set_quote_ttl(quote_ttl).await?;
     let mut mint_info = mint.mint_info().await?;
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
-        registration_fees: vec![registration_fee_setting(unit.clone(), 0, 0)],
+        registration_fees: units
+            .iter()
+            .map(|(unit, _)| registration_fee_setting(unit.clone(), 0, 0))
+            .collect(),
         ..NutCtfSettings::default()
     });
     mint.set_mint_info(mint_info).await?;
@@ -250,10 +257,7 @@ async fn mint_test_proofs_for_unit(
         sleep(Duration::from_secs(1)).await;
     }
 
-    let keyset_id = *mint
-        .get_active_keysets()
-        .get(&unit)
-        .expect("mint should have an active keyset for the requested unit");
+    let keyset_id = get_regular_keyset_id_for_unit(mint, &unit);
 
     let keys = mint
         .keyset_pubkeys(&keyset_id)?
@@ -289,7 +293,365 @@ fn get_regular_keyset_id_for_unit(mint: &crate::mint::Mint, unit: &CurrencyUnit)
     *mint
         .get_active_keysets()
         .get(unit)
-        .expect("mint should have an active keyset for the requested unit")
+        .expect("mint should have an active regular keyset for the requested unit")
+}
+
+async fn rotate_test_regular_fee(mint: &Mint, unit: CurrencyUnit, fee: u64) -> Id {
+    mint.rotate_keyset(
+        unit,
+        (0..32).map(|n| 2u64.pow(n)).collect(),
+        fee,
+        true,
+        None,
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+struct OrderedKeysetsSignatory {
+    inner: Arc<dyn cdk_signatory::signatory::Signatory + Send + Sync>,
+    conditional_first: bool,
+}
+
+#[async_trait::async_trait]
+impl cdk_signatory::signatory::Signatory for OrderedKeysetsSignatory {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    async fn blind_sign(
+        &self,
+        messages: Vec<cdk_common::BlindedMessage>,
+    ) -> Result<Vec<cdk_common::BlindSignature>, Error> {
+        self.inner.blind_sign(messages).await
+    }
+
+    async fn verify_proofs(&self, proofs: cdk_common::Proofs) -> Result<(), Error> {
+        self.inner.verify_proofs(proofs).await
+    }
+
+    async fn keysets(&self) -> Result<cdk_signatory::signatory::SignatoryKeysets, Error> {
+        let mut keysets = self.inner.keysets().await?;
+        keysets
+            .keysets
+            .sort_by_key(|keyset| keyset.condition_id.is_some() != self.conditional_first);
+        Ok(keysets)
+    }
+
+    async fn subscribe_keysets(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<cdk_signatory::signatory::SignatoryKeysets>, Error>
+    {
+        self.inner.subscribe_keysets().await
+    }
+
+    async fn rotate_keyset(
+        &self,
+        args: cdk_signatory::signatory::RotateKeyArguments,
+    ) -> Result<cdk_signatory::signatory::SignatoryKeySet, Error> {
+        self.inner.rotate_keyset(args).await
+    }
+}
+
+#[tokio::test]
+async fn test_condition_keyset_fees_restart_uses_regular_authority_in_either_order() {
+    for conditional_first in [false, true] {
+        for restart_fee in [1, 1000] {
+            let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+            let seed = Mnemonic::generate(12).unwrap().to_seed_normalized("");
+            let mint = build_test_mint_with_unit(db.clone(), &seed, CurrencyUnit::Sat, 1000)
+                .await
+                .unwrap();
+            let (_, conditional) = register_test_condition(&mint, &["YES", "NO"], None).await;
+            rotate_test_regular_fee(&mint, CurrencyUnit::Sat, 1).await;
+            let before = db.get_keyset_infos().await.unwrap();
+            let current_regular = get_regular_keyset_id_for_unit(&mint, &CurrencyUnit::Sat);
+            let signatory = mint.signatory.clone();
+            mint.stop().await.unwrap();
+            let mut builder = MintBuilder::new(db.clone());
+            builder
+                .configure_unit(
+                    CurrencyUnit::Sat,
+                    UnitConfig {
+                        amounts: (0..32).map(|n| 2u64.pow(n)).collect(),
+                        input_fee_ppk: restart_fee,
+                    },
+                )
+                .unwrap();
+            let restarted = builder
+                .build_with_signatory(Arc::new(OrderedKeysetsSignatory {
+                    inner: signatory,
+                    conditional_first,
+                }))
+                .await
+                .unwrap();
+            let after = db.get_keyset_infos().await.unwrap();
+            let regular = get_regular_keyset_id_for_unit(&restarted, &CurrencyUnit::Sat);
+            assert_eq!(
+                restarted.get_keyset_info(&regular).unwrap().input_fee_ppk,
+                restart_fee
+            );
+            if restart_fee == 1 {
+                assert_eq!(regular, current_regular);
+                assert_eq!(after.len(), before.len());
+            } else {
+                assert_ne!(regular, current_regular);
+                assert_eq!(after.len(), before.len() + 1);
+                assert!(!restarted.get_keyset_info(&current_regular).unwrap().active);
+            }
+            assert!(conditional.values().all(|id| restarted
+                .get_keyset_info(id)
+                .unwrap()
+                .input_fee_ppk
+                == 1000));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_condition_keyset_fees_follow_unique_regular_authority() {
+    for unit in [CurrencyUnit::Sat, CurrencyUnit::Msat] {
+        let mint = create_test_mint_with_unit(unit.clone(), 1000)
+            .await
+            .unwrap();
+        let mut snapshot = mint.keysets.load().as_ref().clone();
+        let mut other_unit = snapshot[0].clone();
+        other_unit.unit = if unit == CurrencyUnit::Sat {
+            CurrencyUnit::Msat
+        } else {
+            CurrencyUnit::Sat
+        };
+        other_unit.input_fee_ppk = 31;
+        let mut expired = snapshot[0].clone();
+        expired.final_expiry = Some(unix_time() - 1);
+        expired.input_fee_ppk = 97;
+        let mut inactive = snapshot[0].clone();
+        inactive.active = false;
+        inactive.input_fee_ppk = 11;
+        snapshot.insert(0, expired);
+        snapshot.insert(0, inactive);
+        snapshot.insert(0, other_unit);
+        mint.keysets.store(Arc::new(snapshot));
+        for event in ["first-fee-condition", "second-fee-condition"] {
+            let (_, announcement) =
+                create_test_announcement(&create_test_oracle(), &["A", "B", "C"], event);
+            let mut request = enum_condition_request("Fee authority", vec![announcement]);
+            request.collateral = Some(unit.to_string());
+            request.outcome_collections = Some(vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "A|B".to_string(),
+                "A|C".to_string(),
+                "B|C".to_string(),
+            ]);
+            let response = mint.register_condition(request).await.unwrap();
+            assert_eq!(response.keysets.len(), 6);
+            let stored = mint
+                .localstore()
+                .get_conditional_keyset_infos_for_condition(&response.condition_id)
+                .await
+                .unwrap();
+            let published = mint
+                .get_conditional_keysets(None, None, None)
+                .await
+                .unwrap();
+            for info in stored {
+                assert_eq!(info.unit, unit);
+                assert_eq!(info.input_fee_ppk, 1000);
+                let public = published
+                    .keysets
+                    .iter()
+                    .find(|keyset| keyset.id == info.id)
+                    .unwrap();
+                assert_eq!(public.input_fee_ppk, Some(1000));
+                let keys = mint
+                    .keyset_pubkeys(&info.id)
+                    .unwrap()
+                    .keysets
+                    .remove(0)
+                    .keys;
+                assert_eq!(
+                    info.id,
+                    Id::v2_from_data_conditional(
+                        &keys,
+                        &unit,
+                        1000,
+                        info.final_expiry,
+                        &response.condition_id,
+                        &public.outcome_collection_id
+                    )
+                );
+                assert_ne!(
+                    info.id,
+                    Id::v2_from_data_conditional(
+                        &keys,
+                        &unit,
+                        1,
+                        info.final_expiry,
+                        &response.condition_id,
+                        &public.outcome_collection_id
+                    )
+                );
+                rewrite_test_keyset(&mint, info.id, true, 1, None);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_condition_keyset_fees_preserve_exact_retry_after_rotation() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let (_, announcement) =
+        create_test_announcement(&create_test_oracle(), &["YES", "NO"], "fee-history");
+    let request = enum_condition_request("Fee history", vec![announcement]);
+    let original = mint.register_condition(request.clone()).await.unwrap();
+    rotate_test_regular_fee(&mint, CurrencyUnit::Sat, 1000).await;
+    let before = mint
+        .get_conditional_keysets(None, None, None)
+        .await
+        .unwrap();
+    let snapshot = mint.keysets.load_full();
+    mint.keysets.store(Arc::new(
+        snapshot
+            .iter()
+            .filter(|keyset| keyset.condition_id.is_some())
+            .cloned()
+            .collect(),
+    ));
+    let retry = mint.register_condition(request).await.unwrap();
+    mint.keysets.store(snapshot);
+    assert_eq!(
+        serde_json::to_value(retry).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            mint.get_conditional_keysets(None, None, None)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    assert!(before
+        .keysets
+        .iter()
+        .all(|keyset| keyset.input_fee_ppk == Some(1)));
+    let (_, new_keysets) =
+        register_test_condition_with_event(&mint, &["YES", "NO"], None, "new-fee-history").await;
+    assert!(new_keysets
+        .values()
+        .all(|id| mint.get_keyset_info(id).unwrap().input_fee_ppk == 1000));
+}
+
+#[tokio::test]
+async fn test_condition_keyset_fees_charge_each_input_in_its_collateral_unit() {
+    for unit in [CurrencyUnit::Sat, CurrencyUnit::Msat] {
+        let mint = create_test_mint_with_unit(unit.clone(), 1000)
+            .await
+            .unwrap();
+        let regular = get_regular_keyset_id_for_unit(&mint, &unit);
+        let funding = mint_test_proofs_for_unit(&mint, Amount::from(8), unit.clone())
+            .await
+            .unwrap();
+        assert_eq!(funding.len(), 1);
+        assert_eq!(
+            mint.get_proofs_fee(&funding).await.unwrap().total,
+            Amount::from(1)
+        );
+        let (_, conditional) =
+            register_test_condition_with_collateral(&mint, &["YES", "NO"], unit.clone()).await;
+        let mut inputs =
+            convert_to_conditional(&mint, funding, conditional["YES"], Amount::from(7)).await;
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(
+            mint.get_proofs_fee(&inputs).await.unwrap().total,
+            Amount::from(3)
+        );
+        for proof in &mut inputs {
+            proof.witness = Some(Witness::OracleWitness(create_oracle_witness(
+                &create_test_oracle(),
+                "YES",
+            )));
+        }
+        let outputs = create_premint(&mint, regular, Amount::from(4)).0;
+        let redeemed = mint
+            .process_redeem_outcome(RedeemOutcomeRequest { inputs, outputs })
+            .await
+            .unwrap();
+        assert_eq!(
+            redeemed
+                .signatures
+                .iter()
+                .map(|signature| u64::from(signature.amount))
+                .sum::<u64>(),
+            4
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_condition_keyset_fees_reject_missing_or_ambiguous_regular_authority() {
+    for invalid in ["missing", "inactive", "expired", "wrong-unit", "ambiguous"] {
+        let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+            .await
+            .unwrap();
+        let mut snapshot = mint.keysets.load().as_ref().clone();
+        match invalid {
+            "missing" => snapshot[0].condition_id = Some("11".repeat(32)),
+            "inactive" => snapshot[0].active = false,
+            "expired" => snapshot[0].final_expiry = Some(unix_time() - 1),
+            "wrong-unit" => snapshot[0].unit = CurrencyUnit::Msat,
+            "ambiguous" => snapshot.push(snapshot[0].clone()),
+            _ => unreachable!(),
+        }
+        mint.keysets.store(Arc::new(snapshot));
+        let (_, announcement) =
+            create_test_announcement(&create_test_oracle(), &["YES", "NO"], invalid);
+        let result = mint
+            .register_condition(enum_condition_request(
+                "Invalid fee authority",
+                vec![announcement],
+            ))
+            .await;
+        if invalid == "ambiguous" {
+            assert!(
+                matches!(result, Err(Error::Custom(message)) if message == "Multiple active regular keysets for collateral unit: sat")
+            );
+        } else {
+            assert!(
+                matches!(result, Err(Error::UnknownKeySet)),
+                "{invalid}: {result:?}"
+            );
+        }
+        assert!(mint
+            .get_conditions(None, None, &[])
+            .await
+            .unwrap()
+            .conditions
+            .is_empty());
+        assert!(mint
+            .get_conditional_keysets(None, None, None)
+            .await
+            .unwrap()
+            .keysets
+            .is_empty());
+        let (_, announcement) =
+            create_test_announcement(&create_test_oracle(), &["YES", "NO"], "no-keysets");
+        let mut request = enum_condition_request("No keysets", vec![announcement]);
+        request.outcome_collections = Some(Vec::new());
+        request.collateral = None;
+        assert!(mint
+            .register_condition(request)
+            .await
+            .unwrap()
+            .keysets
+            .is_empty());
+    }
 }
 
 /// Helper: create PreMintSecrets for a given keyset
@@ -411,15 +773,16 @@ async fn mixed_keyset_locked_plus_bare_settlement_fixture(
     mint: &Mint,
     now: u64,
 ) -> MixedKeysetSettlementFixture {
-    let regular_keyset = get_regular_keyset_id(mint);
+    // Keep the historical conditional fee when regular authority changes.
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+    let regular_keyset = rotate_test_regular_fee(mint, CurrencyUnit::Sat, 1000).await;
     let locked_source = mint_test_proofs_for_unit(mint, Amount::from(10), CurrencyUnit::Sat)
         .await
         .unwrap();
     let bare_source = mint_test_proofs_for_unit(mint, Amount::from(10), CurrencyUnit::Sat)
         .await
         .unwrap();
-    let (condition_id, keysets) =
-        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Sat).await;
     let yes_keyset = *keysets.get("YES").expect("YES keyset");
     let no_keyset = *keysets.get("NO").expect("NO keyset");
 
@@ -435,7 +798,7 @@ async fn mixed_keyset_locked_plus_bare_settlement_fixture(
     )
     .await;
     let bare = CtfSettlementParticipant {
-        inputs: swap_to_conditional(mint, bare_source, no_keyset, Amount::from(8)).await,
+        inputs: convert_to_conditional(mint, bare_source, no_keyset, Amount::from(8)).await,
         outputs: create_premint(mint, no_keyset, Amount::from(14)).0,
         mode: ParticipantMode::Standard,
     };
@@ -884,10 +1247,6 @@ async fn assert_atomic_convert_committed(mint: &Mint, fixture: &AtomicConvertFix
     );
 }
 
-fn after_conditional_input_fee(amount: Amount) -> Amount {
-    amount - Amount::from(1)
-}
-
 /// Helper: create P2PK 2-of-2 PreMintSecrets for a given keyset.
 fn create_p2pk_premint(
     mint: &crate::mint::Mint,
@@ -931,14 +1290,98 @@ fn create_p2pk_premint(
     (blinded_messages, pre_mint)
 }
 
-/// Helper: swap regular proofs into a conditional keyset
-async fn swap_to_conditional(
+/// Create conditional proofs through a fee-backed CTF convert.
+async fn convert_to_conditional(
     mint: &crate::mint::Mint,
     regular_proofs: cdk_common::Proofs,
     keyset_id: Id,
     amount: Amount,
 ) -> cdk_common::Proofs {
-    let (outputs, pre_mint) = create_premint(mint, keyset_id, amount);
+    let (_, pre_mint) = create_premint(mint, keyset_id, amount);
+    convert_to_conditional_premint(mint, regular_proofs, pre_mint).await
+}
+
+async fn convert_to_conditional_premint(
+    mint: &Mint,
+    mut regular_proofs: cdk_common::Proofs,
+    pre_mint: PreMintSecrets,
+) -> cdk_common::Proofs {
+    let selected_outputs = pre_mint.blinded_messages();
+    let keyset_id = selected_outputs[0].keyset_id;
+    let amount = Amount::try_sum(selected_outputs.iter().map(|output| output.amount)).unwrap();
+    let (condition_id, collection, _) = mint
+        .localstore()
+        .get_condition_for_keyset(&keyset_id)
+        .await
+        .unwrap()
+        .expect("conditional output keyset");
+    let condition = mint
+        .localstore()
+        .get_condition(&condition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let unit = condition.collateral.clone().unwrap();
+    let mut fee = mint.get_proofs_fee(&regular_proofs).await.unwrap().total;
+    if fee == Amount::ZERO {
+        let regular = get_regular_keyset_id_for_unit(mint, &unit);
+        if mint.get_keyset_info(&regular).unwrap().input_fee_ppk == 0 {
+            rotate_test_regular_fee(mint, unit.clone(), 1).await;
+        }
+        // Convert requires active collateral. NUT-03 rotates historical cash.
+        let regular = get_regular_keyset_id_for_unit(mint, &unit);
+        let (outputs, premint) =
+            create_premint(mint, regular, regular_proofs.total_amount().unwrap());
+        let response = mint
+            .process_swap_request(SwapRequest::new(regular_proofs, outputs))
+            .await
+            .unwrap();
+        let keys = mint
+            .keyset_pubkeys(&regular)
+            .unwrap()
+            .keysets
+            .remove(0)
+            .keys;
+        regular_proofs =
+            construct_proofs(response.signatures, premint.rs(), premint.secrets(), &keys).unwrap();
+        fee = Amount::ONE;
+    }
+    let funding = regular_proofs.total_amount().unwrap();
+    if funding < amount + fee {
+        regular_proofs.extend(
+            mint_test_proofs_for_unit(mint, amount + fee - funding, unit)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        regular_proofs.total_amount().unwrap(),
+        amount + mint.get_proofs_fee(&regular_proofs).await.unwrap().total
+    );
+
+    let mut outputs = HashMap::from([(collection.clone(), selected_outputs)]);
+    let selected = cdk_common::nuts::nut_ctf::parse_outcome_collection(&collection);
+    let resolver =
+        crate::mint::ctf_conservation::CtfCoverageResolver::new(mint, &condition).unwrap();
+    let keysets = mint
+        .localstore()
+        .get_conditional_keyset_infos_for_condition(&condition_id)
+        .await
+        .unwrap();
+    for outcome in resolver
+        .outcomes()
+        .iter()
+        .filter(|outcome| !selected.contains(outcome))
+    {
+        let complement = keysets
+            .iter()
+            .find(|info| info.outcome_collection.as_ref() == Some(outcome))
+            .expect("complementary singleton keyset");
+        outputs.insert(
+            outcome.clone(),
+            create_premint(mint, complement.id, amount).0,
+        );
+    }
 
     let keys = mint
         .keyset_pubkeys(&keyset_id)
@@ -949,11 +1392,18 @@ async fn swap_to_conditional(
         .keys
         .clone();
 
-    let swap_request = SwapRequest::new(regular_proofs, outputs);
-    let swap_response = mint.process_swap_request(swap_request).await.unwrap();
+    let mut response = mint
+        .process_ctf_convert(CtfConvertRequest {
+            condition_id,
+            parent_collection_id: None,
+            inputs: HashMap::from([("*".to_string(), regular_proofs)]),
+            outputs,
+        })
+        .await
+        .unwrap();
 
     construct_proofs(
-        swap_response.signatures,
+        response.signatures.remove(&collection).unwrap(),
         pre_mint.rs(),
         pre_mint.secrets(),
         &keys,
@@ -1137,11 +1587,10 @@ fn nut_ctf_legacy_stored_condition_without_collateral_deserializes_with_none() {
 }
 
 /// Full redeem outcome flow:
-/// mint regular proofs -> register condition -> swap to conditional -> redeem with witness
+/// Mint collateral, register a condition, convert, then redeem with a witness.
 #[tokio::test]
 async fn test_redeem_outcome_valid() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
     let oracle = create_test_oracle();
     let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
 
@@ -1157,9 +1606,9 @@ async fn test_redeem_outcome_valid() {
 
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
 
-    // 4. Swap regular proofs to conditional
+    // 4. Convert regular proofs to conditional proofs.
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
 
     // 5. Attach oracle witness
     let witness = create_oracle_witness(&oracle, "YES");
@@ -1169,11 +1618,7 @@ async fn test_redeem_outcome_valid() {
     }
 
     // 6. Create regular output blinded messages for redemption
-    let (regular_outputs, _) = create_premint(
-        &mint,
-        regular_keyset_id,
-        after_conditional_input_fee(amount),
-    );
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount);
 
     // 7. Redeem
     let redeem_response = mint
@@ -1191,7 +1636,6 @@ async fn test_redeem_outcome_valid() {
 #[tokio::test]
 async fn test_redeem_outcome_wrong_collection() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
     let oracle = create_test_oracle();
     let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
 
@@ -1205,7 +1649,8 @@ async fn test_redeem_outcome_wrong_collection() {
         .unwrap();
     // Use the NO keyset but attest YES
     let no_keyset_id = *condition_response.keysets.get("NO").unwrap();
-    let conditional_proofs = swap_to_conditional(&mint, regular_proofs, no_keyset_id, amount).await;
+    let conditional_proofs =
+        convert_to_conditional(&mint, regular_proofs, no_keyset_id, amount).await;
 
     // Attach witness with YES attestation (but proofs are NO keyset)
     let witness = create_oracle_witness(&oracle, "YES");
@@ -1214,7 +1659,7 @@ async fn test_redeem_outcome_wrong_collection() {
         proof.witness = Some(Witness::OracleWitness(witness.clone()));
     }
 
-    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount);
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -1230,7 +1675,6 @@ async fn test_redeem_outcome_wrong_collection() {
 #[tokio::test]
 async fn test_redeem_outcome_no_witness() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
     let oracle = create_test_oracle();
     let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
 
@@ -1244,10 +1688,10 @@ async fn test_redeem_outcome_no_witness() {
         .unwrap();
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
 
     // No witness attached
-    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount);
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -1281,7 +1725,7 @@ async fn test_redeem_outcome_outputs_conditional() {
     let no_keyset_id = *condition_response.keysets.get("NO").unwrap();
 
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
 
     let witness = create_oracle_witness(&oracle, "YES");
     let mut proofs_with_witness = conditional_proofs;
@@ -1305,6 +1749,215 @@ async fn test_redeem_outcome_outputs_conditional() {
     );
 }
 
+/// Regular inputs cannot create conditional outputs or mixed output assets.
+#[tokio::test]
+async fn test_swap_asset_boundary_rejects_regular_to_conditional_without_writes() {
+    for outcome in ["YES", "NO"] {
+        for resolved in [false, true] {
+            let mint = create_test_mint().await.unwrap();
+            let inputs = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+            let (_, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+            if resolved {
+                resolve_test_swap_condition(&mint, keysets["YES"]).await;
+            }
+            let regular_keyset = get_regular_keyset_id(&mint);
+            for mixed_outputs in [false, true] {
+                let mut outputs = create_premint(
+                    &mint,
+                    keysets[outcome],
+                    Amount::from(if mixed_outputs { 4 } else { 8 }),
+                )
+                .0;
+                if mixed_outputs {
+                    outputs.extend(create_premint(&mint, regular_keyset, Amount::from(4)).0);
+                }
+                assert_swap_asset_refusal_without_writes(
+                    &mint,
+                    SwapRequest::new(inputs.clone(), outputs),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn resolve_test_swap_condition(mint: &Mint, yes_keyset: Id) {
+    let funding = mint_test_proofs_for_unit(mint, Amount::from(8), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let mut resolving = convert_to_conditional(mint, funding, yes_keyset, Amount::from(8)).await;
+    let witness = create_oracle_witness(&create_test_oracle(), "YES");
+    for proof in &mut resolving {
+        proof.witness = Some(Witness::OracleWitness(witness.clone()));
+    }
+    mint.process_redeem_outcome(RedeemOutcomeRequest {
+        inputs: resolving,
+        outputs: create_premint(mint, get_regular_keyset_id(mint), Amount::from(8)).0,
+    })
+    .await
+    .unwrap();
+}
+
+async fn assert_swap_asset_refusal_without_writes(mint: &Mint, request: SwapRequest) {
+    let input_ys = request.inputs().ys().unwrap();
+    let output_points = request
+        .outputs()
+        .iter()
+        .map(|output| output.blinded_secret)
+        .collect::<Vec<_>>();
+    let signing_before = mint.blind_sign_attempts();
+    let completed_before = completed_swap_count(mint).await;
+    let quotes_before = mint.localstore().get_mint_quotes().await.unwrap();
+    let melt_quotes_before = mint.localstore().get_melt_quotes().await.unwrap();
+    let result = mint.process_swap_request(request).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::InputsMustUseSameConditionalKeyset)
+                | Err(Error::OutputsMustUseRegularKeyset)
+        ),
+        "asset crossing must fail before reservation: {result:?}"
+    );
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+    assert!(mint
+        .localstore()
+        .get_proofs_states(&input_ys)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert!(mint
+        .localstore()
+        .get_blind_signatures(&output_points)
+        .await
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert_eq!(completed_swap_count(mint).await, completed_before);
+    let quotes_after = mint.localstore().get_mint_quotes().await.unwrap();
+    assert_eq!(quotes_after, quotes_before);
+    assert_eq!(
+        mint.localstore().get_melt_quotes().await.unwrap(),
+        melt_quotes_before
+    );
+}
+
+#[tokio::test]
+async fn test_swap_asset_boundary_rejects_conditional_crossings_without_writes() {
+    for outcome in ["YES", "NO"] {
+        for resolved in [false, true] {
+            let mint = create_test_mint().await.unwrap();
+            let regular = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+            let other_regular = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+            let (condition_id, keysets) =
+                register_test_condition(&mint, &["YES", "NO"], None).await;
+            let conditional =
+                convert_to_conditional(&mint, regular, keysets[outcome], Amount::from(8)).await;
+            let other_outcome = if outcome == "YES" { "NO" } else { "YES" };
+            let other_conditional = convert_to_conditional(
+                &mint,
+                other_regular,
+                keysets[other_outcome],
+                Amount::from(8),
+            )
+            .await;
+            let (_, announcement) = create_test_announcement(
+                &create_test_oracle_2(),
+                &["YES", "NO"],
+                "other-swap-condition",
+            );
+            let other = mint
+                .register_condition(enum_condition_request(
+                    "Other swap condition",
+                    vec![announcement],
+                ))
+                .await
+                .unwrap();
+            assert_ne!(other.condition_id, condition_id);
+            let other_keysets = other.keysets;
+            let regular_keyset = get_regular_keyset_id(&mint);
+            if resolved {
+                resolve_test_swap_condition(&mint, keysets["YES"]).await;
+            }
+            let condition_before = mint
+                .localstore()
+                .get_condition(&condition_id)
+                .await
+                .unwrap()
+                .unwrap();
+            for output_keyset in [
+                regular_keyset,
+                keysets[other_outcome],
+                other_keysets[outcome],
+            ] {
+                assert_swap_asset_refusal_without_writes(
+                    &mint,
+                    SwapRequest::new(
+                        conditional.clone(),
+                        create_premint(&mint, output_keyset, Amount::from(8)).0,
+                    ),
+                )
+                .await;
+            }
+            for output_keyset in [regular_keyset, keysets[other_outcome]] {
+                let mut outputs = create_premint(&mint, keysets[outcome], Amount::from(4)).0;
+                outputs.extend(create_premint(&mint, output_keyset, Amount::from(4)).0);
+                assert_swap_asset_refusal_without_writes(
+                    &mint,
+                    SwapRequest::new(conditional.clone(), outputs),
+                )
+                .await;
+            }
+            let regular_input =
+                mint_test_proofs_for_unit(&mint, Amount::from(8), CurrencyUnit::Sat)
+                    .await
+                    .unwrap();
+            for extra in [regular_input, other_conditional] {
+                let mut inputs = conditional.clone();
+                inputs.extend(extra);
+                assert_swap_asset_refusal_without_writes(
+                    &mint,
+                    SwapRequest::new(
+                        inputs,
+                        create_premint(&mint, keysets[outcome], Amount::from(16)).0,
+                    ),
+                )
+                .await;
+            }
+            let condition_after = mint
+                .localstore()
+                .get_condition(&condition_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(condition_after).unwrap(),
+                serde_json::to_value(condition_before).unwrap()
+            );
+            let ys = conditional.ys().unwrap();
+            let (outputs, premint) = create_premint(&mint, keysets[outcome], Amount::from(8));
+            let response = mint
+                .process_swap_request(SwapRequest::new(conditional, outputs))
+                .await
+                .expect("same-collection rotation must remain available");
+            let keys = mint
+                .keyset_pubkeys(&keysets[outcome])
+                .unwrap()
+                .keysets
+                .remove(0)
+                .keys;
+            let refreshed =
+                construct_proofs(response.signatures, premint.rs(), premint.secrets(), &keys)
+                    .unwrap();
+            assert_eq!(refreshed.total_amount().unwrap(), Amount::from(8));
+            assert_eq!(
+                mint.localstore().get_proofs_states(&ys).await.unwrap(),
+                vec![Some(State::Spent); ys.len()]
+            );
+        }
+    }
+}
+
 /// Test that regular swap allows conditional trading within the same outcome collection.
 #[tokio::test]
 async fn test_swap_allows_same_conditional_outcome_inputs_and_outputs() {
@@ -1325,9 +1978,9 @@ async fn test_swap_allows_same_conditional_outcome_inputs_and_outputs() {
         .unwrap();
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
 
-    let output_amount = after_conditional_input_fee(amount);
+    let output_amount = amount;
     let (conditional_outputs, pre_mint) = create_premint(&mint, yes_keyset_id, output_amount);
     let keys = mint
         .keyset_pubkeys(&yes_keyset_id)
@@ -1380,12 +2033,12 @@ async fn test_swap_allows_same_conditional_outcome_p2pk_lock_and_change() {
         .unwrap();
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, input_amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, input_amount).await;
 
     let (mut lock_outputs, lock_pre_mint) =
         create_p2pk_premint(&mint, yes_keyset_id, Amount::from(100));
     let (mut change_outputs, change_pre_mint) =
-        create_premint(&mint, yes_keyset_id, Amount::from(35));
+        create_premint(&mint, yes_keyset_id, Amount::from(36));
     lock_outputs.append(&mut change_outputs);
 
     let keys = mint
@@ -1414,14 +2067,13 @@ async fn test_swap_allows_same_conditional_outcome_p2pk_lock_and_change() {
     let refreshed_total = refreshed_proofs
         .iter()
         .fold(Amount::ZERO, |sum, proof| sum + proof.amount);
-    assert_eq!(refreshed_total, after_conditional_input_fee(input_amount));
+    assert_eq!(refreshed_total, input_amount);
 }
 
 /// Test that regular swap rejects conditional keyset inputs to regular outputs
 #[tokio::test]
 async fn test_swap_rejects_conditional_inputs() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
     let oracle = create_test_oracle();
     let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
 
@@ -1435,10 +2087,10 @@ async fn test_swap_rejects_conditional_inputs() {
         .unwrap();
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
 
     // Try a regular swap with conditional proofs as input — should fail
-    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount);
     let swap_request = SwapRequest::new(conditional_proofs, regular_outputs);
     let result = mint.process_swap_request(swap_request).await;
 
@@ -1469,7 +2121,7 @@ async fn test_swap_rejects_conditional_inputs_to_different_outcome() {
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
     let no_keyset_id = *condition_response.keysets.get("NO").unwrap();
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
 
     let (wrong_outcome_outputs, _) = create_premint(&mint, no_keyset_id, amount);
     let swap_request = SwapRequest::new(conditional_proofs, wrong_outcome_outputs);
@@ -1579,7 +2231,7 @@ async fn test_pay_to_unlock_refund_rejects_regular_to_conditional_output() {
         .await
         .expect_err("regular PAY_TO_UNLOCK refund must preserve the regular asset class")
         .into();
-    assert_eq!(response.code, ErrorCode::PayToUnlockInvalidCondition);
+    assert_eq!(response.code, ErrorCode::OutputsMustUseRegularKeyset);
 }
 
 #[tokio::test]
@@ -1590,19 +2242,19 @@ async fn test_pay_to_unlock_refund_rejects_cross_collection_output() {
     let (_, conditional_keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
     let yes_keyset = *conditional_keysets.get("YES").unwrap();
     let no_keyset = *conditional_keysets.get("NO").unwrap();
-    let conditional = swap_to_conditional(&mint, regular, yes_keyset, amount).await;
+    let conditional = convert_to_conditional(&mint, regular, yes_keyset, amount).await;
     let refund_key = SecretKey::generate();
     let locked = lock_pay_to_unlock(
         &mint,
         conditional,
         yes_keyset,
-        after_conditional_input_fee(amount),
+        amount,
         unix_time().saturating_sub(1),
         &refund_key,
     )
     .await;
 
-    let refund_amount = after_conditional_input_fee(after_conditional_input_fee(amount));
+    let refund_amount = amount;
     let (outputs, _) = create_premint(&mint, no_keyset, refund_amount);
     let mut request = SwapRequest::new(locked, outputs);
     sign_pay_to_unlock_refund(&mut request, 0, &refund_key).unwrap();
@@ -1623,19 +2275,19 @@ async fn test_redeem_rejects_pay_to_unlock_without_spending_it() {
     let regular_keyset = get_regular_keyset_id(&mint);
     let (_, conditional_keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
     let yes_keyset = *conditional_keysets.get("YES").unwrap();
-    let conditional = swap_to_conditional(&mint, regular, yes_keyset, amount).await;
+    let conditional = convert_to_conditional(&mint, regular, yes_keyset, amount).await;
     let refund_key = SecretKey::generate();
     let locked = lock_pay_to_unlock(
         &mint,
         conditional,
         yes_keyset,
-        after_conditional_input_fee(amount),
+        amount,
         unix_time() + 3600,
         &refund_key,
     )
     .await;
     let locked_ys = locked.ys().unwrap();
-    let output_amount = after_conditional_input_fee(after_conditional_input_fee(amount));
+    let output_amount = amount;
     let (outputs, _) = create_premint(&mint, regular_keyset, output_amount);
 
     let result = mint
@@ -1661,7 +2313,6 @@ async fn test_redeem_rejects_pay_to_unlock_without_spending_it() {
 #[tokio::test]
 async fn test_redeem_second_uses_stored_attestation() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
     let oracle = create_test_oracle();
     let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
 
@@ -1680,22 +2331,20 @@ async fn test_redeem_second_uses_stored_attestation() {
         .unwrap();
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
 
+    let conditional_proofs_1 =
+        convert_to_conditional(&mint, regular_proofs_1, yes_keyset_id, amount1).await;
+    let conditional_proofs_2 =
+        convert_to_conditional(&mint, regular_proofs_2, yes_keyset_id, amount2).await;
+
     // First redemption with valid witness
     {
-        let conditional_proofs =
-            swap_to_conditional(&mint, regular_proofs_1, yes_keyset_id, amount1).await;
-
         let witness = create_oracle_witness(&oracle, "YES");
-        let mut proofs_with_witness = conditional_proofs;
+        let mut proofs_with_witness = conditional_proofs_1;
         for proof in &mut proofs_with_witness {
             proof.witness = Some(Witness::OracleWitness(witness.clone()));
         }
 
-        let (regular_outputs, _) = create_premint(
-            &mint,
-            regular_keyset_id,
-            after_conditional_input_fee(amount1),
-        );
+        let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount1);
 
         mint.process_redeem_outcome(RedeemOutcomeRequest {
             inputs: proofs_with_witness,
@@ -1707,21 +2356,14 @@ async fn test_redeem_second_uses_stored_attestation() {
 
     // Second redemption — attestation is already stored
     {
-        let conditional_proofs =
-            swap_to_conditional(&mint, regular_proofs_2, yes_keyset_id, amount2).await;
-
         // Witness still needed for parsing, but verification path changes
         let witness = create_oracle_witness(&oracle, "YES");
-        let mut proofs_with_witness = conditional_proofs;
+        let mut proofs_with_witness = conditional_proofs_2;
         for proof in &mut proofs_with_witness {
             proof.witness = Some(Witness::OracleWitness(witness.clone()));
         }
 
-        let (regular_outputs, _) = create_premint(
-            &mint,
-            regular_keyset_id,
-            after_conditional_input_fee(amount2),
-        );
+        let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount2);
 
         mint.process_redeem_outcome(RedeemOutcomeRequest {
             inputs: proofs_with_witness,
@@ -1904,7 +2546,7 @@ async fn test_register_condition_returns_registration_fee_change() {
     let fee_proofs = mint_test_proofs(&mint, Amount::from(16)).await.unwrap();
     let fee_ys = fee_proofs.ys().unwrap();
     let regular_keyset_id = get_regular_keyset_id(&mint);
-    let (change_outputs, _) = create_premint(&mint, regular_keyset_id, Amount::from(8));
+    let (change_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), Amount::from(8));
 
     let oracle = create_test_oracle();
     let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "fee-change");
@@ -2049,7 +2691,9 @@ async fn test_register_condition_empty_registration_fees_rejects_all_units() {
 
 #[tokio::test]
 async fn test_register_condition_allows_explicit_free_registration() {
-    let mint = create_test_mint_without_registration_fees().await.unwrap();
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 0)
+        .await
+        .unwrap();
     let mut mint_info = mint.mint_info().await.unwrap();
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
         registration_fees: vec![registration_fee_setting(CurrencyUnit::Msat, 0, 0)],
@@ -2225,7 +2869,7 @@ async fn test_register_condition_rejects_conditional_registration_fee() {
         .unwrap();
     let yes_keyset_id = *first.keysets.get("YES").unwrap();
     let conditional_fee =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, Amount::from(8)).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, Amount::from(8)).await;
 
     let mut mint_info = mint.mint_info().await.unwrap();
     mint_info.nuts.nut_ctf = Some(NutCtfSettings {
@@ -2244,64 +2888,50 @@ async fn test_register_condition_rejects_conditional_registration_fee() {
 
 #[tokio::test]
 async fn test_overlapping_collection_redeems_for_any_member() {
-    let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
-    let oracle = create_test_oracle();
-    let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B", "C"], "overlap-redeem");
-    let amount = Amount::from(16);
-
-    let regular_proofs_a = mint_test_proofs(&mint, amount).await.unwrap();
-    let regular_proofs_c = mint_test_proofs(&mint, amount).await.unwrap();
-
-    let mut request = enum_condition_request("Overlap redeem", vec![hex_tlv]);
-    request.outcome_collections = Some(vec![
-        "A".to_string(),
-        "B".to_string(),
-        "C".to_string(),
-        "A|B".to_string(),
-        "B|C".to_string(),
-        "A|C".to_string(),
-    ]);
-    let condition_response = mint.register_condition(request).await.unwrap();
-    let ab_keyset_id = *condition_response.keysets.get("A|B").unwrap();
-
-    let ab_proofs = swap_to_conditional(&mint, regular_proofs_a, ab_keyset_id, amount).await;
-    let witness_a = create_oracle_witness(&oracle, "A");
-    let mut proofs_with_witness = ab_proofs;
-    for proof in &mut proofs_with_witness {
-        proof.witness = Some(Witness::OracleWitness(witness_a.clone()));
+    for (outcome, accepts) in [("A", true), ("B", true), ("C", false)] {
+        let mint = create_test_mint().await.unwrap();
+        let oracle = create_test_oracle();
+        let (_, hex_tlv) = create_test_announcement(&oracle, &["A", "B", "C"], "overlap-redeem");
+        let amount = Amount::from(16);
+        let regular_proofs = mint_test_proofs(&mint, amount).await.unwrap();
+        let mut request = enum_condition_request("Overlap redeem", vec![hex_tlv]);
+        request.outcome_collections = Some(vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "A|B".to_string(),
+            "B|C".to_string(),
+            "A|C".to_string(),
+        ]);
+        let condition_response = mint.register_condition(request).await.unwrap();
+        let ab_keyset_id = condition_response.keysets["A|B"];
+        let mut inputs = convert_to_conditional(&mint, regular_proofs, ab_keyset_id, amount).await;
+        for proof in &mut inputs {
+            proof.witness = Some(Witness::OracleWitness(create_oracle_witness(
+                &oracle, outcome,
+            )));
+        }
+        let outputs = create_premint(&mint, get_regular_keyset_id(&mint), amount).0;
+        let input_ys = inputs.ys().unwrap();
+        let result = mint
+            .process_redeem_outcome(RedeemOutcomeRequest { inputs, outputs })
+            .await;
+        if accepts {
+            assert!(result.is_ok(), "A|B membership for {outcome}: {result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(Error::OracleNotAttestedOutcome)),
+                "{result:?}"
+            );
+            assert!(mint
+                .localstore()
+                .get_proofs_states(&input_ys)
+                .await
+                .unwrap()
+                .iter()
+                .all(Option::is_none));
+        }
     }
-    let (regular_outputs, _) = create_premint(
-        &mint,
-        regular_keyset_id,
-        after_conditional_input_fee(amount),
-    );
-    let result = mint
-        .process_redeem_outcome(RedeemOutcomeRequest {
-            inputs: proofs_with_witness,
-            outputs: regular_outputs,
-        })
-        .await;
-    assert!(
-        result.is_ok(),
-        "A|B should redeem when A is attested: {:?}",
-        result.err()
-    );
-
-    let ab_proofs = swap_to_conditional(&mint, regular_proofs_c, ab_keyset_id, amount).await;
-    let witness_c = create_oracle_witness(&oracle, "C");
-    let mut proofs_with_witness = ab_proofs;
-    for proof in &mut proofs_with_witness {
-        proof.witness = Some(Witness::OracleWitness(witness_c.clone()));
-    }
-    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
-    let result = mint
-        .process_redeem_outcome(RedeemOutcomeRequest {
-            inputs: proofs_with_witness,
-            outputs: regular_outputs,
-        })
-        .await;
-    assert!(result.is_err(), "A|B should not redeem when C is attested");
 }
 
 // ============================================================================
@@ -2414,7 +3044,6 @@ async fn test_numeric_condition_info() {
 #[tokio::test]
 async fn test_numeric_redemption_hi() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
 
     // Mint proofs BEFORE registering condition
     let face_amount = Amount::from(100);
@@ -2426,7 +3055,7 @@ async fn test_numeric_redemption_hi() {
 
     // Swap to HI conditional keyset
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
+        convert_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
 
     // Oracle attests value 50000 (midpoint) -> HI gets 50%
     let oracle = create_test_oracle();
@@ -2438,11 +3067,7 @@ async fn test_numeric_redemption_hi() {
 
     // HI payout = floor(100 * 50000 / 100000) = 50
     let hi_payout = Amount::from(50);
-    let (regular_outputs, _) = create_premint(
-        &mint,
-        regular_keyset_id,
-        after_conditional_input_fee(hi_payout),
-    );
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), hi_payout);
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -2463,7 +3088,6 @@ async fn test_numeric_redemption_hi() {
 #[tokio::test]
 async fn test_numeric_redemption_lo() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
 
     let face_amount = Amount::from(100);
     let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
@@ -2473,7 +3097,7 @@ async fn test_numeric_redemption_lo() {
     let lo_keyset_id = *keysets.get("LO").unwrap();
 
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, lo_keyset_id, face_amount).await;
+        convert_to_conditional(&mint, regular_proofs, lo_keyset_id, face_amount).await;
 
     // Oracle attests value 50000 -> LO gets 50%
     let oracle = create_test_oracle();
@@ -2485,11 +3109,7 @@ async fn test_numeric_redemption_lo() {
 
     // LO payout = 100 - 50 = 50
     let lo_payout = Amount::from(50);
-    let (regular_outputs, _) = create_premint(
-        &mint,
-        regular_keyset_id,
-        after_conditional_input_fee(lo_payout),
-    );
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), lo_payout);
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -2510,7 +3130,6 @@ async fn test_numeric_redemption_lo() {
 #[tokio::test]
 async fn test_numeric_boundary_lo() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
 
     let face_amount = Amount::from(100);
     let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
@@ -2519,7 +3138,7 @@ async fn test_numeric_boundary_lo() {
     let lo_keyset_id = *keysets.get("LO").unwrap();
 
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, lo_keyset_id, face_amount).await;
+        convert_to_conditional(&mint, regular_proofs, lo_keyset_id, face_amount).await;
 
     // Oracle attests value 0 (at lo_bound) -> LO gets 100%
     let oracle = create_test_oracle();
@@ -2529,11 +3148,7 @@ async fn test_numeric_boundary_lo() {
         proof.witness = Some(Witness::OracleWitness(witness.clone()));
     }
 
-    let (regular_outputs, _) = create_premint(
-        &mint,
-        regular_keyset_id,
-        after_conditional_input_fee(face_amount),
-    );
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), face_amount);
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -2553,7 +3168,6 @@ async fn test_numeric_boundary_lo() {
 #[tokio::test]
 async fn test_numeric_boundary_hi() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
 
     let face_amount = Amount::from(100);
     let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
@@ -2562,7 +3176,7 @@ async fn test_numeric_boundary_hi() {
     let hi_keyset_id = *keysets.get("HI").unwrap();
 
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
+        convert_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
 
     // Oracle attests value 99999 which is max for 5 unsigned base-10 digits
     // 99999 < 100000 so HI gets floor(100 * 99999/100000) = 99
@@ -2577,11 +3191,7 @@ async fn test_numeric_boundary_hi() {
 
     // HI gets floor(100 * 99999/100000) = 99
     let hi_payout = Amount::from(99);
-    let (regular_outputs, _) = create_premint(
-        &mint,
-        regular_keyset_id,
-        after_conditional_input_fee(hi_payout),
-    );
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), hi_payout);
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -2601,7 +3211,6 @@ async fn test_numeric_boundary_hi() {
 #[tokio::test]
 async fn test_numeric_redemption_overspend_rejected() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
 
     let face_amount = Amount::from(100);
     let regular_proofs = mint_test_proofs(&mint, face_amount).await.unwrap();
@@ -2610,7 +3219,7 @@ async fn test_numeric_redemption_overspend_rejected() {
     let hi_keyset_id = *keysets.get("HI").unwrap();
 
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
+        convert_to_conditional(&mint, regular_proofs, hi_keyset_id, face_amount).await;
 
     // Oracle attests 20000 -> HI gets floor(100 * 20000/100000) = 20
     let oracle = create_test_oracle();
@@ -2621,7 +3230,8 @@ async fn test_numeric_redemption_overspend_rejected() {
     }
 
     // Try to redeem 50 (more than the 20 payout)
-    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, Amount::from(50));
+    let (regular_outputs, _) =
+        create_premint(&mint, get_regular_keyset_id(&mint), Amount::from(50));
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -3555,7 +4165,7 @@ async fn test_ctf_settlement_expiry_uses_all_registered_keysets() {
 
 #[tokio::test]
 async fn test_ctf_settlement_mixed_keysets_lock_bare_fee_and_outcome_conservation() {
-    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
         .await
         .unwrap();
     let now = unix_time();
@@ -4847,24 +5457,249 @@ struct MixedInputCtfConvertFixture {
     manifest: PoolManifest,
 }
 
+#[tokio::test]
+async fn test_ctf_audit_multiparty_requires_positive_output_for_every_outcome() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1000)
+        .await
+        .unwrap();
+    let conditional_funding = mint_test_proofs_for_unit(&mint, Amount::from(6), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let regular_inputs = mint_test_proofs_for_unit(&mint, Amount::from(2), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
+    let conditional_inputs =
+        convert_to_conditional(&mint, conditional_funding, keysets["YES"], Amount::from(4)).await;
+    let all_inputs = conditional_inputs
+        .iter()
+        .chain(&regular_inputs)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(all_inputs.len(), 2);
+    assert_eq!(
+        mint.get_proofs_fee(&all_inputs).await.unwrap().total,
+        Amount::from(2)
+    );
+    let mut participants = vec![
+        CtfSettlementParticipant {
+            inputs: conditional_inputs,
+            outputs: create_premint(&mint, keysets["YES"], Amount::from(2)).0,
+            mode: ParticipantMode::Standard,
+        },
+        CtfSettlementParticipant {
+            inputs: regular_inputs,
+            outputs: create_premint(&mint, keysets["YES"], Amount::from(2)).0,
+            mode: ParticipantMode::Standard,
+        },
+    ];
+    canonicalize_settlement_participants(&mut participants);
+    let output_points = participants
+        .iter()
+        .flat_map(|participant| &participant.outputs)
+        .map(|output| output.blinded_secret)
+        .collect();
+    let fixture = StandardSettlementFixture {
+        request: CtfSettlementRequest {
+            condition_id: CanonicalHash::parse(&condition_id, "condition_id").unwrap(),
+            parent_collection_id: CanonicalHash::from_bytes([0; 32]),
+            participants,
+            coordinator_sig: None,
+        },
+        output_only_keyset: keysets["YES"],
+        input_ys: all_inputs.ys().unwrap(),
+        output_points,
+    };
+    let completed_before = completed_swap_count(&mint).await;
+    let signing_before = mint.blind_sign_attempts();
+    let result = mint
+        .process_ctf_settlement(&fixture.request, settlement_settings(), unix_time())
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(CtfSettlementError::Mint(Error::ConvertPayoffFeeViolation))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+    assert_ctf_settlement_absent(&mint, &fixture, completed_before).await;
+}
+
+#[tokio::test]
+async fn test_ctf_audit_singleparty_full_exit_with_exact_regular_fee() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 1000)
+        .await
+        .unwrap();
+    let fixture = mixed_input_ctf_convert_fixture(&mint, Amount::from(2)).await;
+    let all_inputs = fixture
+        .conditional_inputs
+        .iter()
+        .chain(&fixture.regular_inputs)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(fixture.conditional_inputs.len(), 1);
+    assert_eq!(fixture.conditional_inputs[0].amount, Amount::from(8));
+    assert_eq!(fixture.regular_inputs.len(), 1);
+    assert_eq!(fixture.regular_inputs[0].amount, Amount::from(2));
+    assert!(all_inputs.iter().all(|proof| mint
+        .get_keyset_info(&proof.keyset_id)
+        .unwrap()
+        .input_fee_ppk
+        == 1000));
+    assert_eq!(
+        mint.get_proofs_fee(&all_inputs).await.unwrap().total,
+        Amount::from(2)
+    );
+    let request = CtfConvertRequest {
+        condition_id: fixture.condition_id.clone(),
+        parent_collection_id: None,
+        inputs: HashMap::from([
+            ("*".to_string(), fixture.regular_inputs.clone()),
+            ("YES".to_string(), fixture.conditional_inputs.clone()),
+        ]),
+        outputs: HashMap::from([(
+            "YES".to_string(),
+            fixture.locked_premint.blinded_messages().to_vec(),
+        )]),
+    };
+    let mut response = mint.process_ctf_convert(request).await.unwrap();
+    let signatures = response.signatures.remove("YES").unwrap();
+    assert!(response.signatures.is_empty());
+    let keys = mint
+        .keyset_pubkeys(&fixture.offer_keyset)
+        .unwrap()
+        .keysets
+        .remove(0)
+        .keys;
+    let locked_proofs = construct_proofs(
+        signatures,
+        fixture.locked_premint.rs(),
+        fixture.locked_premint.secrets(),
+        &keys,
+    )
+    .unwrap();
+    assert_eq!(locked_proofs.len(), 1);
+    assert_eq!(locked_proofs[0].amount, Amount::from(8));
+    assert_eq!(locked_proofs[0].secret, fixture.locked_secret);
+    let authorization = mint
+        .validate_ctf_range_authorization(
+            CanonicalHash::parse(&fixture.condition_id, "condition_id").unwrap(),
+            CanonicalHash::from_bytes([0; 32]),
+            &locked_proofs,
+            &fixture.manifest,
+            settlement_settings(),
+            unix_time(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorization.offer_keyset, fixture.offer_keyset);
+    assert!(matches!(
+        authorization.mode,
+        cdk_common::nuts::nut_ctf::settlement::PayToUnlockMode::Pool(_)
+    ));
+    assert_eq!(
+        mint.localstore()
+            .get_proofs_states(&all_inputs.ys().unwrap())
+            .await
+            .unwrap(),
+        vec![Some(State::Spent); 2]
+    );
+}
+
+#[tokio::test]
+async fn test_ctf_audit_regular_only_convert_uses_stored_collateral() {
+    for (unit, has_collateral) in [
+        (CurrencyUnit::Sat, true),
+        (CurrencyUnit::Msat, true),
+        (CurrencyUnit::Sat, false),
+    ] {
+        let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+        let seed = Mnemonic::generate(12).unwrap().to_seed_normalized("");
+        let mint = build_test_mint_with_units(
+            db,
+            &seed,
+            &[(CurrencyUnit::Sat, 1000), (CurrencyUnit::Msat, 1000)],
+        )
+        .await
+        .unwrap();
+        let regular_keyset = get_regular_keyset_id_for_unit(&mint, &unit);
+        let inputs = mint_test_proofs_for_unit(&mint, Amount::from(8), unit.clone())
+            .await
+            .unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            mint.get_proofs_fee(&inputs).await.unwrap().total,
+            Amount::from(1)
+        );
+        let (_, announcement) = create_test_announcement(
+            &create_test_oracle(),
+            &["YES", "NO"],
+            "registered-collateral",
+        );
+        let mut registration = enum_condition_request("Registered collateral", vec![announcement]);
+        if !has_collateral {
+            registration.collateral = None;
+            registration.outcome_collections = Some(Vec::new());
+        }
+        let condition = mint.register_condition(registration).await.unwrap();
+        let outputs = create_premint(&mint, regular_keyset, Amount::from(7)).0;
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| u64::from(output.amount))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        let fixture = AtomicConvertFixture {
+            input_ys: inputs.ys().unwrap(),
+            blinded_secrets: outputs.iter().map(|output| output.blinded_secret).collect(),
+            request: CtfConvertRequest {
+                condition_id: condition.condition_id,
+                parent_collection_id: None,
+                inputs: HashMap::from([("*".to_string(), inputs)]),
+                outputs: HashMap::from([("*".to_string(), outputs)]),
+            },
+        };
+        let signing_before = mint.blind_sign_attempts();
+        let result = mint.process_ctf_convert(fixture.request.clone()).await;
+        if has_collateral && unit == CurrencyUnit::Sat {
+            assert!(result.is_ok(), "matching collateral: {result:?}");
+            assert_atomic_convert_committed(&mint, &fixture).await;
+        } else {
+            if has_collateral {
+                assert!(matches!(result, Err(Error::MultipleUnits)), "{result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(Error::UnsupportedCollateralUnit)),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(mint.blind_sign_attempts(), signing_before);
+            assert_atomic_convert_absent(&mint, &fixture).await;
+        }
+    }
+}
+
 async fn mixed_input_ctf_convert_fixture(
     mint: &Mint,
     regular_input_amount: Amount,
 ) -> MixedInputCtfConvertFixture {
     let offer_amount = Amount::from(8);
-    let regular_keyset = get_regular_keyset_id_for_unit(mint, &CurrencyUnit::Msat);
+    // Keep the historical conditional fee when regular authority changes.
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Msat).await;
+    let regular_keyset = rotate_test_regular_fee(mint, CurrencyUnit::Msat, 1000).await;
     let conditional_funding = mint_test_proofs_for_unit(mint, Amount::from(10), CurrencyUnit::Msat)
         .await
         .unwrap();
     let regular_inputs = mint_test_proofs_for_unit(mint, regular_input_amount, CurrencyUnit::Msat)
         .await
         .unwrap();
-    let (condition_id, keysets) =
-        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Msat).await;
     let offer_keyset = *keysets.get("YES").expect("YES keyset");
     let receive_keyset = *keysets.get("NO").expect("NO keyset");
     let conditional_inputs =
-        swap_to_conditional(mint, conditional_funding, offer_keyset, offer_amount).await;
+        convert_to_conditional(mint, conditional_funding, offer_keyset, offer_amount).await;
 
     let (receive_candidates, _) = create_premint(mint, receive_keyset, offer_amount);
     let (change_candidates, _) = create_premint(mint, offer_keyset, offer_amount);
@@ -4956,7 +5791,7 @@ fn settlement_pool_pay_to_unlock_secret_for_range(
 
 #[tokio::test]
 async fn test_ctf_convert_mixed_conditional_and_regular_inputs_preserve_full_exit() {
-    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 1000)
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 1)
         .await
         .unwrap();
     let fixture = mixed_input_ctf_convert_fixture(&mint, Amount::from(8)).await;
@@ -5106,7 +5941,7 @@ async fn test_ctf_convert_mixed_conditional_and_regular_inputs_preserve_full_exi
 
 #[tokio::test]
 async fn test_ctf_convert_mixed_inputs_reject_insufficient_regular_fee_without_spending() {
-    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 1000)
+    let mint = create_test_mint_with_unit(CurrencyUnit::Msat, 1)
         .await
         .unwrap();
     let fixture = mixed_input_ctf_convert_fixture(&mint, Amount::from(1)).await;
@@ -5474,7 +6309,7 @@ async fn test_ctf_convert_conditional_input_as_collateral_rejected() {
     let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
     let yes_keyset_id = *keysets.get("YES").unwrap();
     let yes_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, Amount::from(8)).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, Amount::from(8)).await;
     let (yes_outputs, _) = create_premint(&mint, yes_keyset_id, Amount::from(7));
     let (no_outputs, _) = create_premint(&mint, *keysets.get("NO").unwrap(), Amount::from(7));
     let request = CtfConvertRequest {
@@ -5492,28 +6327,30 @@ async fn test_ctf_convert_conditional_input_as_collateral_rejected() {
 }
 
 /// Test that a CTF merge of a complete partition returns regular tokens.
-/// Flow: mint regular → (swap) YES conditional proofs + NO conditional proofs → merge → regular
+/// Mint collateral, convert to YES and NO proofs, then merge to collateral.
 #[tokio::test]
 async fn test_ctf_merge_returns_regular_tokens() {
-    let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
 
     let face_amount = Amount::from(8);
     // Mint BEFORE registering conditions; need two batches for YES and NO conditional proofs
-    let yes_regular = mint_test_proofs(&mint, face_amount).await.unwrap();
-    let no_regular = mint_test_proofs(&mint, face_amount).await.unwrap();
+    // Each regular funding batch has two proofs and pays one base unit.
+    let yes_regular = mint_test_proofs(&mint, Amount::from(9)).await.unwrap();
+    let no_regular = mint_test_proofs(&mint, Amount::from(9)).await.unwrap();
 
     let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
     let yes_keyset_id = *keysets.get("YES").unwrap();
     let no_keyset_id = *keysets.get("NO").unwrap();
 
-    // Swap regular proofs into each conditional keyset
-    let yes_proofs = swap_to_conditional(&mint, yes_regular, yes_keyset_id, face_amount).await;
-    let no_proofs = swap_to_conditional(&mint, no_regular, no_keyset_id, face_amount).await;
+    // Convert regular proofs into each conditional collection.
+    let yes_proofs = convert_to_conditional(&mint, yes_regular, yes_keyset_id, face_amount).await;
+    let no_proofs = convert_to_conditional(&mint, no_regular, no_keyset_id, face_amount).await;
 
     // Merge YES + NO back into regular tokens. Conditional keysets charge 1 ppk,
     // so the two input proofs pay one base unit total.
-    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, Amount::from(7));
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), Amount::from(7));
 
     let mut inputs = HashMap::new();
     inputs.insert("YES".to_string(), yes_proofs);
@@ -5541,7 +6378,6 @@ async fn test_ctf_merge_returns_regular_tokens() {
 #[tokio::test]
 async fn test_ctf_merge_incomplete_partition_rejected() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
 
     let face_amount = Amount::from(8);
     // Mint BEFORE registering conditions
@@ -5550,10 +6386,10 @@ async fn test_ctf_merge_incomplete_partition_rejected() {
     let (condition_id, keysets) = register_test_condition(&mint, &["YES", "NO"], None).await;
     let yes_keyset_id = *keysets.get("YES").unwrap();
 
-    let yes_proofs = swap_to_conditional(&mint, yes_regular, yes_keyset_id, face_amount).await;
+    let yes_proofs = convert_to_conditional(&mint, yes_regular, yes_keyset_id, face_amount).await;
 
     // Only provide YES inputs — NO is missing, so the partition is incomplete
-    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, face_amount);
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), face_amount);
 
     let mut inputs = HashMap::new();
     inputs.insert("YES".to_string(), yes_proofs);
@@ -5587,7 +6423,6 @@ async fn test_ctf_merge_incomplete_partition_rejected() {
 #[tokio::test]
 async fn test_redeem_outcome_multi_oracle_threshold() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
 
     let oracle1 = create_test_oracle();
     let oracle2 = create_test_oracle_2();
@@ -5626,7 +6461,7 @@ async fn test_redeem_outcome_multi_oracle_threshold() {
     // --- Attempt 1: only oracle1 sig — should fail (threshold not met) ---
     {
         let conditional_proofs =
-            swap_to_conditional(&mint, regular_proofs_1, yes_keyset_id, amount).await;
+            convert_to_conditional(&mint, regular_proofs_1, yes_keyset_id, amount).await;
 
         let witness_one = create_multi_oracle_witness(&[(&oracle1, "YES")]);
 
@@ -5635,11 +6470,7 @@ async fn test_redeem_outcome_multi_oracle_threshold() {
             proof.witness = Some(Witness::OracleWitness(witness_one.clone()));
         }
 
-        let (regular_outputs, _) = create_premint(
-            &mint,
-            regular_keyset_id,
-            after_conditional_input_fee(amount),
-        );
+        let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount);
 
         let result = mint
             .process_redeem_outcome(RedeemOutcomeRequest {
@@ -5657,7 +6488,7 @@ async fn test_redeem_outcome_multi_oracle_threshold() {
     // --- Attempt 2: both oracle sigs — should succeed ---
     {
         let conditional_proofs =
-            swap_to_conditional(&mint, regular_proofs_2, yes_keyset_id, amount).await;
+            convert_to_conditional(&mint, regular_proofs_2, yes_keyset_id, amount).await;
 
         let witness_both = create_multi_oracle_witness(&[(&oracle1, "YES"), (&oracle2, "YES")]);
 
@@ -5666,11 +6497,7 @@ async fn test_redeem_outcome_multi_oracle_threshold() {
             proof.witness = Some(Witness::OracleWitness(witness_both.clone()));
         }
 
-        let (regular_outputs, _) = create_premint(
-            &mint,
-            regular_keyset_id,
-            after_conditional_input_fee(amount),
-        );
+        let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount);
 
         let result = mint
             .process_redeem_outcome(RedeemOutcomeRequest {
@@ -5698,7 +6525,6 @@ async fn test_redeem_outcome_multi_oracle_threshold() {
 #[tokio::test]
 async fn test_redeem_rejects_duplicate_oracle_sigs() {
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
 
     let oracle1 = create_test_oracle();
     let oracle2 = create_test_oracle_2();
@@ -5731,7 +6557,7 @@ async fn test_redeem_rejects_duplicate_oracle_sigs() {
         .unwrap();
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
 
     // Provide oracle1's signature twice (duplicate) — should NOT satisfy threshold=2
     let witness = create_multi_oracle_witness(&[(&oracle1, "YES"), (&oracle1, "YES")]);
@@ -5740,7 +6566,7 @@ async fn test_redeem_rejects_duplicate_oracle_sigs() {
         proof.witness = Some(Witness::OracleWitness(witness.clone()));
     }
 
-    let (regular_outputs, _) = create_premint(&mint, regular_keyset_id, amount);
+    let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount);
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -5765,7 +6591,6 @@ async fn test_failed_redeem_does_not_persist_attestation() {
     use cdk_common::nuts::nut_ctf::AttestationStatus;
 
     let mint = create_test_mint().await.unwrap();
-    let regular_keyset_id = get_regular_keyset_id(&mint);
     let oracle = create_test_oracle();
     let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
 
@@ -5780,7 +6605,7 @@ async fn test_failed_redeem_does_not_persist_attestation() {
 
     let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
     let conditional_proofs =
-        swap_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
+        convert_to_conditional(&mint, regular_proofs, yes_keyset_id, amount).await;
 
     // Attach a perfectly valid oracle witness — exactly what an attacker who watches the
     // oracle's public attestation would have access to.
@@ -5793,7 +6618,8 @@ async fn test_failed_redeem_does_not_persist_attestation() {
     // But sum the outputs to a larger amount than the inputs cover — this fails the balance
     // check, which (after the fix) runs BEFORE record_attestation. Pre-fix this branch
     // wrote the attestation anyway.
-    let (oversized_outputs, _) = create_premint(&mint, regular_keyset_id, Amount::from(100));
+    let (oversized_outputs, _) =
+        create_premint(&mint, get_regular_keyset_id(&mint), Amount::from(100));
 
     let result = mint
         .process_redeem_outcome(RedeemOutcomeRequest {
@@ -5825,4 +6651,484 @@ async fn test_failed_redeem_does_not_persist_attestation() {
             .is_none(),
         "failed redeem must not persist a winning_outcome"
     );
+}
+
+#[tokio::test]
+async fn test_active_unit_keyset_remains_regular_after_condition_registration() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let regular = get_regular_keyset_id(&mint);
+    register_test_condition_with_collateral(&mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+
+    assert_eq!(
+        mint.get_active_keysets().get(&CurrencyUnit::Sat),
+        Some(&regular)
+    );
+}
+
+#[derive(Clone, Copy)]
+enum SinglePartyLock {
+    P2pk,
+    Htlc,
+}
+
+fn single_party_secret(
+    kind: SinglePartyLock,
+    key: &SecretKey,
+    preimage: &str,
+    flag: SigFlag,
+) -> Secret {
+    match kind {
+        SinglePartyLock::P2pk => individual_p2pk_secret(key, flag),
+        SinglePartyLock::Htlc => individual_htlc_secret(preimage, flag),
+    }
+}
+
+fn add_single_party_witness(
+    proof: &mut cdk_common::nuts::Proof,
+    kind: SinglePartyLock,
+    key: &SecretKey,
+    preimage: &str,
+    valid: bool,
+) {
+    match kind {
+        SinglePartyLock::P2pk => {
+            let signer = if valid {
+                key.clone()
+            } else {
+                SecretKey::generate()
+            };
+            proof.sign_p2pk(signer).unwrap();
+        }
+        SinglePartyLock::Htlc => {
+            proof.add_preimage(if valid {
+                preimage.to_owned()
+            } else {
+                "24".repeat(32)
+            });
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_registration_fee_requires_individual_spend_authorization() {
+    for kind in [SinglePartyLock::P2pk, SinglePartyLock::Htlc] {
+        let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+            .await
+            .unwrap();
+        let mut info = mint.mint_info().await.unwrap();
+        info.nuts.nut_ctf = Some(NutCtfSettings {
+            registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 8, 0)],
+            ..NutCtfSettings::default()
+        });
+        mint.set_mint_info(info).await.unwrap();
+
+        let regular = get_regular_keyset_id(&mint);
+        let source = mint_test_proofs_for_unit(&mint, Amount::from(9), CurrencyUnit::Sat)
+            .await
+            .unwrap();
+        let key = SecretKey::generate();
+        let preimage = "42".repeat(32);
+        let locked = issue_locked_proof(
+            &mint,
+            source,
+            regular,
+            single_party_secret(kind, &key, &preimage, SigFlag::SigInputs),
+        )
+        .await;
+        let ys = vec![locked.y().unwrap()];
+        let oracle = create_test_oracle();
+        let (_, announcement) = create_test_announcement(&oracle, &["YES", "NO"], "fee-auth");
+        let mut request = enum_condition_request("Fee authorization", vec![announcement]);
+        request.fee = Some(vec![locked.clone()]);
+        let signing_before = mint.blind_sign_attempts();
+
+        for valid in [None, Some(false)] {
+            let mut refused = request.clone();
+            if let Some(valid) = valid {
+                add_single_party_witness(
+                    &mut refused.fee.as_mut().unwrap()[0],
+                    kind,
+                    &key,
+                    &preimage,
+                    valid,
+                );
+            }
+            assert!(matches!(
+                mint.register_condition(refused).await,
+                Err(Error::NUT11(_) | Error::NUT14(_))
+            ));
+            assert_eq!(mint.blind_sign_attempts(), signing_before);
+            assert_eq!(
+                mint.localstore().get_proofs_states(&ys).await.unwrap(),
+                vec![None]
+            );
+            assert!(mint
+                .get_conditions(None, None, &[])
+                .await
+                .unwrap()
+                .conditions
+                .is_empty());
+        }
+
+        let mut authorized = request;
+        add_single_party_witness(
+            &mut authorized.fee.as_mut().unwrap()[0],
+            kind,
+            &key,
+            &preimage,
+            true,
+        );
+        mint.register_condition(authorized).await.unwrap();
+        assert_eq!(
+            mint.localstore().get_proofs_states(&ys).await.unwrap(),
+            vec![Some(State::Spent)]
+        );
+
+        let source = mint_test_proofs_for_unit(&mint, Amount::from(9), CurrencyUnit::Sat)
+            .await
+            .unwrap();
+        let mut sig_all = issue_locked_proof(
+            &mint,
+            source,
+            regular,
+            single_party_secret(kind, &key, &preimage, SigFlag::SigAll),
+        )
+        .await;
+        add_single_party_witness(&mut sig_all, kind, &key, &preimage, true);
+        let sig_all_y = vec![sig_all.y().unwrap()];
+        let (_, announcement) =
+            create_test_announcement(&oracle, &["YES", "NO"], "fee-auth-sig-all");
+        let mut refused = enum_condition_request("Fee SIG_ALL", vec![announcement]);
+        refused.fee = Some(vec![sig_all]);
+        assert!(matches!(
+            mint.register_condition(refused).await,
+            Err(Error::NUT11(_) | Error::NUT14(_))
+        ));
+        assert_eq!(
+            mint.localstore()
+                .get_proofs_states(&sig_all_y)
+                .await
+                .unwrap(),
+            vec![None]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_convert_requires_individual_spend_authorization() {
+    for kind in [SinglePartyLock::P2pk, SinglePartyLock::Htlc] {
+        let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+            .await
+            .unwrap();
+        let regular = get_regular_keyset_id(&mint);
+        let source = mint_test_proofs_for_unit(&mint, Amount::from(9), CurrencyUnit::Sat)
+            .await
+            .unwrap();
+        let key = SecretKey::generate();
+        let preimage = "42".repeat(32);
+        let locked = issue_locked_proof(
+            &mint,
+            source,
+            regular,
+            single_party_secret(kind, &key, &preimage, SigFlag::SigInputs),
+        )
+        .await;
+        let ys = vec![locked.y().unwrap()];
+        let (condition_id, keysets) =
+            register_test_condition_with_collateral(&mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+        let (yes_outputs, _) = create_premint(&mint, *keysets.get("YES").unwrap(), Amount::from(7));
+        let (no_outputs, _) = create_premint(&mint, *keysets.get("NO").unwrap(), Amount::from(7));
+        let points = yes_outputs
+            .iter()
+            .chain(&no_outputs)
+            .map(|output| output.blinded_secret)
+            .collect::<Vec<_>>();
+        let request = CtfConvertRequest {
+            condition_id,
+            parent_collection_id: None,
+            inputs: HashMap::from([("*".to_string(), vec![locked])]),
+            outputs: HashMap::from([
+                ("YES".to_string(), yes_outputs),
+                ("NO".to_string(), no_outputs),
+            ]),
+        };
+        let signing_before = mint.blind_sign_attempts();
+
+        for valid in [None, Some(false)] {
+            let mut refused = request.clone();
+            if let Some(valid) = valid {
+                add_single_party_witness(
+                    &mut refused.inputs.get_mut("*").unwrap()[0],
+                    kind,
+                    &key,
+                    &preimage,
+                    valid,
+                );
+            }
+            assert!(matches!(
+                mint.process_ctf_convert(refused).await,
+                Err(Error::NUT11(_) | Error::NUT14(_))
+            ));
+            assert_eq!(mint.blind_sign_attempts(), signing_before);
+            assert_eq!(
+                mint.localstore().get_proofs_states(&ys).await.unwrap(),
+                vec![None]
+            );
+            assert!(mint
+                .localstore()
+                .get_blind_signatures(&points)
+                .await
+                .unwrap()
+                .iter()
+                .all(Option::is_none));
+        }
+
+        let condition_id = request.condition_id.clone();
+        let mut authorized = request;
+        add_single_party_witness(
+            &mut authorized.inputs.get_mut("*").unwrap()[0],
+            kind,
+            &key,
+            &preimage,
+            true,
+        );
+        mint.process_ctf_convert(authorized).await.unwrap();
+        assert_eq!(
+            mint.localstore().get_proofs_states(&ys).await.unwrap(),
+            vec![Some(State::Spent)]
+        );
+
+        let source = mint_test_proofs_for_unit(&mint, Amount::from(9), CurrencyUnit::Sat)
+            .await
+            .unwrap();
+        let mut sig_all = issue_locked_proof(
+            &mint,
+            source,
+            regular,
+            single_party_secret(kind, &key, &preimage, SigFlag::SigAll),
+        )
+        .await;
+        add_single_party_witness(&mut sig_all, kind, &key, &preimage, true);
+        let sig_all_y = vec![sig_all.y().unwrap()];
+        let (yes_outputs, _) = create_premint(&mint, *keysets.get("YES").unwrap(), Amount::from(7));
+        let (no_outputs, _) = create_premint(&mint, *keysets.get("NO").unwrap(), Amount::from(7));
+        let refused = CtfConvertRequest {
+            condition_id,
+            parent_collection_id: None,
+            inputs: HashMap::from([("*".to_string(), vec![sig_all])]),
+            outputs: HashMap::from([
+                ("YES".to_string(), yes_outputs),
+                ("NO".to_string(), no_outputs),
+            ]),
+        };
+        assert!(matches!(
+            mint.process_ctf_convert(refused).await,
+            Err(Error::NUT11(_) | Error::NUT14(_))
+        ));
+        assert_eq!(
+            mint.localstore()
+                .get_proofs_states(&sig_all_y)
+                .await
+                .unwrap(),
+            vec![None]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_convert_rejects_nut10_secret_with_invalid_locktime_tag() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let regular = get_regular_keyset_id(&mint);
+    let source = mint_test_proofs_for_unit(&mint, Amount::from(9), CurrencyUnit::Sat)
+        .await
+        .unwrap();
+    let key = SecretKey::generate();
+    let secret = Secret::new(
+        serde_json::json!([
+            "P2PK",
+            {
+                "nonce": "01",
+                "data": key.public_key().to_hex(),
+                "tags": [["locktime", "not-a-unix-time"]]
+            }
+        ])
+        .to_string(),
+    );
+    assert!(cdk_common::nuts::Nut10Secret::try_from(&secret).is_ok());
+    assert!(SpendingConditions::try_from(&secret).is_err());
+    let locked = issue_locked_proof(&mint, source, regular, secret).await;
+    let ys = vec![locked.y().unwrap()];
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(&mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+    let (yes_outputs, _) = create_premint(&mint, *keysets.get("YES").unwrap(), Amount::from(7));
+    let (no_outputs, _) = create_premint(&mint, *keysets.get("NO").unwrap(), Amount::from(7));
+    let signing_before = mint.blind_sign_attempts();
+
+    assert!(matches!(
+        mint.process_ctf_convert(CtfConvertRequest {
+            condition_id,
+            parent_collection_id: None,
+            inputs: HashMap::from([("*".to_string(), vec![locked])]),
+            outputs: HashMap::from([
+                ("YES".to_string(), yes_outputs),
+                ("NO".to_string(), no_outputs),
+            ]),
+        })
+        .await,
+        Err(Error::NUT11(_))
+    ));
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+    assert_eq!(
+        mint.localstore().get_proofs_states(&ys).await.unwrap(),
+        vec![None]
+    );
+}
+
+#[tokio::test]
+async fn test_redeem_requires_individual_spend_authorization() {
+    for kind in [SinglePartyLock::P2pk, SinglePartyLock::Htlc] {
+        let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+            .await
+            .unwrap();
+        let regular = get_regular_keyset_id(&mint);
+        let collateral = mint_test_proofs_for_unit(&mint, Amount::from(10), CurrencyUnit::Sat)
+            .await
+            .unwrap();
+        let (condition_id, keysets) =
+            register_test_condition_with_collateral(&mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+        let conditional = convert_to_conditional(
+            &mint,
+            collateral,
+            *keysets.get("YES").unwrap(),
+            Amount::from(9),
+        )
+        .await;
+        let key = SecretKey::generate();
+        let preimage = "42".repeat(32);
+        let locked = issue_locked_proof(
+            &mint,
+            conditional,
+            *keysets.get("YES").unwrap(),
+            single_party_secret(kind, &key, &preimage, SigFlag::SigInputs),
+        )
+        .await;
+        let collateral = mint_test_proofs_for_unit(&mint, Amount::from(10), CurrencyUnit::Sat)
+            .await
+            .unwrap();
+        let conditional = convert_to_conditional(
+            &mint,
+            collateral,
+            *keysets.get("YES").unwrap(),
+            Amount::from(9),
+        )
+        .await;
+        let mut sig_all = issue_locked_proof(
+            &mint,
+            conditional,
+            *keysets.get("YES").unwrap(),
+            single_party_secret(kind, &key, &preimage, SigFlag::SigAll),
+        )
+        .await;
+        add_single_party_witness(&mut sig_all, kind, &key, &preimage, true);
+        let sig_all_y = vec![sig_all.y().unwrap()];
+        let ys = vec![locked.y().unwrap()];
+        let (outputs, _) = create_premint(&mint, regular, Amount::from(7));
+        let points = outputs
+            .iter()
+            .map(|output| output.blinded_secret)
+            .collect::<Vec<_>>();
+        let request = RedeemOutcomeRequest {
+            inputs: vec![locked],
+            outputs,
+        };
+        let signing_before = mint.blind_sign_attempts();
+
+        assert!(matches!(
+            mint.process_redeem_outcome(request.clone()).await,
+            Err(Error::NUT11(_) | Error::NUT14(_))
+        ));
+        assert_eq!(mint.blind_sign_attempts(), signing_before);
+        assert_eq!(
+            mint.localstore().get_proofs_states(&ys).await.unwrap(),
+            vec![None]
+        );
+        assert_eq!(
+            mint.localstore()
+                .get_condition(&condition_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attestation_status,
+            "pending"
+        );
+        let mut incompatible = request.clone();
+        incompatible.inputs[0].witness = Some(Witness::OracleWitness(create_oracle_witness(
+            &create_test_oracle(),
+            "YES",
+        )));
+        assert!(matches!(
+            mint.process_redeem_outcome(incompatible).await,
+            Err(Error::NUT11(_) | Error::NUT14(_))
+        ));
+        assert_eq!(
+            mint.localstore().get_proofs_states(&ys).await.unwrap(),
+            vec![None]
+        );
+
+        assert!(mint
+            .localstore()
+            .update_condition_attestation(&condition_id, "attested", Some("YES"), Some(unix_time()))
+            .await
+            .unwrap());
+        for valid in [None, Some(false)] {
+            let mut refused = request.clone();
+            if let Some(valid) = valid {
+                add_single_party_witness(&mut refused.inputs[0], kind, &key, &preimage, valid);
+            }
+            assert!(matches!(
+                mint.process_redeem_outcome(refused).await,
+                Err(Error::NUT11(_) | Error::NUT14(_))
+            ));
+            assert_eq!(mint.blind_sign_attempts(), signing_before);
+            assert_eq!(
+                mint.localstore().get_proofs_states(&ys).await.unwrap(),
+                vec![None]
+            );
+            assert!(mint
+                .localstore()
+                .get_blind_signatures(&points)
+                .await
+                .unwrap()
+                .iter()
+                .all(Option::is_none));
+        }
+
+        assert!(matches!(
+            mint.process_redeem_outcome(RedeemOutcomeRequest {
+                inputs: vec![sig_all],
+                outputs: request.outputs.clone(),
+            })
+            .await,
+            Err(Error::NUT11(_) | Error::NUT14(_))
+        ));
+        assert_eq!(
+            mint.localstore()
+                .get_proofs_states(&sig_all_y)
+                .await
+                .unwrap(),
+            vec![None]
+        );
+
+        let mut authorized = request;
+        add_single_party_witness(&mut authorized.inputs[0], kind, &key, &preimage, true);
+        mint.process_redeem_outcome(authorized).await.unwrap();
+        assert_eq!(
+            mint.localstore().get_proofs_states(&ys).await.unwrap(),
+            vec![Some(State::Spent)]
+        );
+    }
 }

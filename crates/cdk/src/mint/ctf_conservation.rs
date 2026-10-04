@@ -27,7 +27,6 @@ enum AssetKind {
 struct AssetCoverage {
     kind: AssetKind,
     outcomes: Vec<String>,
-    unit: CurrencyUnit,
 }
 
 /// Resolves mint keysets to their CTF payoff coverage.
@@ -35,21 +34,34 @@ pub(super) struct CtfCoverageResolver<'a> {
     mint: &'a Mint,
     condition_id: &'a str,
     condition_id_bytes: [u8; 32],
-    outcomes: &'a [String],
+    outcomes: Vec<String>,
+    collateral: &'a CurrencyUnit,
 }
 
 impl<'a> CtfCoverageResolver<'a> {
-    pub(super) fn new(
-        mint: &'a Mint,
-        condition_id: &'a str,
-        outcomes: &'a [String],
-    ) -> Result<Self, Error> {
+    pub(super) fn new(mint: &'a Mint, condition: &'a StoredCondition) -> Result<Self, Error> {
+        let collateral = condition
+            .collateral
+            .as_ref()
+            .ok_or(Error::UnsupportedCollateralUnit)?;
         Ok(Self {
             mint,
-            condition_id,
-            condition_id_bytes: hex_32(condition_id)?,
-            outcomes,
+            condition_id: &condition.condition_id,
+            condition_id_bytes: hex_32(&condition.condition_id)?,
+            outcomes: condition_outcomes(condition)?,
+            collateral,
         })
+    }
+
+    pub(super) fn outcomes(&self) -> &[String] {
+        &self.outcomes
+    }
+
+    pub(super) fn check_collateral_unit(&self, unit: &CurrencyUnit) -> Result<(), Error> {
+        if unit != self.collateral {
+            return Err(Error::MultipleUnits);
+        }
+        Ok(())
     }
 
     pub(super) async fn resolve_input_entry(
@@ -82,7 +94,7 @@ impl<'a> CtfCoverageResolver<'a> {
             if coverage.kind != expected {
                 return Err(Error::OutputsMustUseRegularKeyset);
             }
-            check_unit(&mut resolved, coverage)?;
+            resolved.get_or_insert(coverage);
         }
         resolved.map(ResolvedCoverage).ok_or(Error::UnknownKeySet)
     }
@@ -91,7 +103,7 @@ impl<'a> CtfCoverageResolver<'a> {
         if key == "*" {
             return Ok(AssetKind::Collateral);
         }
-        let collection = canonical_collection(key, self.outcomes)?;
+        let collection = canonical_collection(key, &self.outcomes)?;
         if collection != key {
             return Err(Error::ConvertPayoffFeeViolation);
         }
@@ -125,7 +137,7 @@ impl<'a> CtfCoverageResolver<'a> {
         keyset: &Id,
         now: Option<u64>,
     ) -> Result<ResolvedCoverage, Error> {
-        let keyset_info = self.keyset_info(keyset, now)?;
+        self.keyset_info(keyset, now)?;
         let binding = self
             .mint
             .localstore
@@ -136,11 +148,7 @@ impl<'a> CtfCoverageResolver<'a> {
             AssetKind::Collateral => self.outcomes.to_vec(),
             AssetKind::Conditional { collection, .. } => parse_outcome_collection(collection),
         };
-        Ok(ResolvedCoverage(AssetCoverage {
-            kind,
-            outcomes,
-            unit: keyset_info.unit,
-        }))
+        Ok(ResolvedCoverage(AssetCoverage { kind, outcomes }))
     }
 
     async fn resolve_keyset(&self, keyset: &Id) -> Result<AssetCoverage, Error> {
@@ -159,7 +167,7 @@ impl<'a> CtfCoverageResolver<'a> {
             Some((condition_id, collection, collection_id))
                 if condition_id == self.condition_id =>
             {
-                let canonical = canonical_collection(&collection, self.outcomes)
+                let canonical = canonical_collection(&collection, &self.outcomes)
                     .map_err(|_| Error::OutputsMustUseRegularKeyset)?;
                 let expected = root_collection_id(&self.condition_id_bytes, &canonical)
                     .map_err(|_| Error::OutputsMustUseRegularKeyset)?;
@@ -180,6 +188,7 @@ impl<'a> CtfCoverageResolver<'a> {
             .mint
             .get_keyset_info(keyset)
             .ok_or(Error::UnknownKeySet)?;
+        self.check_collateral_unit(&info.unit)?;
         if let Some(now) = now {
             if !info.active {
                 return Err(Error::InactiveKeyset);
@@ -199,7 +208,6 @@ pub(super) struct ResolvedCoverage(AssetCoverage);
 /// Checked aggregate input/output value for every possible outcome.
 pub(super) struct OutcomeConservation {
     balances: HashMap<String, OutcomeBalance>,
-    unit: Option<CurrencyUnit>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -215,7 +223,6 @@ impl OutcomeConservation {
                 .iter()
                 .map(|outcome| (outcome.clone(), OutcomeBalance::default()))
                 .collect(),
-            unit: None,
         }
     }
 
@@ -249,6 +256,15 @@ impl OutcomeConservation {
         Ok(())
     }
 
+    /// Multi-party settlement must leave positive aggregate value in every outcome.
+    pub(super) fn validate_multi_party(&self, fee: u64) -> Result<(), Error> {
+        self.validate(fee)?;
+        if self.balances.values().any(|balance| balance.outputs == 0) {
+            return Err(Error::ConvertPayoffFeeViolation);
+        }
+        Ok(())
+    }
+
     fn add(
         &mut self,
         coverage: &ResolvedCoverage,
@@ -258,7 +274,6 @@ impl OutcomeConservation {
         if amount == 0 {
             return Err(Error::ConvertPayoffFeeViolation);
         }
-        check_currency_unit(&mut self.unit, &coverage.0.unit)?;
         for outcome in &coverage.0.outcomes {
             let balance = self
                 .balances
@@ -282,7 +297,7 @@ enum BalanceSide {
     Output,
 }
 
-pub(super) fn condition_outcomes(condition: &StoredCondition) -> Result<Vec<String>, Error> {
+fn condition_outcomes(condition: &StoredCondition) -> Result<Vec<String>, Error> {
     if condition.condition_type == "numeric" {
         return Ok(vec!["HI".to_string(), "LO".to_string()]);
     }
@@ -290,32 +305,6 @@ pub(super) fn condition_outcomes(condition: &StoredCondition) -> Result<Vec<Stri
     let first = announcements.first().ok_or(Error::ConditionNotFound)?;
     let announcement = cdk_common::nuts::nut_ctf::dlc::parse_oracle_announcement(first)?;
     cdk_common::nuts::nut_ctf::dlc::extract_outcomes(&announcement).map_err(Error::from)
-}
-
-fn check_unit(resolved: &mut Option<AssetCoverage>, coverage: AssetCoverage) -> Result<(), Error> {
-    match resolved {
-        Some(current) if current.kind != coverage.kind => Err(Error::OutputsMustUseRegularKeyset),
-        Some(current) if current.unit != coverage.unit => Err(Error::MultipleUnits),
-        Some(_) => Ok(()),
-        None => {
-            *resolved = Some(coverage);
-            Ok(())
-        }
-    }
-}
-
-fn check_currency_unit(
-    expected: &mut Option<CurrencyUnit>,
-    actual: &CurrencyUnit,
-) -> Result<(), Error> {
-    match expected {
-        Some(unit) if unit != actual => Err(Error::MultipleUnits),
-        Some(_) => Ok(()),
-        None => {
-            *expected = Some(actual.clone());
-            Ok(())
-        }
-    }
 }
 
 fn checked_amount_sum(mut amounts: impl Iterator<Item = u64>) -> Result<u64, Error> {

@@ -712,7 +712,7 @@ impl MintBuilder {
             let keyset = active_keysets
                 .keysets
                 .iter()
-                .find(|k| k.active && k.unit == *unit);
+                .find(|k| k.active && k.unit == *unit && Mint::is_regular_keyset(k));
 
             let mut rotate = false;
 

@@ -22,9 +22,11 @@ impl Mint {
     ///   enumerated via the NUT-CTF conditional endpoints
     #[inline]
     fn is_listable_keyset(keyset: &cdk_signatory::signatory::SignatoryKeySet) -> bool {
-        if keyset.unit == CurrencyUnit::Auth {
-            return false;
-        }
+        keyset.unit != CurrencyUnit::Auth && Self::is_regular_keyset(keyset)
+    }
+
+    #[cfg_attr(not(feature = "conditional-tokens"), allow(unused_variables))]
+    pub(super) fn is_regular_keyset(keyset: &cdk_signatory::signatory::SignatoryKeySet) -> bool {
         #[cfg(feature = "conditional-tokens")]
         if keyset.condition_id.is_some() {
             return false;

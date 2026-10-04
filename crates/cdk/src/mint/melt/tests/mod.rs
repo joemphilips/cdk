@@ -1,3 +1,5 @@
+#[cfg(all(feature = "conditional-tokens", feature = "test-utils"))]
+mod conditional_asset_tests;
 mod htlc_sigall_spending_conditions_tests;
 mod htlc_spending_conditions_tests;
 mod locktime_spending_conditions_tests;
