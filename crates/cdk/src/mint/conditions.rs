@@ -411,6 +411,7 @@ impl Mint {
             return Err(Error::RegistrationFeeInsufficient);
         }
         super::reject_pay_to_unlock_spend(fee)?;
+        super::verify_individual_spending_conditions(fee)?;
 
         let collateral_unit = cdk_common::CurrencyUnit::from_str(collateral)
             .map_err(|_| Error::Custom(format!("Invalid collateral unit: {}", collateral)))?;
@@ -704,6 +705,20 @@ impl Mint {
         })?;
         let unit = cdk_common::CurrencyUnit::from_str(collateral)
             .map_err(|_| Error::Custom(format!("Invalid collateral unit: {}", collateral)))?;
+        let snapshot = self.keysets.load();
+        let mut eligible = snapshot.iter().filter(|keyset| {
+            keyset.unit == unit
+                && Self::is_regular_keyset(keyset)
+                && keyset.active
+                && !keyset.is_expired()
+        });
+        let input_fee_ppk = eligible.next().ok_or(Error::UnknownKeySet)?.input_fee_ppk;
+        if eligible.next().is_some() {
+            return Err(Error::Custom(format!(
+                "Multiple active regular keysets for collateral unit: {}",
+                unit
+            )));
+        }
         let parent_collection_id_bytes = [0u8; 32];
         let amounts = (0..32).map(|n| 2u64.pow(n)).collect::<Vec<u64>>();
         let mut keysets = Vec::with_capacity(outcome_collections.len());
@@ -725,7 +740,7 @@ impl Mint {
                         outcome_collection: outcome_collection_string.clone(),
                         outcome_collection_id,
                         amounts: amounts.clone(),
-                        input_fee_ppk: 1,
+                        input_fee_ppk,
                         final_expiry: None,
                     },
                 )

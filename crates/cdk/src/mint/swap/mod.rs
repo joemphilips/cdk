@@ -64,9 +64,8 @@ impl Mint {
                 });
             }
 
-            // Conditional tokens may be refreshed or transferred through NUT-03
-            // only within one condition outcome collection. Conditional-to-regular
-            // conversion remains exclusive to the oracle-witness redemption path.
+            // NUT-03 preserves the asset class. CTF convert owns collateral
+            // crossings, and redemption requires the condition result.
             #[cfg(feature = "conditional-tokens")]
             {
                 let mut conditional_input: Option<(String, String)> = None;
@@ -146,6 +145,17 @@ impl Mint {
                                 );
                                 return Err(Error::InputsMustUseSameConditionalKeyset);
                             }
+                        }
+                    }
+                } else {
+                    for output in swap_request.outputs() {
+                        if self
+                            .localstore
+                            .get_condition_for_keyset(&output.keyset_id)
+                            .await?
+                            .is_some()
+                        {
+                            return Err(Error::OutputsMustUseRegularKeyset);
                         }
                     }
                 }

@@ -5,22 +5,18 @@ use std::ops::Range;
 use std::sync::{Arc, Weak};
 
 use cdk_common::database::mint::CtfSettlementReplay;
-use cdk_common::mint::MintKeySetInfo;
 use cdk_common::nuts::nut00::{BlindedMessage, Proofs, ProofsMethods};
 use cdk_common::nuts::nut02::Id;
-use cdk_common::nuts::nut10::SpendingConditions;
 use cdk_common::nuts::nut_ctf::settlement::{
     validate_ctf_range_authorization as validate_range_protocol, CanonicalHash,
     CtfSettlementRequest, CtfSettlementResponse, Error as SettlementError,
     NutCtfSettlementSettings, NutCtfSettlementSettingsError, ParticipantMode,
     PayToUnlockAuthorization, PoolManifest,
 };
-use cdk_common::{CurrencyUnit, State};
+use cdk_common::State;
 
 use super::conditions::STATUS_PENDING;
-use super::ctf_conservation::{
-    condition_outcomes, CtfCoverageResolver, OutcomeConservation, ResolvedCoverage,
-};
+use super::ctf_conservation::{CtfCoverageResolver, OutcomeConservation, ResolvedCoverage};
 use super::swap::atomic::{execute_atomic_ctf_settlement, reject_atomic_ctf_settlement};
 use super::{Mint, Verification};
 use crate::fees::ProofsFeeBreakdown;
@@ -103,19 +99,14 @@ impl Mint {
         let _keyset_snapshot = self.keyset_store_lock.read().await;
         let condition_id = condition_id.to_string();
         let condition = self.load_pending_condition(&condition_id).await?;
-        let collateral = condition
-            .collateral
-            .clone()
-            .ok_or(CtfSettlementError::MissingCollateralUnit)?;
-        let outcomes = condition_outcomes(&condition)?;
+        let resolver = CtfCoverageResolver::new(self, &condition).map_err(coverage_error)?;
         let expiry_ceiling = self
             .range_authorization_expiry_ceiling(&condition_id, settings, now)
             .await?;
         validate_authorization_expiries(&[authorization], now, expiry_ceiling)?;
 
-        let resolver = CtfCoverageResolver::new(self, &condition_id, &outcomes)?;
         let keysets = range_authorization_keysets(inputs, manifest);
-        self.resolve_involved_keysets(keysets, &resolver, &collateral, Some(now))
+        self.resolve_involved_keysets(keysets, &resolver, Some(now))
             .await?;
         self.validate_manifest_denominations(manifest)?;
         self.verify_inputs(inputs).await?;
@@ -220,7 +211,7 @@ impl Mint {
         if !request.parent_collection_id.is_zero() {
             return Err(SettlementError::NonRootParentCollection.into());
         }
-        request.validate(limits)?;
+        request.verify_coordinator_authentication()?;
         let authorizations = request.validated_authorizations(limits)?;
         validate_individual_conditions(request)?;
         let condition_id = request.condition_id.to_string();
@@ -230,11 +221,7 @@ impl Mint {
         if expired_cutoff.is_none() && condition.attestation_status != STATUS_PENDING {
             return Err(Error::ConvertNotPermitted.into());
         }
-        let collateral = condition
-            .collateral
-            .clone()
-            .ok_or(CtfSettlementError::MissingCollateralUnit)?;
-        let outcomes = condition_outcomes(&condition)?;
+        let resolver = CtfCoverageResolver::new(self, &condition).map_err(coverage_error)?;
         if expired_cutoff.is_none() {
             let effective_expiry_ceiling = self
                 .settlement_expiry_ceiling(&condition_id, settings, now)
@@ -242,24 +229,18 @@ impl Mint {
             validate_authorization_expiry_ceiling(&authorizations, effective_expiry_ceiling)?;
         }
 
-        let resolver = CtfCoverageResolver::new(self, &condition_id, &outcomes)?;
         for participant in &request.participants {
             if let ParticipantMode::Pool { manifest, .. } = &participant.mode {
                 self.validate_manifest_denominations(manifest)?;
             }
         }
         let coverages = self
-            .resolve_settlement_keysets(
-                request,
-                &resolver,
-                &collateral,
-                expired_cutoff.is_none().then_some(now),
-            )
+            .resolve_settlement_keysets(request, &resolver, expired_cutoff.is_none().then_some(now))
             .await?;
-        let flat = flatten_settlement(request, &coverages, &outcomes)?;
+        let flat = flatten_settlement(request, &coverages, resolver.outcomes())?;
         self.validate_output_denominations(&flat.outputs)?;
         let fee = self.get_proofs_fee(&flat.inputs).await?;
-        flat.conservation.validate(fee.total.into())?;
+        flat.conservation.validate_multi_party(fee.total.into())?;
         let input_verification = match expired_cutoff {
             Some(_) => self.verify_inputs_historically(&flat.inputs).await?,
             None => self.verify_inputs(&flat.inputs).await?,
@@ -354,10 +335,9 @@ impl Mint {
         &self,
         request: &CtfSettlementRequest,
         resolver: &CtfCoverageResolver<'_>,
-        collateral: &CurrencyUnit,
         active_at: Option<u64>,
     ) -> Result<HashMap<Id, ResolvedCoverage>, CtfSettlementError> {
-        self.resolve_involved_keysets(involved_keysets(request), resolver, collateral, active_at)
+        self.resolve_involved_keysets(involved_keysets(request), resolver, active_at)
             .await
     }
 
@@ -365,17 +345,22 @@ impl Mint {
         &self,
         keysets: BTreeSet<Id>,
         resolver: &CtfCoverageResolver<'_>,
-        collateral: &CurrencyUnit,
         active_at: Option<u64>,
     ) -> Result<HashMap<Id, ResolvedCoverage>, CtfSettlementError> {
         let mut resolved = HashMap::new();
         for id in keysets {
             let info = self.get_keyset_info(&id).ok_or(Error::UnknownKeySet)?;
-            validate_involved_keyset(&info, collateral)?;
+            resolver
+                .check_collateral_unit(&info.unit)
+                .map_err(coverage_error)?;
+            if info.input_fee_ppk == 0 {
+                return Err(SettlementError::ZeroFeeKeyset.into());
+            }
             let coverage = match active_at {
-                Some(now) => resolver.resolve_keyset_at(&id, now).await?,
-                None => resolver.resolve_keyset_historically(&id).await?,
-            };
+                Some(now) => resolver.resolve_keyset_at(&id, now).await,
+                None => resolver.resolve_keyset_historically(&id).await,
+            }
+            .map_err(coverage_error)?;
             resolved.insert(id, coverage);
         }
         Ok(resolved)
@@ -448,20 +433,8 @@ fn replay_ctf_settlement_result(
 fn validate_individual_conditions(
     request: &CtfSettlementRequest,
 ) -> Result<(), CtfSettlementError> {
-    for proof in request
-        .participants
-        .iter()
-        .flat_map(|participant| participant.inputs.iter())
-    {
-        match SpendingConditions::try_from(&proof.secret) {
-            Ok(SpendingConditions::P2PKConditions { .. }) => {
-                proof.verify_p2pk().map_err(Error::NUT11)?;
-            }
-            Ok(SpendingConditions::HTLCConditions { .. }) => {
-                proof.verify_htlc().map_err(Error::NUT14)?;
-            }
-            Err(_) => {}
-        }
+    for participant in &request.participants {
+        super::verify_individual_spending_conditions(&participant.inputs)?;
     }
     Ok(())
 }
@@ -530,17 +503,12 @@ fn range_authorization_keysets(inputs: &Proofs, manifest: &PoolManifest) -> BTre
         .collect()
 }
 
-fn validate_involved_keyset(
-    info: &MintKeySetInfo,
-    collateral: &CurrencyUnit,
-) -> Result<(), CtfSettlementError> {
-    if &info.unit != collateral {
-        return Err(CtfSettlementError::CollateralUnitMismatch);
+fn coverage_error(error: Error) -> CtfSettlementError {
+    match error {
+        Error::UnsupportedCollateralUnit => CtfSettlementError::MissingCollateralUnit,
+        Error::MultipleUnits => CtfSettlementError::CollateralUnitMismatch,
+        other => CtfSettlementError::Mint(other),
     }
-    if info.input_fee_ppk == 0 {
-        return Err(SettlementError::ZeroFeeKeyset.into());
-    }
-    Ok(())
 }
 
 fn effective_expiry_ceiling(
