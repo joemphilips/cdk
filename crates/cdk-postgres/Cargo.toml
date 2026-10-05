@@ -40,7 +40,7 @@ once_cell.workspace = true
 paste.workspace = true
 
 [dev-dependencies]
-cdk-common = { workspace = true, features = ["test"] }
+cdk-common = { workspace = true, features = ["test", "test-utils"] }
 
 [lints]
 workspace = true

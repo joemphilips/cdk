@@ -1,13 +1,24 @@
 -- NUT-CTF: Conditional tokens - conditions table
 CREATE TABLE IF NOT EXISTS conditions (
     condition_id TEXT PRIMARY KEY,
-    threshold INTEGER NOT NULL DEFAULT 1,
+    threshold INTEGER NOT NULL DEFAULT 1 CHECK (threshold BETWEEN 1 AND 32),
     tags_json TEXT NOT NULL DEFAULT '[]',
     announcements_json TEXT NOT NULL,
-    attestation_status TEXT NOT NULL DEFAULT 'pending',
+    attestation_status TEXT NOT NULL DEFAULT 'pending' CHECK (attestation_status IN ('pending', 'attested', 'expired', 'violation')),
     winning_outcome TEXT,
     attested_at BIGINT,
-    created_at BIGINT NOT NULL
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    collateral TEXT,
+    condition_type TEXT NOT NULL DEFAULT 'enum' CHECK (condition_type IN ('enum', 'numeric')),
+    lo_bound BIGINT,
+    hi_bound BIGINT,
+    precision INTEGER,
+    oracle_sigs_json TEXT,
+    CHECK ((condition_type = 'enum' AND lo_bound IS NULL AND hi_bound IS NULL AND precision IS NULL)
+        OR (condition_type = 'numeric' AND lo_bound IS NOT NULL AND hi_bound IS NOT NULL AND lo_bound < hi_bound AND precision IS NOT NULL)),
+    CHECK ((winning_outcome IS NULL AND attested_at IS NULL AND oracle_sigs_json IS NULL AND attestation_status <> 'attested')
+        OR (winning_outcome IS NOT NULL AND length(winning_outcome) > 0 AND attested_at IS NOT NULL AND attested_at >= 0 AND oracle_sigs_json IS NOT NULL AND attestation_status <> 'pending')),
+    CHECK (oracle_sigs_json IS NULL OR (jsonb_typeof(oracle_sigs_json::jsonb) = 'array' AND jsonb_array_length(oracle_sigs_json::jsonb) BETWEEN threshold AND 64))
 );
 
 -- NUT-CTF: Conditional tokens - conditional keysets table

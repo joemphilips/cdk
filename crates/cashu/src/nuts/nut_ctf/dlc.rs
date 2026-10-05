@@ -142,6 +142,12 @@ pub fn verify_digit_attestation(
         )));
     }
 
+    if !(2..=65535).contains(&base) || digit_sigs.is_empty() || (is_signed && digit_sigs.len() < 2)
+    {
+        return Err(Error::DigitSignatureVerificationFailed(
+            "Invalid digit descriptor".to_string(),
+        ));
+    }
     let nb_digits = digit_sigs.len();
     let value_digits_start = if is_signed { 1 } else { 0 };
 
@@ -160,7 +166,7 @@ pub fn verify_digit_attestation(
     };
 
     // Reconstruct absolute value from remaining digits
-    let mut abs_value: i64 = 0;
+    let mut abs_value: i128 = 0;
     for i in value_digits_start..nb_digits {
         let digit_outcomes: Vec<String> = (0..base).map(|d| d.to_string()).collect();
         let digit_strs: Vec<&str> = digit_outcomes.iter().map(String::as_str).collect();
@@ -168,15 +174,22 @@ pub fn verify_digit_attestation(
         let digit_str =
             find_attested_digit(oracle_pubkey, &digit_sigs[i], &nonce_points[i], &digit_strs)?;
 
-        let digit_val: i64 = digit_str.parse().map_err(|_| {
+        let digit_val: i128 = digit_str.parse().map_err(|_| {
             Error::DigitSignatureVerificationFailed(format!("Invalid digit value: {}", digit_str))
         })?;
 
         // Most significant digit first
-        abs_value = abs_value * (base as i64) + digit_val;
+        abs_value = abs_value
+            .checked_mul(i128::from(base))
+            .and_then(|value| value.checked_add(digit_val))
+            .filter(|value| *value <= i128::from(i64::MAX) + i128::from(sign < 0))
+            .ok_or_else(|| {
+                Error::AttestedValueOutsideRange("Numeric witness exceeds i64".to_string())
+            })?;
     }
 
-    Ok(sign * abs_value)
+    i64::try_from(i128::from(sign) * abs_value)
+        .map_err(|_| Error::AttestedValueOutsideRange("Numeric witness exceeds i64".to_string()))
 }
 
 /// Brute-force find which outcome a digit signature attests to.
@@ -253,6 +266,48 @@ mod tests {
         create_test_oracle, create_test_oracle_2, sign_ctf_attestation,
     };
     use crate::nuts::nut_ctf::to_hex;
+
+    #[test]
+    fn test_d2_numeric_signed_full_range_and_overflow_refusal() {
+        use crate::nuts::nut_ctf::test_helpers::sign_digit_attestation;
+        let oracle = create_test_oracle();
+        let (announcement, _) =
+            create_digit_decomposition_announcement(&oracle, 10, true, 19, "sat", 0, "full-range");
+        let nonces = extract_nonce_points(&announcement.oracle_event);
+        for value in [i64::MIN, i64::MAX] {
+            let signatures = sign_digit_attestation(&oracle, value, 10, true, 19)
+                .iter()
+                .map(|signature| signature.to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                verify_digit_attestation(
+                    &oracle.public_key.serialize(),
+                    &signatures,
+                    &nonces,
+                    10,
+                    true
+                )
+                .unwrap(),
+                value
+            );
+        }
+        let mut signatures = sign_digit_attestation(&oracle, i64::MIN, 10, true, 19)
+            .iter()
+            .map(|signature| signature.to_vec())
+            .collect::<Vec<_>>();
+        // The same magnitude cannot be represented with a positive sign.
+        signatures[0] = sign_ctf_attestation(&oracle, "+").to_vec();
+        assert!(matches!(
+            verify_digit_attestation(
+                &oracle.public_key.serialize(),
+                &signatures,
+                &nonces,
+                10,
+                true
+            ),
+            Err(Error::AttestedValueOutsideRange(_))
+        ));
+    }
 
     #[test]
     fn test_parse_announcement_roundtrip() {
@@ -463,7 +518,7 @@ mod tests {
         let witness = create_oracle_witness(&oracle, "YES");
 
         assert_eq!(witness.oracle_sigs.len(), 1);
-        assert_eq!(witness.oracle_sigs[0].outcome, "YES");
+        assert_eq!(witness.oracle_sigs[0].outcome.as_deref(), Some("YES"));
         assert_eq!(
             witness.oracle_sigs[0].oracle_pubkey,
             to_hex(&oracle.public_key.serialize())

@@ -1207,6 +1207,7 @@ dependencies = [
  "cdk-http-client",
  "cdk-npubcash",
  "cdk-nwc",
+ "cdk-postgres",
  "cdk-prometheus",
  "cdk-signatory",
  "cdk-sqlite",

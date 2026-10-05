@@ -48,6 +48,7 @@ fn test_condition(condition_id: &str) -> StoredCondition {
         attestation_status: "pending".to_string(),
         winning_outcome: None,
         attested_at: None,
+        oracle_sigs: None,
         created_at: 1000000,
         condition_type: "enum".to_string(),
         lo_bound: None,
@@ -159,9 +160,19 @@ where
     let cond = test_condition(&"cc".repeat(32));
     db.add_condition(cond.clone()).await.unwrap();
 
-    db.update_condition_attestation(&cond.condition_id, "attested", Some("YES"), Some(2000000))
-        .await
-        .unwrap();
+    db.update_condition_attestation(
+        &cond.condition_id,
+        "attested",
+        Some("YES"),
+        Some(2000000),
+        &crate::nuts::nut_ctf::test_helpers::create_oracle_witness(
+            &crate::nuts::nut_ctf::test_helpers::create_test_oracle(),
+            "YES",
+        )
+        .oracle_sigs,
+    )
+    .await
+    .unwrap();
 
     let updated = db.get_condition(&cond.condition_id).await.unwrap().unwrap();
     assert_eq!(updated.attestation_status, "attested");
@@ -435,9 +446,19 @@ where
     db.add_condition(cond2.clone()).await.unwrap();
 
     // Attest second condition
-    db.update_condition_attestation(&cond2.condition_id, "attested", Some("YES"), Some(3000))
-        .await
-        .unwrap();
+    db.update_condition_attestation(
+        &cond2.condition_id,
+        "attested",
+        Some("YES"),
+        Some(3000),
+        &crate::nuts::nut_ctf::test_helpers::create_oracle_witness(
+            &crate::nuts::nut_ctf::test_helpers::create_test_oracle(),
+            "YES",
+        )
+        .oracle_sigs,
+    )
+    .await
+    .unwrap();
 
     // Filter by pending only
     let pending = db

@@ -48,6 +48,7 @@ redis = { version = "0.31.0", default-features = false, features = [
 uuid = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
+cdk = { workspace = true, features = ["test-utils"] }
 cdk-fake-wallet = { workspace = true }
 cdk-sqlite = { workspace = true, features = ["mint"] }
 cdk-signatory = { workspace = true }

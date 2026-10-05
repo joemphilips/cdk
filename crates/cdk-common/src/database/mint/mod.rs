@@ -643,6 +643,15 @@ pub trait ConditionsTransaction {
         condition_id: &str,
     ) -> Result<Option<Acquired<StoredCondition>>, Self::Err>;
 
+    /// Record a validated first oracle result while holding the condition lock.
+    async fn record_condition_attestation(
+        &mut self,
+        condition: &Acquired<StoredCondition>,
+        winning_outcome: &str,
+        attested_at: u64,
+        oracle_sigs: &[cashu::nuts::nut_ctf::OracleSig],
+    ) -> Result<bool, Self::Err>;
+
     /// Add a stored condition in the current transaction.
     async fn add_condition(&mut self, condition: StoredCondition) -> Result<(), Self::Err>;
 
@@ -691,6 +700,7 @@ pub trait ConditionsDatabase {
         status: &str,
         winning_outcome: Option<&str>,
         attested_at: Option<u64>,
+        oracle_sigs: &[cashu::nuts::nut_ctf::OracleSig],
     ) -> Result<bool, Self::Err>;
 
     /// Get active conditional keysets for a condition (mapping outcome_collection → keyset id).

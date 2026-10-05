@@ -256,6 +256,17 @@ pub struct AttestationState {
     pub winning_outcome: Option<String>,
     /// Unix timestamp of attestation (null if pending)
     pub attested_at: Option<u64>,
+    /// Accepted public oracle evidence, included when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_sigs: Option<Vec<OracleSig>>,
+}
+
+/// Options for an individual condition read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GetConditionRequest {
+    /// Include the first accepted oracle evidence.
+    #[serde(default)]
+    pub include_oracle_sigs: bool,
 }
 
 /// Attestation status enum
@@ -382,7 +393,8 @@ pub struct OracleSig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle_sig: Option<String>,
     /// The outcome string this oracle attested to
-    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     /// Per-digit Schnorr signatures (128-char hex each) for digit decomposition (NUT-CTF-numeric)
     /// Mutually exclusive with oracle_sig
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,6 +406,49 @@ pub struct OracleSig {
 pub struct OracleWitness {
     /// Array of oracle attestation entries
     pub oracle_sigs: Vec<OracleSig>,
+}
+
+impl OracleWitness {
+    /// Check signature encodings, distinct keys, and the condition-specific shape.
+    pub fn validate_shape(&self, numeric: bool) -> Result<(), Error> {
+        if self.oracle_sigs.is_empty() || self.oracle_sigs.len() > MAX_ORACLE_WITNESS_SIGS {
+            return Err(Error::OracleThresholdNotMet);
+        }
+        let mut keys = std::collections::HashSet::new();
+        for entry in &self.oracle_sigs {
+            if entry.oracle_pubkey.len() != 64 {
+                return Err(Error::InvalidOracleSignature);
+            }
+            let key = from_hex(&entry.oracle_pubkey).map_err(|_| Error::InvalidOracleSignature)?;
+            if key.len() != 32 || !keys.insert(key) {
+                return Err(Error::InvalidOracleSignature);
+            }
+            let valid_signature = |hex: &str| -> bool { hex.len() == 128 && from_hex(hex).is_ok() };
+            if numeric {
+                let digits = entry
+                    .digit_sigs
+                    .as_ref()
+                    .ok_or(Error::InvalidOracleSignature)?;
+                if entry.outcome.is_some()
+                    || entry.oracle_sig.is_some()
+                    || digits.is_empty()
+                    || digits.len() > MAX_ANNOUNCEMENT_HEX_LENGTH / 64
+                    || !digits.iter().all(|sig| valid_signature(sig))
+                {
+                    return Err(Error::InvalidOracleSignature);
+                }
+            } else if entry.digit_sigs.is_some()
+                || entry.outcome.as_ref().is_none_or(|value| value.is_empty())
+                || entry
+                    .oracle_sig
+                    .as_ref()
+                    .is_none_or(|sig| !valid_signature(sig))
+            {
+                return Err(Error::InvalidOracleSignature);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Conditional keyset info (extends KeySetInfo for conditional keyset discovery)
@@ -571,7 +626,7 @@ pub fn compute_condition_id_numeric(
 ///
 /// Given a face amount, attested value, and bounds [lo, hi]:
 /// - HI payout = floor(amount * (V - lo) / (hi - lo))
-/// - LO payout = amount - HI payout (conservation)
+/// - LO payout = floor(amount * (hi - V) / (hi - lo))
 ///
 /// At boundaries: V <= lo → HI=0, LO=amount; V >= hi → HI=amount, LO=0.
 ///
@@ -597,12 +652,12 @@ pub fn compute_numeric_payout(
     }
 
     // Use u128 intermediate arithmetic for overflow safety
-    let numerator = (attested_value - lo_bound) as u128;
-    let denominator = (hi_bound - lo_bound) as u128;
+    let numerator = (i128::from(attested_value) - i128::from(lo_bound)) as u128;
+    let denominator = (i128::from(hi_bound) - i128::from(lo_bound)) as u128;
     let amount_128 = face_amount as u128;
 
     let hi_payout = (amount_128 * numerator / denominator) as u64;
-    let lo_payout = face_amount - hi_payout; // conservation
+    let lo_payout = (amount_128 * (denominator - numerator) / denominator) as u64;
 
     Ok((hi_payout, lo_payout))
 }
@@ -915,7 +970,7 @@ mod tests {
             oracle_sigs: vec![OracleSig {
                 oracle_pubkey: "a".repeat(64),
                 oracle_sig: Some("b".repeat(128)),
-                outcome: "YES".to_string(),
+                outcome: Some("YES".to_string()),
                 digit_sigs: None,
             }],
         };
@@ -931,7 +986,7 @@ mod tests {
             oracle_sigs: vec![OracleSig {
                 oracle_pubkey: "a".repeat(64),
                 oracle_sig: None,
-                outcome: "YES".to_string(),
+                outcome: Some("YES".to_string()),
                 digit_sigs: None,
             }],
         };
@@ -1119,19 +1174,29 @@ mod tests {
     }
 
     #[test]
+    fn test_d2_numeric_independent_floors_and_full_range() {
+        assert_eq!(compute_numeric_payout(1, 50, 0, 100).unwrap(), (0, 0));
+        assert_eq!(compute_numeric_payout(3, 50, 0, 100).unwrap(), (1, 1));
+        assert_eq!(
+            compute_numeric_payout(u64::MAX, 0, i64::MIN, i64::MAX).unwrap(),
+            (1u64 << 63, i64::MAX as u64)
+        );
+    }
+
+    #[test]
     fn test_numeric_payout_single_unit() {
         // amount=1: result is always 0 or 1, never a fraction
-        // At midpoint: HI = floor(1 * 50/100) = 0, LO = 1
+        // At midpoint, each leg floors independently to zero.
         let (hi, lo) = compute_numeric_payout(1, 50, 0, 100).unwrap();
         assert_eq!(hi, 0);
-        assert_eq!(lo, 1);
-        assert_eq!(hi + lo, 1);
+        assert_eq!(lo, 0);
+        assert_eq!(hi + lo, 0);
 
-        // Near hi boundary: HI = floor(1 * 99/100) = 0, LO = 1
+        // Near the upper bound, each leg still floors to zero.
         let (hi, lo) = compute_numeric_payout(1, 99, 0, 100).unwrap();
         assert_eq!(hi, 0);
-        assert_eq!(lo, 1);
-        assert_eq!(hi + lo, 1);
+        assert_eq!(lo, 0);
+        assert_eq!(hi + lo, 0);
 
         // At hi boundary: HI = 1, LO = 0
         let (hi, lo) = compute_numeric_payout(1, 100, 0, 100).unwrap();
@@ -1146,7 +1211,7 @@ mod tests {
             oracle_sigs: vec![OracleSig {
                 oracle_pubkey: "a".repeat(64),
                 oracle_sig: None,
-                outcome: "HI".to_string(),
+                outcome: None,
                 digit_sigs: Some(vec!["c".repeat(128), "d".repeat(128)]),
             }],
         };

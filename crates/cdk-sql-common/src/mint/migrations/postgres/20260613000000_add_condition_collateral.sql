@@ -1,2 +1,1 @@
--- NUT-CTF: Persist condition collateral unit for conditions-info echo.
-ALTER TABLE conditions ADD COLUMN IF NOT EXISTS collateral TEXT;
+-- Columns are in the pre-release CTF base schema.

@@ -2349,6 +2349,9 @@ pub struct StoredCondition {
     pub winning_outcome: Option<String>,
     /// Attestation timestamp
     pub attested_at: Option<u64>,
+    /// Accepted public oracle signatures for the first result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_sigs: Option<Vec<cashu::nuts::nut_ctf::OracleSig>>,
     /// Created at timestamp
     pub created_at: u64,
     /// Condition type: "enum" or "numeric" (NUT-CTF-numeric)
@@ -2365,4 +2368,79 @@ pub struct StoredCondition {
 #[cfg(feature = "conditional-tokens")]
 fn default_condition_type() -> String {
     "enum".to_string()
+}
+
+#[cfg(feature = "conditional-tokens")]
+impl StoredCondition {
+    /// Reject malformed condition state and incomplete result/evidence tuples.
+    pub fn validate(&self) -> Result<(), crate::database::Error> {
+        let invalid = || {
+            crate::database::Error::Internal(
+                "Invalid stored condition state or evidence".to_string(),
+            )
+        };
+        if !matches!(
+            self.attestation_status.as_str(),
+            "pending" | "attested" | "expired" | "violation"
+        ) || !matches!(self.condition_type.as_str(), "enum" | "numeric")
+            || self.threshold == 0
+            || self.threshold as usize > cashu::nuts::nut_ctf::MAX_ANNOUNCEMENTS
+            || self.created_at > i64::MAX as u64
+            || self.attested_at.is_some_and(|time| time > i64::MAX as u64)
+        {
+            return Err(invalid());
+        }
+        let _: Vec<Vec<String>> = serde_json::from_str(&self.tags_json).map_err(|_| invalid())?;
+        let announcements: Vec<String> =
+            serde_json::from_str(&self.announcements_json).map_err(|_| invalid())?;
+        if announcements.is_empty()
+            || announcements.len() > cashu::nuts::nut_ctf::MAX_ANNOUNCEMENTS
+            || self.threshold as usize > announcements.len()
+            || announcements
+                .iter()
+                .any(|value| value.len() > cashu::nuts::nut_ctf::MAX_ANNOUNCEMENT_HEX_LENGTH)
+        {
+            return Err(invalid());
+        }
+        let numeric = self.condition_type == "numeric";
+        if numeric {
+            if self
+                .lo_bound
+                .zip(self.hi_bound)
+                .is_none_or(|(lo, hi)| lo >= hi)
+                || self.precision.is_none()
+            {
+                return Err(invalid());
+            }
+        } else if self.lo_bound.is_some() || self.hi_bound.is_some() || self.precision.is_some() {
+            return Err(invalid());
+        }
+        match (&self.winning_outcome, self.attested_at, &self.oracle_sigs) {
+            (None, None, None) if self.attestation_status != "attested" => Ok(()),
+            (Some(outcome), Some(_), Some(sigs)) if self.attestation_status != "pending" => {
+                if outcome.is_empty()
+                    || sigs.len() < self.threshold as usize
+                    || (numeric && outcome.parse::<i64>().is_err())
+                {
+                    return Err(invalid());
+                }
+                cashu::nuts::nut_ctf::OracleWitness {
+                    oracle_sigs: sigs.clone(),
+                }
+                .validate_shape(numeric)
+                .map_err(|_| invalid())?;
+                if !numeric
+                    && sigs.iter().any(|sig| {
+                        sig.outcome.as_ref().is_none_or(|value| {
+                            cashu::nuts::nut_ctf::normalize_outcome(value) != *outcome
+                        })
+                    })
+                {
+                    return Err(invalid());
+                }
+                Ok(())
+            }
+            _ => Err(invalid()),
+        }
+    }
 }
