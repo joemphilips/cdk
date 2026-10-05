@@ -34,7 +34,7 @@ native-tls = "=0.2.18"
 percent-encoding = "2"
 
 [dev-dependencies]
-cdk-common = { workspace = true, features = ["test"] }
+cdk-common = { workspace = true, features = ["test", "test-utils"] }
 # Needed at macro-expansion sites of cdk-common's `*_db_test!` macros
 paste.workspace = true
 

@@ -164,11 +164,18 @@ async fn build_test_mint_with_unit(
     build_test_mint_with_units(db, seed, &[(unit, input_fee_ppk)]).await
 }
 
-async fn build_test_mint_with_units(
-    db: Arc<cdk_sqlite::mint::MintSqliteDatabase>,
+async fn build_test_mint_with_units<DB>(
+    db: Arc<DB>,
     seed: &[u8],
     units: &[(CurrencyUnit, u64)],
-) -> Result<Mint, Error> {
+) -> Result<Mint, Error>
+where
+    DB: cdk_common::database::MintDatabase<cdk_common::database::Error>
+        + MintKeysDatabase<Err = cdk_common::database::Error>
+        + Send
+        + Sync
+        + 'static,
+{
     let mut mint_builder = MintBuilder::new(db.clone());
     for (unit, input_fee_ppk) in units {
         mint_builder.configure_unit(
@@ -2309,7 +2316,7 @@ async fn test_redeem_rejects_pay_to_unlock_without_spending_it() {
         .all(Option::is_none));
 }
 
-/// Test that a second redemption uses the stored attestation (skips witness verification)
+/// Test that a second redemption uses the stored attestation and verifies supplied evidence.
 #[tokio::test]
 async fn test_redeem_second_uses_stored_attestation() {
     let mint = create_test_mint().await.unwrap();
@@ -2356,7 +2363,7 @@ async fn test_redeem_second_uses_stored_attestation() {
 
     // Second redemption — attestation is already stored
     {
-        // Witness still needed for parsing, but verification path changes
+        // Supplied evidence must still verify against the first result.
         let witness = create_oracle_witness(&oracle, "YES");
         let mut proofs_with_witness = conditional_proofs_2;
         for proof in &mut proofs_with_witness {
@@ -2371,6 +2378,74 @@ async fn test_redeem_second_uses_stored_attestation() {
         })
         .await
         .expect("second redemption should use stored attestation and succeed");
+    }
+}
+
+#[tokio::test]
+async fn test_d2_resolved_conflicting_witness_is_rejected() {
+    let mint = create_test_mint().await.unwrap();
+    let oracle = create_test_oracle();
+    let (_, hex_tlv) = create_test_announcement(&oracle, &["YES", "NO"], "test-event");
+
+    // Mint ALL regular proofs BEFORE registering conditions
+    let amount1 = Amount::from(10);
+    let amount2 = Amount::from(8);
+    let regular_proofs_1 = mint_test_proofs(&mint, amount1).await.unwrap();
+    let regular_proofs_2 = mint_test_proofs(&mint, amount2).await.unwrap();
+
+    let condition_response = mint
+        .register_condition(enum_condition_request(
+            "Stored attestation test",
+            vec![hex_tlv],
+        ))
+        .await
+        .unwrap();
+    let yes_keyset_id = *condition_response.keysets.get("YES").unwrap();
+
+    let conditional_proofs_1 =
+        convert_to_conditional(&mint, regular_proofs_1, yes_keyset_id, amount1).await;
+    let conditional_proofs_2 =
+        convert_to_conditional(&mint, regular_proofs_2, yes_keyset_id, amount2).await;
+
+    // First redemption with valid witness
+    {
+        let witness = create_oracle_witness(&oracle, "YES");
+        let mut proofs_with_witness = conditional_proofs_1;
+        for proof in &mut proofs_with_witness {
+            proof.witness = Some(Witness::OracleWitness(witness.clone()));
+        }
+
+        let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount1);
+
+        mint.process_redeem_outcome(RedeemOutcomeRequest {
+            inputs: proofs_with_witness,
+            outputs: regular_outputs,
+        })
+        .await
+        .expect("first redemption should succeed");
+    }
+
+    // Second redemption — attestation is already stored
+    {
+        // Supplied evidence must still verify against the first result.
+        let witness = create_oracle_witness(&oracle, "NO");
+        let mut proofs_with_witness = conditional_proofs_2;
+        for proof in &mut proofs_with_witness {
+            proof.witness = Some(Witness::OracleWitness(witness.clone()));
+        }
+
+        let (regular_outputs, _) = create_premint(&mint, get_regular_keyset_id(&mint), amount2);
+
+        let result = mint
+            .process_redeem_outcome(RedeemOutcomeRequest {
+                inputs: proofs_with_witness,
+                outputs: regular_outputs,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "resolved valid conflicting evidence must refuse"
+        );
     }
 }
 
@@ -3987,6 +4062,11 @@ async fn test_ctf_range_authorization_rejects_wrong_or_attested_condition() {
             "attested",
             Some("YES"),
             Some(now),
+            &cdk_common::nuts::nut_ctf::test_helpers::create_oracle_witness(
+                &cdk_common::nuts::nut_ctf::test_helpers::create_test_oracle(),
+                "YES"
+            )
+            .oracle_sigs
         )
         .await
         .unwrap());
@@ -4429,6 +4509,11 @@ async fn test_ctf_settlement_commits_once_and_replays_after_attestation() {
             "attested",
             Some("YES"),
             Some(now + 1),
+            &cdk_common::nuts::nut_ctf::test_helpers::create_oracle_witness(
+                &cdk_common::nuts::nut_ctf::test_helpers::create_test_oracle(),
+                "YES"
+            )
+            .oracle_sigs
         )
         .await
         .unwrap());
@@ -4517,6 +4602,11 @@ async fn test_ctf_settlement_cutoff_rejection_after_attestation_is_durable() {
             "attested",
             Some("YES"),
             Some(now + 1),
+            &cdk_common::nuts::nut_ctf::test_helpers::create_oracle_witness(
+                &cdk_common::nuts::nut_ctf::test_helpers::create_test_oracle(),
+                "YES"
+            )
+            .oracle_sigs
         )
         .await
         .unwrap());
@@ -4790,6 +4880,11 @@ async fn test_ctf_settlement_attestation_gap_rejects_without_persistence() {
             "attested",
             Some("YES"),
             Some(now + 1),
+            &cdk_common::nuts::nut_ctf::test_helpers::create_oracle_witness(
+                &cdk_common::nuts::nut_ctf::test_helpers::create_test_oracle(),
+                "YES"
+            )
+            .oracle_sigs
         )
         .await
         .unwrap());
@@ -6058,6 +6153,11 @@ async fn test_atomic_ctf_convert_attestation_gap_rejects_without_persistence() {
             "attested",
             Some("YES"),
             Some(2_000_000),
+            &cdk_common::nuts::nut_ctf::test_helpers::create_oracle_witness(
+                &cdk_common::nuts::nut_ctf::test_helpers::create_test_oracle(),
+                "YES"
+            )
+            .oracle_sigs
         )
         .await
         .unwrap());
@@ -6147,6 +6247,11 @@ async fn test_ctf_convert_before_attestation_commits_then_attests() {
             "attested",
             Some("YES"),
             Some(2_000_000),
+            &cdk_common::nuts::nut_ctf::test_helpers::create_oracle_witness(
+                &cdk_common::nuts::nut_ctf::test_helpers::create_test_oracle(),
+                "YES"
+            )
+            .oracle_sigs
         )
         .await
         .unwrap());
@@ -7081,7 +7186,17 @@ async fn test_redeem_requires_individual_spend_authorization() {
 
         assert!(mint
             .localstore()
-            .update_condition_attestation(&condition_id, "attested", Some("YES"), Some(unix_time()))
+            .update_condition_attestation(
+                &condition_id,
+                "attested",
+                Some("YES"),
+                Some(unix_time()),
+                &cdk_common::nuts::nut_ctf::test_helpers::create_oracle_witness(
+                    &cdk_common::nuts::nut_ctf::test_helpers::create_test_oracle(),
+                    "YES"
+                )
+                .oracle_sigs
+            )
             .await
             .unwrap());
         for valid in [None, Some(false)] {
@@ -7132,3 +7247,5 @@ async fn test_redeem_requires_individual_spend_authorization() {
         );
     }
 }
+
+mod oracle_evidence_tests;

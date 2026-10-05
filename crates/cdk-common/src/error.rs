@@ -583,6 +583,10 @@ pub enum Error {
     #[cfg(feature = "conditional-tokens")]
     #[error("PAY_TO_UNLOCK refund witness is missing or invalid")]
     RefundWitnessMissingOrInvalid,
+    /// Conflicting valid oracle attestations (13049)
+    #[cfg(feature = "conditional-tokens")]
+    #[error("Conflicting valid oracle attestations")]
+    ConflictingOracleAttestations,
     /// Invalid numeric range (13030)
     #[cfg(feature = "conditional-tokens")]
     #[error("Invalid numeric range")]
@@ -939,6 +943,7 @@ impl Error {
             | Self::ConvertPayoffFeeViolation
             | Self::ConvertNotPermitted
             | Self::FullSetOrSingleElementPartition
+            | Self::ConflictingOracleAttestations
             | Self::OracleThresholdNotMet
             | Self::ConditionAlreadyExists
             | Self::OverlappingOutcomeCollections
@@ -1383,6 +1388,11 @@ impl From<Error> for ErrorResponse {
                 detail: err.to_string(),
             },
             #[cfg(feature = "conditional-tokens")]
+            Error::ConflictingOracleAttestations => ErrorResponse {
+                code: ErrorCode::ConflictingOracleAttestations,
+                detail: err.to_string(),
+            },
+            #[cfg(feature = "conditional-tokens")]
             Error::InvalidNumericRange => ErrorResponse {
                 code: ErrorCode::InvalidNumericRange,
                 detail: err.to_string(),
@@ -1724,6 +1734,9 @@ pub enum ErrorCode {
     /// Condition already exists with different configuration (13028)
     #[cfg(feature = "conditional-tokens")]
     ConditionAlreadyExists,
+    /// Conflicting valid oracle attestations (13049)
+    #[cfg(feature = "conditional-tokens")]
+    ConflictingOracleAttestations,
     /// Invalid numeric range (13030)
     #[cfg(feature = "conditional-tokens")]
     InvalidNumericRange,
@@ -1868,6 +1881,8 @@ impl ErrorCode {
             #[cfg(feature = "conditional-tokens")]
             13028 => Self::ConditionAlreadyExists,
             #[cfg(feature = "conditional-tokens")]
+            13049 => Self::ConflictingOracleAttestations,
+            #[cfg(feature = "conditional-tokens")]
             13030 => Self::InvalidNumericRange,
             #[cfg(feature = "conditional-tokens")]
             13031 => Self::DigitSignatureVerificationFailed,
@@ -1976,6 +1991,8 @@ impl ErrorCode {
             Self::OracleThresholdNotMet => 13027,
             #[cfg(feature = "conditional-tokens")]
             Self::ConditionAlreadyExists => 13028,
+            #[cfg(feature = "conditional-tokens")]
+            Self::ConflictingOracleAttestations => 13049,
             #[cfg(feature = "conditional-tokens")]
             Self::InvalidNumericRange => 13030,
             #[cfg(feature = "conditional-tokens")]
@@ -2105,7 +2122,7 @@ impl From<cashu::nuts::nut_ctf::Error> for Error {
                 Self::FullSetOrSingleElementPartition
             }
             cashu::nuts::nut_ctf::Error::ConflictingOracleAttestations => {
-                Self::OracleNotAttestedOutcome
+                Self::ConflictingOracleAttestations
             }
             cashu::nuts::nut_ctf::Error::InvalidNumericRange(_) => Self::InvalidNumericRange,
             cashu::nuts::nut_ctf::Error::DigitSignatureVerificationFailed(_) => {

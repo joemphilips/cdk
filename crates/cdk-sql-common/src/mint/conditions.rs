@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use cdk_common::database::mint::{ConditionsDatabase, ConditionsTransaction};
-use cdk_common::database::Error;
+use cdk_common::database::{Error, MintDatabase};
 use cdk_common::mint::{MintKeySetInfo, StoredCondition};
 use cdk_common::nuts::nut_ctf::ConditionalKeySetInfo;
 use cdk_common::nuts::{CurrencyUnit, Id};
@@ -14,81 +14,67 @@ use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
 use crate::{column_as_number, column_as_string, unpack_into};
 
+const CONDITION_COLUMNS: &str = "condition_id, threshold, tags_json, announcements_json, \
+    collateral, attestation_status, winning_outcome, attested_at, created_at, \
+    condition_type, lo_bound, hi_bound, precision, oracle_sigs_json";
+
 fn sql_row_to_stored_condition(row: Vec<Column>) -> Result<StoredCondition, Error> {
-    unpack_into!(
-        let (
-            condition_id,
-            threshold,
-            tags_json,
-            announcements_json,
-            collateral,
-            attestation_status,
-            winning_outcome,
-            attested_at,
-            created_at,
-            condition_type,
-            lo_bound,
-            hi_bound,
-            precision
-        ) = row
-    );
-
-    let winning_outcome = match &winning_outcome {
-        Column::Text(s) => Some(s.clone()),
-        _ => None,
+    unpack_into!(let (condition_id, threshold, tags_json, announcements_json, collateral,
+        attestation_status, winning_outcome, attested_at, created_at, condition_type,
+        lo_bound, hi_bound, precision, oracle_sigs_json) = row);
+    let invalid = || Error::Internal("Invalid stored condition column".to_string());
+    let text = |column: Column| -> Result<String, Error> {
+        match column {
+            Column::Text(value) => Ok(value),
+            _ => Err(invalid()),
+        }
     };
-
-    let attested_at: Option<u64> = match &attested_at {
-        Column::Integer(n) => Some(*n as u64),
-        _ => None,
+    let optional_text = |column: Column| -> Result<Option<String>, Error> {
+        match column {
+            Column::Text(value) => Ok(Some(value)),
+            Column::Null => Ok(None),
+            _ => Err(invalid()),
+        }
     };
-
-    let threshold_val: u64 = column_as_number!(threshold);
-    let created_at_val: u64 = column_as_number!(created_at);
-
-    let condition_type_str = match &condition_type {
-        Column::Text(s) => s.clone(),
-        _ => "enum".to_string(),
+    let number = |column: Column| -> Result<i64, Error> {
+        match column {
+            Column::Integer(value) => Ok(value),
+            _ => Err(invalid()),
+        }
     };
-
-    let collateral_val = match &collateral {
-        Column::Text(s) => Some(
-            s.parse::<CurrencyUnit>()
-                .map_err(|e| Error::Internal(format!("Invalid collateral unit: {e}")))?,
-        ),
-        _ => None,
+    let optional_number = |column: Column| -> Result<Option<i64>, Error> {
+        match column {
+            Column::Integer(value) => Ok(Some(value)),
+            Column::Null => Ok(None),
+            _ => Err(invalid()),
+        }
     };
-
-    let lo_bound_val: Option<i64> = match &lo_bound {
-        Column::Integer(n) => Some(*n),
-        _ => None,
+    let condition = StoredCondition {
+        condition_id: text(condition_id)?,
+        threshold: u32::try_from(number(threshold)?).map_err(|_| invalid())?,
+        tags_json: text(tags_json)?,
+        announcements_json: text(announcements_json)?,
+        collateral: optional_text(collateral)?
+            .map(|value| value.parse::<CurrencyUnit>().map_err(|_| invalid()))
+            .transpose()?,
+        attestation_status: text(attestation_status)?,
+        winning_outcome: optional_text(winning_outcome)?,
+        attested_at: optional_number(attested_at)?
+            .map(|value| u64::try_from(value).map_err(|_| invalid()))
+            .transpose()?,
+        created_at: u64::try_from(number(created_at)?).map_err(|_| invalid())?,
+        condition_type: text(condition_type)?,
+        lo_bound: optional_number(lo_bound)?,
+        hi_bound: optional_number(hi_bound)?,
+        precision: optional_number(precision)?
+            .map(|value| i32::try_from(value).map_err(|_| invalid()))
+            .transpose()?,
+        oracle_sigs: optional_text(oracle_sigs_json)?
+            .map(|value| serde_json::from_str(&value).map_err(|_| invalid()))
+            .transpose()?,
     };
-
-    let hi_bound_val: Option<i64> = match &hi_bound {
-        Column::Integer(n) => Some(*n),
-        _ => None,
-    };
-
-    let precision_val: Option<i32> = match &precision {
-        Column::Integer(n) => Some(*n as i32),
-        _ => None,
-    };
-
-    Ok(StoredCondition {
-        condition_id: column_as_string!(&condition_id),
-        threshold: threshold_val as u32,
-        tags_json: column_as_string!(&tags_json),
-        announcements_json: column_as_string!(&announcements_json),
-        collateral: collateral_val,
-        attestation_status: column_as_string!(&attestation_status),
-        winning_outcome,
-        attested_at,
-        created_at: created_at_val,
-        condition_type: condition_type_str,
-        lo_bound: lo_bound_val,
-        hi_bound: hi_bound_val,
-        precision: precision_val,
-    })
+    condition.validate()?;
+    Ok(condition)
 }
 
 fn sql_row_to_keyset_mapping(row: Vec<Column>) -> Result<(String, Id), Error> {
@@ -199,16 +185,17 @@ async fn insert_condition<EX>(executor: &EX, condition: StoredCondition) -> Resu
 where
     EX: crate::database::DatabaseExecutor,
 {
+    condition.validate()?;
     query(
         r#"
         INSERT INTO conditions (
             condition_id, threshold, tags_json, announcements_json,
             collateral, attestation_status, winning_outcome, attested_at, created_at,
-            condition_type, lo_bound, hi_bound, precision
+            condition_type, lo_bound, hi_bound, precision, oracle_sigs_json
         ) VALUES (
             :condition_id, :threshold, :tags_json, :announcements_json,
             :collateral, :attestation_status, :winning_outcome, :attested_at, :created_at,
-            :condition_type, :lo_bound, :hi_bound, :precision
+            :condition_type, :lo_bound, :hi_bound, :precision, :oracle_sigs_json
         )
         "#,
     )?
@@ -228,6 +215,14 @@ where
     .bind("lo_bound", condition.lo_bound)
     .bind("hi_bound", condition.hi_bound)
     .bind("precision", condition.precision.map(|p| p as i64))
+    .bind(
+        "oracle_sigs_json",
+        condition
+            .oracle_sigs
+            .map(|sigs| serde_json::to_string(&sigs))
+            .transpose()
+            .map_err(|err| Error::Internal(err.to_string()))?,
+    )
     .execute(executor)
     .await?;
 
@@ -416,15 +411,9 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let row = query(
-            r#"
-            SELECT condition_id, threshold, tags_json, announcements_json,
-                   collateral, attestation_status, winning_outcome, attested_at, created_at,
-                   condition_type, lo_bound, hi_bound, precision
-            FROM conditions
-            WHERE condition_id = :condition_id
-            "#,
-        )?
+        let row = query(&format!(
+            "SELECT {CONDITION_COLUMNS} FROM conditions WHERE condition_id = :condition_id"
+        ))?
         .bind("condition_id", condition_id.to_string())
         .fetch_one(&*conn)
         .await?;
@@ -448,11 +437,7 @@ where
             .map_err(|e| Error::Database(Box::new(e)))?;
 
         // Build SQL dynamically for status IN clause
-        let mut sql = String::from(
-            "SELECT condition_id, threshold, tags_json, announcements_json, \
-             collateral, attestation_status, winning_outcome, attested_at, created_at, \
-             condition_type, lo_bound, hi_bound, precision FROM conditions WHERE 1=1",
-        );
+        let mut sql = format!("SELECT {CONDITION_COLUMNS} FROM conditions WHERE 1=1");
 
         if since.is_some() {
             // Replay the boundary timestamp so same-second rows cannot be
@@ -502,31 +487,27 @@ where
         status: &str,
         winning_outcome: Option<&str>,
         attested_at: Option<u64>,
+        oracle_sigs: &[cdk_common::nuts::nut_ctf::OracleSig],
     ) -> Result<bool, Self::Err> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Database(Box::new(e)))?;
-
-        let rows_affected = query(
-            r#"
-            UPDATE conditions
-            SET attestation_status = :status,
-                winning_outcome = :winning_outcome,
-                attested_at = :attested_at
-            WHERE condition_id = :condition_id
-              AND attestation_status = 'pending'
-            "#,
-        )?
-        .bind("status", status.to_string())
-        .bind("winning_outcome", winning_outcome.map(|w| w.to_string()))
-        .bind("attested_at", attested_at.map(|a| a as i64))
-        .bind("condition_id", condition_id.to_string())
-        .execute(&*conn)
-        .await?;
-
-        Ok(rows_affected > 0)
+        if status != "attested" {
+            return Err(Error::Internal(
+                "Only oracle-attested results can be recorded".to_string(),
+            ));
+        }
+        let winning_outcome =
+            winning_outcome.ok_or_else(|| Error::Internal("Missing oracle result".to_string()))?;
+        let attested_at =
+            attested_at.ok_or_else(|| Error::Internal("Missing attestation time".to_string()))?;
+        let mut tx = self.begin_transaction().await?;
+        let condition = tx
+            .get_condition_for_update(condition_id)
+            .await?
+            .ok_or_else(|| Error::Internal("Condition not found".to_string()))?;
+        let updated = tx
+            .record_condition_attestation(&condition, winning_outcome, attested_at, oracle_sigs)
+            .await?;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     async fn get_conditional_keysets_for_condition(
@@ -649,22 +630,49 @@ where
         &mut self,
         condition_id: &str,
     ) -> Result<Option<cdk_common::database::mint::Acquired<StoredCondition>>, Self::Err> {
-        query(
-            r#"
-            SELECT condition_id, threshold, tags_json, announcements_json,
-                   collateral, attestation_status, winning_outcome, attested_at, created_at,
-                   condition_type, lo_bound, hi_bound, precision
-            FROM conditions
-            WHERE condition_id = :condition_id
-            FOR UPDATE
-            "#,
-        )?
+        query(&format!("SELECT {CONDITION_COLUMNS} FROM conditions WHERE condition_id = :condition_id FOR UPDATE"))?
         .bind("condition_id", condition_id.to_string())
         .fetch_one(&self.inner)
         .await?
         .map(sql_row_to_stored_condition)
         .transpose()
         .map(|condition| condition.map(Into::into))
+    }
+
+    async fn record_condition_attestation(
+        &mut self,
+        condition: &cdk_common::database::mint::Acquired<StoredCondition>,
+        winning_outcome: &str,
+        attested_at: u64,
+        oracle_sigs: &[cdk_common::nuts::nut_ctf::OracleSig],
+    ) -> Result<bool, Self::Err> {
+        let mut result = (**condition).clone();
+        result.attestation_status = "attested".to_string();
+        result.winning_outcome = Some(winning_outcome.to_string());
+        result.attested_at = Some(attested_at);
+        result.oracle_sigs = Some(oracle_sigs.to_vec());
+        result.validate()?;
+        if condition.attestation_status != "pending" {
+            return Ok(false);
+        }
+        let rows = query(
+            r#"
+            UPDATE conditions SET attestation_status = 'attested',
+                winning_outcome = :winning_outcome, attested_at = :attested_at,
+                oracle_sigs_json = :oracle_sigs_json
+            WHERE condition_id = :condition_id AND attestation_status = 'pending'
+        "#,
+        )?
+        .bind("condition_id", condition.condition_id.clone())
+        .bind("winning_outcome", winning_outcome.to_string())
+        .bind("attested_at", attested_at as i64)
+        .bind(
+            "oracle_sigs_json",
+            serde_json::to_string(oracle_sigs).map_err(|err| Error::Internal(err.to_string()))?,
+        )
+        .execute(&self.inner)
+        .await?;
+        Ok(rows > 0)
     }
 
     async fn add_condition(&mut self, condition: StoredCondition) -> Result<(), Self::Err> {
@@ -677,5 +685,69 @@ where
         created_at: u64,
     ) -> Result<(), Self::Err> {
         insert_conditional_keyset(&self.inner, keyset_info, created_at).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_row() -> Vec<Column> {
+        vec![
+            Column::Text("aa".repeat(32)),
+            Column::Integer(1),
+            Column::Text("[]".to_string()),
+            Column::Text(r#"["deadbeef"]"#.to_string()),
+            Column::Text("sat".to_string()),
+            Column::Text("pending".to_string()),
+            Column::Null,
+            Column::Null,
+            Column::Integer(1),
+            Column::Text("enum".to_string()),
+            Column::Null,
+            Column::Null,
+            Column::Null,
+            Column::Null,
+        ]
+    }
+
+    #[test]
+    fn d2_strict_condition_rows_reject_corrupt_states_types_and_evidence() {
+        assert!(sql_row_to_stored_condition(pending_row()).is_ok());
+        for (column, corrupt) in [
+            (1, Column::Integer(-1)),
+            (1, Column::Integer(i64::MAX)),
+            (2, Column::Text("invalid".to_string())),
+            (5, Column::Text("unknown".to_string())),
+            (6, Column::Text("YES".to_string())),
+            (7, Column::Integer(-1)),
+            (8, Column::Integer(-1)),
+            (9, Column::Null),
+            (9, Column::Text("unknown".to_string())),
+            (12, Column::Integer(i64::MAX)),
+            (13, Column::Text("invalid".to_string())),
+            (13, Column::Text("[]".to_string())),
+        ] {
+            let mut row = pending_row();
+            row[column] = corrupt;
+            assert!(
+                sql_row_to_stored_condition(row).is_err(),
+                "invalid column {column}"
+            );
+        }
+        let mut row = pending_row();
+        row[5] = Column::Text("attested".to_string());
+        row[6] = Column::Text("YES".to_string());
+        row[7] = Column::Integer(2);
+        for malformed in [
+            "null",
+            "{}",
+            "[]",
+            "[{}]",
+            r#"[{"oracle_pubkey":"a","oracle_sig":"b","outcome":"YES"}]"#,
+        ] {
+            row[13] = Column::Text(malformed.to_string());
+            assert!(sql_row_to_stored_condition(row.clone()).is_err());
+        }
     }
 }

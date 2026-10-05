@@ -280,6 +280,7 @@ impl Mint {
             attestation_status: STATUS_PENDING.to_string(),
             winning_outcome: None,
             attested_at: None,
+            oracle_sigs: None,
             created_at: now,
             condition_type: request.condition_type.clone(),
             lo_bound: request.lo_bound,
@@ -782,7 +783,7 @@ impl Mint {
         // TODO: N+1 query — build_condition_info loads keysets per condition.
         // Batch when condition count grows.
         for condition in conditions {
-            let info = self.build_condition_info(condition).await?;
+            let info = self.build_condition_info(condition, false).await?;
             infos.push(info);
         }
 
@@ -792,20 +793,34 @@ impl Mint {
     /// Get a specific condition (GET /v1/conditions/{condition_id})
     #[instrument(skip_all)]
     pub async fn get_condition(&self, condition_id: &str) -> Result<ConditionInfo, Error> {
+        self.get_condition_with_oracle_sigs(condition_id, false)
+            .await
+    }
+
+    /// Read an individual condition with optional accepted public oracle evidence.
+    #[instrument(skip_all)]
+    pub async fn get_condition_with_oracle_sigs(
+        &self,
+        condition_id: &str,
+        include_oracle_sigs: bool,
+    ) -> Result<ConditionInfo, Error> {
         let condition = self
             .localstore
             .get_condition(condition_id)
             .await?
             .ok_or(Error::ConditionNotFound)?;
 
-        self.build_condition_info(condition).await
+        self.build_condition_info(condition, include_oracle_sigs)
+            .await
     }
 
     /// Build a ConditionInfo from a StoredCondition, including keysets
     async fn build_condition_info(
         &self,
         condition: StoredCondition,
+        include_oracle_sigs: bool,
     ) -> Result<ConditionInfo, Error> {
+        condition.validate()?;
         let announcements: Vec<String> = serde_json::from_str(&condition.announcements_json)?;
 
         let keysets = self
@@ -816,7 +831,7 @@ impl Mint {
         Ok(ConditionInfo {
             condition_id: condition.condition_id,
             threshold: condition.threshold,
-            tags: serde_json::from_str(&condition.tags_json).unwrap_or_default(),
+            tags: serde_json::from_str(&condition.tags_json)?,
             announcements,
             collateral: condition.collateral,
             keysets,
@@ -825,10 +840,20 @@ impl Mint {
                     STATUS_ATTESTED => AttestationStatus::Attested,
                     "expired" => AttestationStatus::Expired,
                     "violation" => AttestationStatus::Violation,
-                    _ => AttestationStatus::Pending,
+                    STATUS_PENDING => AttestationStatus::Pending,
+                    _ => {
+                        return Err(Error::Custom(
+                            "Invalid stored attestation status".to_string(),
+                        ))
+                    }
                 },
                 winning_outcome: condition.winning_outcome,
                 attested_at: condition.attested_at,
+                oracle_sigs: if include_oracle_sigs {
+                    condition.oracle_sigs
+                } else {
+                    None
+                },
             }),
             condition_type: condition.condition_type,
             lo_bound: condition.lo_bound,

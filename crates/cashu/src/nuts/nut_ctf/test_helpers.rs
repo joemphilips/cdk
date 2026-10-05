@@ -149,7 +149,7 @@ pub fn create_multi_oracle_witness(oracle_outcomes: &[(&TestOracle, &str)]) -> O
             OracleSig {
                 oracle_pubkey: to_hex(&oracle.public_key.serialize()),
                 oracle_sig: Some(to_hex(&sig)),
-                outcome: outcome.to_string(),
+                outcome: Some(outcome.to_string()),
                 digit_sigs: None,
             }
         })
@@ -164,7 +164,7 @@ pub fn create_oracle_witness(oracle: &TestOracle, outcome: &str) -> OracleWitnes
         oracle_sigs: vec![OracleSig {
             oracle_pubkey: to_hex(&oracle.public_key.serialize()),
             oracle_sig: Some(to_hex(&sig)),
-            outcome: outcome.to_string(),
+            outcome: Some(outcome.to_string()),
             digit_sigs: None,
         }],
     }
@@ -327,7 +327,7 @@ pub fn create_numeric_oracle_witness(
         oracle_sigs: vec![OracleSig {
             oracle_pubkey: to_hex(&oracle.public_key.serialize()),
             oracle_sig: None,
-            outcome: value.to_string(),
+            outcome: None,
             digit_sigs: Some(digit_sigs_hex),
         }],
     }

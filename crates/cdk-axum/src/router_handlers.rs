@@ -1211,6 +1211,7 @@ pub(crate) async fn get_condition(
     auth: AuthHeader,
     State(state): State<MintState>,
     Path(condition_id): Path<String>,
+    Query(options): Query<cdk::nuts::nut_ctf::GetConditionRequest>,
 ) -> Result<Json<cdk::nuts::nut_ctf::ConditionInfo>, Response> {
     state
         .mint
@@ -1223,7 +1224,7 @@ pub(crate) async fn get_condition(
 
     let response = state
         .mint
-        .get_condition(&condition_id)
+        .get_condition_with_oracle_sigs(&condition_id, options.include_oracle_sigs)
         .await
         .map_err(|err| {
             tracing::error!("Could not get condition: {}", err);
@@ -2014,5 +2015,147 @@ mod ctf_convert_admission_tests {
         assert_eq!(response.detail, "individual condition witness is invalid");
         assert!(!response.detail.contains("dleq"));
         assert!(!response.detail.contains("secret"));
+    }
+}
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod oracle_evidence_http_tests {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use cdk::mint::MintBuilder;
+    use cdk::nuts::nut_ctf::test_helpers::{
+        create_oracle_witness, create_test_announcement, create_test_oracle,
+    };
+    use cdk::nuts::nut_ctf::{NutCtfSettings, RegisterConditionRequest, RegistrationFeeSetting};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn d2_individual_get_serves_requested_original_evidence_directly() {
+        let path = std::env::temp_dir().join(format!("cdk-d2-http-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            cdk_sqlite::mint::MintSqliteDatabase::new(path.clone())
+                .await
+                .unwrap(),
+        );
+        let mut builder = MintBuilder::new(db.clone());
+        builder
+            .configure_unit(
+                cdk::nuts::CurrencyUnit::Sat,
+                cdk::mint::UnitConfig {
+                    amounts: (0..32).map(|index| 1u64 << index).collect(),
+                    input_fee_ppk: 0,
+                },
+            )
+            .unwrap();
+        let mint = builder.build_with_seed(db, &[8; 64]).await.unwrap();
+        let mut info = mint.mint_info().await.unwrap();
+        info.nuts.nut_ctf = Some(NutCtfSettings {
+            registration_fees: vec![RegistrationFeeSetting {
+                unit: "sat".to_string(),
+                registration_fee_base: 0,
+                registration_fee_per_keyset: 0,
+            }],
+            ..NutCtfSettings::default()
+        });
+        mint.set_mint_info(info).await.unwrap();
+        let oracle = create_test_oracle();
+        let (_, announcement) = create_test_announcement(&oracle, &["YES", "NO"], "http-evidence");
+        let registration = mint
+            .register_condition(RegisterConditionRequest {
+                threshold: 1,
+                tags: Vec::new(),
+                announcements: vec![announcement],
+                collateral: Some("sat".to_string()),
+                outcome_collections: Some(vec!["YES".to_string(), "NO".to_string()]),
+                fee: None,
+                outputs: None,
+                condition_type: "enum".to_string(),
+                lo_bound: None,
+                hi_bound: None,
+                precision: None,
+            })
+            .await
+            .unwrap();
+        let witness = create_oracle_witness(&oracle, "YES");
+        mint.localstore()
+            .update_condition_attestation(
+                &registration.condition_id,
+                "attested",
+                Some("YES"),
+                Some(1234),
+                &witness.oracle_sigs,
+            )
+            .await
+            .unwrap();
+        drop(mint);
+        // Serve a new mint instance over the reopened durable provider.
+        let db = Arc::new(
+            cdk_sqlite::mint::MintSqliteDatabase::new(path.clone())
+                .await
+                .unwrap(),
+        );
+        let mint = Arc::new(
+            MintBuilder::new(db.clone())
+                .build_with_seed(db, &[8; 64])
+                .await
+                .unwrap(),
+        );
+        let router = crate::create_mint_router(mint, Vec::new()).await.unwrap();
+        for (query, requested) in [
+            ("", false),
+            ("?include_oracle_sigs=false", false),
+            ("?include_oracle_sigs=true", true),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/v1/conditions/{}{query}",
+                            registration.condition_id
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["condition_id"], registration.condition_id);
+            assert!(body.get("conditions").is_none());
+            assert_eq!(body["attestation"]["winning_outcome"], "YES");
+            assert_eq!(body["attestation"]["attested_at"], 1234);
+            if requested {
+                assert_eq!(
+                    body["attestation"]["oracle_sigs"],
+                    serde_json::to_value(&witness.oracle_sigs).unwrap()
+                );
+                if let Ok(directory) = std::env::var("CDK_D2_FIXTURE_DIR") {
+                    std::fs::write(
+                        std::path::Path::new(&directory).join("http-condition-info.json"),
+                        &bytes,
+                    )
+                    .unwrap();
+                }
+            } else {
+                assert!(body["attestation"].get("oracle_sigs").is_none());
+            }
+        }
+        let malformed = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/conditions/{}?include_oracle_sigs=invalid",
+                        registration.condition_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        std::fs::remove_file(path).unwrap();
     }
 }
