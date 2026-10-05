@@ -1154,7 +1154,7 @@ where
 pub(crate) async fn get_conditions(
     auth: AuthHeader,
     State(state): State<MintState>,
-    Query(params): Query<cdk::nuts::nut_ctf::GetConditionsRequest>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Json<cdk::nuts::nut_ctf::GetConditionsResponse>, Response> {
     state
         .mint
@@ -1165,9 +1165,15 @@ pub(crate) async fn get_conditions(
         .await
         .map_err(into_response)?;
 
+    let params = super::listing_query::conditions_query(query.as_deref()).map_err(into_response)?;
     let response = state
         .mint
-        .get_conditions(params.since, params.limit, &params.status)
+        .get_conditions_page(
+            params.since,
+            params.limit,
+            &params.status,
+            params.cursor.as_deref(),
+        )
         .await
         .map_err(|err| {
             tracing::error!("Could not get conditions: {}", err);
@@ -1252,7 +1258,12 @@ pub(crate) async fn get_conditional_keysets(
 
     let response = state
         .mint
-        .get_conditional_keysets(params.since, params.limit, params.active)
+        .get_conditional_keysets_page(
+            params.since,
+            params.limit,
+            params.active,
+            params.cursor.as_deref(),
+        )
         .await
         .map_err(|err| {
             tracing::error!("Could not get conditional keysets: {}", err);

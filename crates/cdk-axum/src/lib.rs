@@ -22,6 +22,8 @@ mod auth;
 pub mod cache;
 mod custom_handlers;
 mod custom_router;
+#[cfg(feature = "conditional-tokens")]
+mod listing_query;
 mod router_handlers;
 mod ws;
 
@@ -166,3 +168,9 @@ pub async fn create_mint_router_with_custom_cache(
 
     Ok(mint_router)
 }
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod pagination_tests;
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod pagination_test_database;

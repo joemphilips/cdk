@@ -188,6 +188,7 @@ pub trait MintConnector: Debug {
         since: Option<u64>,
         limit: Option<u64>,
         status: &[String],
+        cursor: Option<&str>,
     ) -> Result<crate::nuts::nut_ctf::GetConditionsResponse, Error>;
 
     /// Get a specific condition [NUT-CTF]
@@ -211,6 +212,7 @@ pub trait MintConnector: Debug {
         since: Option<u64>,
         limit: Option<u64>,
         active: Option<bool>,
+        cursor: Option<&str>,
     ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error>;
 
     /// CTF convert [NUT-CTF-split-merge]

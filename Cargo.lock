@@ -1328,8 +1328,10 @@ dependencies = [
  "cdk-common",
  "cdk-fake-wallet",
  "cdk-http-client",
+ "cdk-postgres",
  "cdk-prometheus",
  "cdk-signatory",
+ "cdk-sql-common",
  "cdk-sqlite",
  "futures",
  "maud",
@@ -1343,6 +1345,8 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]

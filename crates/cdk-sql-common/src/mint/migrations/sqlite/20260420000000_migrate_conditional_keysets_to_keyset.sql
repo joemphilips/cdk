@@ -45,4 +45,4 @@ CREATE INDEX IF NOT EXISTS conditional_keyset_outcome_collection_id_idx
     ON conditional_keyset(outcome_collection_id);
 
 CREATE INDEX IF NOT EXISTS conditional_keyset_created_at_idx
-    ON conditional_keyset(created_at);
+    ON conditional_keyset(created_at, id);

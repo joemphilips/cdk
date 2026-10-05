@@ -11,9 +11,8 @@ CREATE INDEX IF NOT EXISTS idx_proof_operation_id_only ON proof(operation_id);
 CREATE INDEX IF NOT EXISTS idx_blind_signature_keyset_id ON blind_signature(keyset_id);
 CREATE INDEX IF NOT EXISTS idx_proof_keyset_id ON proof(keyset_id);
 
--- Conditions: unfiltered listing by created_at
--- (existing index is (attestation_status, created_at) — can't be used without status filter)
-CREATE INDEX IF NOT EXISTS idx_conditions_created_at ON conditions(created_at);
+-- Use registration timestamp and ID for unfiltered condition seeks.
+CREATE INDEX IF NOT EXISTS idx_conditions_created_at ON conditions(created_at, condition_id);
 
--- Conditional keyset: active-filtered pagination
-CREATE INDEX IF NOT EXISTS idx_conditional_keyset_active_created ON conditional_keyset(active, created_at);
+-- Use active status, registration timestamp and ID for keyset seeks.
+CREATE INDEX IF NOT EXISTS idx_conditional_keyset_active_created ON conditional_keyset(active, created_at, id);

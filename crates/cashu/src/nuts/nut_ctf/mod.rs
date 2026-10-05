@@ -190,6 +190,9 @@ pub struct RegisterConditionResponse {
 /// GET /v1/conditions query parameters
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GetConditionsRequest {
+    /// Opaque continuation from the previous page. Keep the same filters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
     /// Unix timestamp; only return conditions registered at or after this time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
@@ -204,8 +207,18 @@ pub struct GetConditionsRequest {
 /// GET /v1/conditions response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetConditionsResponse {
+    /// Opaque continuation, or null when the listing is complete.
+    #[serde(deserialize_with = "deserialize_next_cursor")]
+    pub next_cursor: Option<String>,
     /// Array of available conditions
     pub conditions: Vec<ConditionInfo>,
+}
+
+fn deserialize_next_cursor<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 /// Full condition detail
@@ -478,6 +491,9 @@ pub struct ConditionalKeySetInfo {
 /// GET /v1/conditional_keysets query parameters
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GetConditionalKeysetsRequest {
+    /// Opaque continuation from the previous page. Keep the same filters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
     /// Unix timestamp; only return keysets registered at or after this time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
@@ -492,6 +508,9 @@ pub struct GetConditionalKeysetsRequest {
 /// GET /v1/conditional_keysets response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConditionalKeysetsResponse {
+    /// Opaque continuation, or null when the listing is complete.
+    #[serde(deserialize_with = "deserialize_next_cursor")]
+    pub next_cursor: Option<String>,
     /// Array of conditional keyset info
     pub keysets: Vec<ConditionalKeySetInfo>,
 }
@@ -819,6 +838,41 @@ pub fn from_hex(hex: &str) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn d3_listing_responses_require_explicit_string_or_null_continuation() {
+        for next_cursor in ["null", "\"opaque-cursor\""] {
+            let conditions = format!(r#"{{"conditions":[],"next_cursor":{next_cursor}}}"#);
+            let keysets = format!(r#"{{"keysets":[],"next_cursor":{next_cursor}}}"#);
+            assert!(serde_json::from_str::<GetConditionsResponse>(&conditions).is_ok());
+            assert!(serde_json::from_str::<ConditionalKeysetsResponse>(&keysets).is_ok());
+        }
+        for invalid in [
+            r#"{"conditions":[]}"#,
+            r#"{"conditions":[],"next_cursor":false}"#,
+        ] {
+            assert!(serde_json::from_str::<GetConditionsResponse>(invalid).is_err());
+        }
+        for invalid in [r#"{"keysets":[]}"#, r#"{"keysets":[],"next_cursor":0}"#] {
+            assert!(serde_json::from_str::<ConditionalKeysetsResponse>(invalid).is_err());
+        }
+        let conditions = GetConditionsResponse {
+            conditions: Vec::new(),
+            next_cursor: None,
+        };
+        let keysets = ConditionalKeysetsResponse {
+            keysets: Vec::new(),
+            next_cursor: None,
+        };
+        assert_eq!(
+            serde_json::to_value(conditions).unwrap(),
+            serde_json::json!({"conditions": [], "next_cursor": null})
+        );
+        assert_eq!(
+            serde_json::to_value(keysets).unwrap(),
+            serde_json::json!({"keysets": [], "next_cursor": null})
+        );
+    }
+
     use super::*;
 
     #[test]
