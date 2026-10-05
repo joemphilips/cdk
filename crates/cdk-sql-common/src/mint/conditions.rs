@@ -12,7 +12,12 @@ use cdk_common::nuts::{CurrencyUnit, Id};
 use super::{SQLMintDatabase, SQLTransaction};
 use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
-use crate::{column_as_number, column_as_string, unpack_into};
+use crate::{column_as_string, unpack_into};
+
+pub(super) fn checked_sql_integer(value: u64) -> Result<i64, Error> {
+    i64::try_from(value)
+        .map_err(|_| Error::Internal("Registration query integer exceeds SQL range".to_string()))
+}
 
 const CONDITION_COLUMNS: &str = "condition_id, threshold, tags_json, announcements_json, \
     collateral, attestation_status, winning_outcome, attested_at, created_at, \
@@ -126,7 +131,15 @@ pub(crate) fn sql_row_to_conditional_mint_keyset_info(
     info.outcome_collection = Some(column_as_string!(&outcome_collection));
     info.outcome_collection_id = Some(column_as_string!(&outcome_collection_id));
 
-    let created_at_val: u64 = column_as_number!(created_at);
+    let created_at_val = match created_at {
+        Column::Integer(value) => u64::try_from(value)
+            .map_err(|_| Error::Internal("Invalid keyset registration time".to_string()))?,
+        _ => {
+            return Err(Error::Internal(
+                "Invalid keyset registration time".to_string(),
+            ))
+        }
+    };
     Ok((info, created_at_val))
 }
 
@@ -210,7 +223,7 @@ where
     .bind("attestation_status", condition.attestation_status)
     .bind("winning_outcome", condition.winning_outcome)
     .bind("attested_at", condition.attested_at.map(|a| a as i64))
-    .bind("created_at", condition.created_at as i64)
+    .bind("created_at", checked_sql_integer(condition.created_at)?)
     .bind("condition_type", condition.condition_type)
     .bind("lo_bound", condition.lo_bound)
     .bind("hi_bound", condition.hi_bound)
@@ -285,7 +298,7 @@ where
     .bind("condition_id", condition_id)
     .bind("outcome_collection", outcome_collection)
     .bind("outcome_collection_id", outcome_collection_id)
-    .bind("created_at", created_at as i64)
+    .bind("created_at", checked_sql_integer(created_at)?)
     .execute(executor)
     .await?;
 
@@ -296,15 +309,14 @@ impl<RM> SQLMintDatabase<RM>
 where
     RM: DatabasePool + 'static,
 {
-    /// Query the `conditional_keyset` table with optional inclusive cursor
-    /// pagination, `limit`, and active filter. This is the shared path for
-    /// both the public NUT-CTF listing endpoint and the internal
-    /// `reload_keys_from_db` bootstrap.
+    /// Read keysets with an inclusive registration filter and optional strict seek.
+    /// Internal key reload passes no limit or seek to keep the complete read.
     pub(crate) async fn query_conditional_keysets(
         &self,
         since: Option<u64>,
         limit: Option<u64>,
         active: Option<bool>,
+        after: Option<&(u64, String)>,
     ) -> Result<Vec<(MintKeySetInfo, u64)>, Error> {
         let conn = self
             .pool
@@ -318,8 +330,6 @@ where
         );
 
         if since.is_some() {
-            // Replay the boundary timestamp so same-second rows cannot be
-            // skipped. Clients deduplicate returned keysets by ID.
             sql.push_str(" AND created_at >= :since");
         }
 
@@ -327,7 +337,12 @@ where
             sql.push_str(" AND active = :active");
         }
 
-        sql.push_str(" ORDER BY created_at ASC");
+        if after.is_some() {
+            sql.push_str(
+                " AND (created_at > :after_time OR (created_at = :after_time AND id > :after_id))",
+            );
+        }
+        sql.push_str(" ORDER BY created_at ASC, id ASC");
 
         if limit.is_some() {
             sql.push_str(" LIMIT :limit");
@@ -336,15 +351,21 @@ where
         let mut stmt = query(&sql)?;
 
         if let Some(since_ts) = since {
-            stmt = stmt.bind("since", since_ts as i64);
+            stmt = stmt.bind("since", checked_sql_integer(since_ts)?);
         }
 
         if let Some(active_val) = active {
             stmt = stmt.bind("active", active_val as i64);
         }
 
+        if let Some((timestamp, id)) = after {
+            stmt = stmt
+                .bind("after_time", checked_sql_integer(*timestamp)?)
+                .bind("after_id", id.clone());
+        }
+
         if let Some(limit_val) = limit {
-            stmt = stmt.bind("limit", limit_val as i64);
+            stmt = stmt.bind("limit", checked_sql_integer(limit_val)?);
         }
 
         stmt.fetch_all(&*conn)
@@ -430,6 +451,16 @@ where
         limit: Option<u64>,
         status: &[String],
     ) -> Result<Vec<StoredCondition>, Self::Err> {
+        self.get_conditions_page(since, limit, status, None).await
+    }
+
+    async fn get_conditions_page(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        status: &[String],
+        after: Option<&(u64, String)>,
+    ) -> Result<Vec<StoredCondition>, Self::Err> {
         let conn = self
             .pool
             .get()
@@ -440,8 +471,6 @@ where
         let mut sql = format!("SELECT {CONDITION_COLUMNS} FROM conditions WHERE 1=1");
 
         if since.is_some() {
-            // Replay the boundary timestamp so same-second rows cannot be
-            // skipped. Clients deduplicate returned conditions by ID.
             sql.push_str(" AND created_at >= :since");
         }
 
@@ -456,7 +485,10 @@ where
             sql.push(')');
         }
 
-        sql.push_str(" ORDER BY created_at ASC");
+        if after.is_some() {
+            sql.push_str(" AND (created_at > :after_time OR (created_at = :after_time AND condition_id > :after_id))");
+        }
+        sql.push_str(" ORDER BY created_at ASC, condition_id ASC");
 
         if limit.is_some() {
             sql.push_str(" LIMIT :limit");
@@ -465,15 +497,21 @@ where
         let mut stmt = query(&sql)?;
 
         if let Some(since_ts) = since {
-            stmt = stmt.bind("since", since_ts as i64);
+            stmt = stmt.bind("since", checked_sql_integer(since_ts)?);
         }
 
         for (i, s) in status.iter().enumerate() {
             stmt = stmt.bind(format!("status_{}", i), s.clone());
         }
 
+        if let Some((timestamp, id)) = after {
+            stmt = stmt
+                .bind("after_time", checked_sql_integer(*timestamp)?)
+                .bind("after_id", id.clone());
+        }
+
         if let Some(limit_val) = limit {
-            stmt = stmt.bind("limit", limit_val as i64);
+            stmt = stmt.bind("limit", checked_sql_integer(limit_val)?);
         }
 
         let rows = stmt.fetch_all(&*conn).await?;
@@ -543,6 +581,45 @@ where
         Ok(map)
     }
 
+    async fn get_conditional_keysets_for_conditions(
+        &self,
+        condition_ids: &[String],
+    ) -> Result<HashMap<String, HashMap<String, Id>>, Self::Err> {
+        if condition_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        let placeholders = (0..condition_ids.len())
+            .map(|index| format!(":condition_{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT condition_id, outcome_collection, id FROM conditional_keyset WHERE active = :active AND condition_id IN ({placeholders}) ORDER BY condition_id ASC, outcome_collection ASC");
+        let mut stmt = query(&sql)?.bind("active", true);
+        for (index, id) in condition_ids.iter().enumerate() {
+            stmt = stmt.bind(format!("condition_{index}"), id.clone());
+        }
+        let mut maps = HashMap::new();
+        for mut row in stmt.fetch_all(&*conn).await? {
+            let condition_id = match row.remove(0) {
+                Column::Text(value) => value,
+                _ => {
+                    return Err(Error::Internal(
+                        "Invalid condition keyset mapping".to_string(),
+                    ))
+                }
+            };
+            let (outcome, id) = sql_row_to_keyset_mapping(row)?;
+            maps.entry(condition_id)
+                .or_insert_with(HashMap::new)
+                .insert(outcome, id);
+        }
+        Ok(maps)
+    }
+
     async fn get_conditional_keyset_infos_for_condition(
         &self,
         condition_id: &str,
@@ -574,7 +651,20 @@ where
         limit: Option<u64>,
         active: Option<bool>,
     ) -> Result<Vec<ConditionalKeySetInfo>, Self::Err> {
-        let rows = self.query_conditional_keysets(since, limit, active).await?;
+        self.get_conditional_keyset_infos_page(since, limit, active, None)
+            .await
+    }
+
+    async fn get_conditional_keyset_infos_page(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        active: Option<bool>,
+        after: Option<&(u64, String)>,
+    ) -> Result<Vec<ConditionalKeySetInfo>, Self::Err> {
+        let rows = self
+            .query_conditional_keysets(since, limit, active, after)
+            .await?;
         rows.into_iter()
             .map(|(info, created_at)| {
                 mint_keyset_info_to_conditional_keyset_info(&info, created_at)

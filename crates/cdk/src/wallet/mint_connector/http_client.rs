@@ -947,6 +947,7 @@ where
         since: Option<u64>,
         limit: Option<u64>,
         status: &[String],
+        cursor: Option<&str>,
     ) -> Result<crate::nuts::nut_ctf::GetConditionsResponse, Error> {
         let mut url = self.mint_url.join_paths(&["v1", "conditions"])?;
         let mut query_parts = Vec::new();
@@ -958,6 +959,12 @@ where
         }
         for s in status {
             query_parts.push(format!("status={}", s));
+        }
+        if let Some(cursor) = cursor {
+            query_parts.push(format!(
+                "cursor={}",
+                url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>()
+            ));
         }
         if !query_parts.is_empty() {
             url.set_query(Some(&query_parts.join("&")));
@@ -1006,6 +1013,7 @@ where
         since: Option<u64>,
         limit: Option<u64>,
         active: Option<bool>,
+        cursor: Option<&str>,
     ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
         let mut url = self.mint_url.join_paths(&["v1", "conditional_keysets"])?;
         let mut query_parts = Vec::new();
@@ -1017,6 +1025,12 @@ where
         }
         if let Some(active_val) = active {
             query_parts.push(format!("active={}", active_val));
+        }
+        if let Some(cursor) = cursor {
+            query_parts.push(format!(
+                "cursor={}",
+                url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>()
+            ));
         }
         if !query_parts.is_empty() {
             url.set_query(Some(&query_parts.join("&")));
@@ -1333,6 +1347,94 @@ mod tests {
                 .clone()
                 .expect("no mock response set");
             Ok(RawResponse::new(200, json.into_bytes()))
+        }
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn test_wallet_listing_cursor_and_filters_reach_http_transport() {
+        let cursor = "opaque+/=& cursor";
+        let transport = MockTransport {
+            get_response: Arc::new(Mutex::new(Some(
+                serde_json::json!({"conditions": [], "keysets": [], "next_cursor": cursor})
+                    .to_string(),
+            ))),
+            ..Default::default()
+        };
+        let get_urls = transport.get_urls.clone();
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url.clone(), transport, None);
+        let database = cdk_sqlite::wallet::memory::empty()
+            .await
+            .expect("wallet database");
+        let mut wallet = crate::wallet::Wallet::new(
+            "https://mint.example.com",
+            crate::nuts::CurrencyUnit::Sat,
+            Arc::new(database),
+            [8; 64],
+            None,
+        )
+        .expect("wallet");
+        wallet.set_client(Arc::new(client));
+
+        let since = 9_007_199_254_740_993;
+        let status = ["pending".to_string(), "expired".to_string()];
+        let first = wallet
+            .get_conditions(Some(since), Some(100), &status, None)
+            .await
+            .expect("first conditions page");
+        wallet
+            .get_conditions(
+                Some(since),
+                Some(100),
+                &status,
+                first.next_cursor.as_deref(),
+            )
+            .await
+            .expect("next conditions page");
+        let first = wallet
+            .get_conditional_keysets(Some(since), Some(100), Some(false), None)
+            .await
+            .expect("first keysets page");
+        wallet
+            .get_conditional_keysets(
+                Some(since),
+                Some(100),
+                Some(false),
+                first.next_cursor.as_deref(),
+            )
+            .await
+            .expect("next keysets page");
+
+        let urls = get_urls.lock().expect("lock");
+        assert_eq!(urls.len(), 4);
+        for (index, expected_path) in [
+            "/v1/conditions",
+            "/v1/conditions",
+            "/v1/conditional_keysets",
+            "/v1/conditional_keysets",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let url = Url::parse(&urls[index]).expect("request URL");
+            assert_eq!(url.path(), *expected_path);
+            let mut expected = vec![
+                ("since".to_string(), "9007199254740993".to_string()),
+                ("limit".to_string(), "100".to_string()),
+            ];
+            if index < 2 {
+                expected.extend([
+                    ("status".to_string(), "pending".to_string()),
+                    ("status".to_string(), "expired".to_string()),
+                ]);
+            } else {
+                expected.push(("active".to_string(), "false".to_string()));
+            }
+            if index % 2 == 1 {
+                expected.push(("cursor".to_string(), cursor.to_string()));
+            }
+            assert_eq!(url.query_pairs().into_owned().collect::<Vec<_>>(), expected);
         }
     }
 

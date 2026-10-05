@@ -691,6 +691,30 @@ pub trait ConditionsDatabase {
         status: &[String],
     ) -> Result<Vec<StoredCondition>, Self::Err>;
 
+    /// Read conditions strictly after a registration timestamp and identifier.
+    async fn get_conditions_page(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        status: &[String],
+        after: Option<&(u64, String)>,
+    ) -> Result<Vec<StoredCondition>, Self::Err>;
+
+    /// Get active outcome keysets for a bounded set of conditions in one read.
+    async fn get_conditional_keysets_for_conditions(
+        &self,
+        condition_ids: &[String],
+    ) -> Result<HashMap<String, HashMap<String, Id>>, Self::Err>;
+
+    /// Read conditional keysets strictly after a registration timestamp and identifier.
+    async fn get_conditional_keyset_infos_page(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        active: Option<bool>,
+        after: Option<&(u64, String)>,
+    ) -> Result<Vec<cashu::nuts::nut_ctf::ConditionalKeySetInfo>, Self::Err>;
+
     /// Update condition attestation state.
     /// Only succeeds if current status is 'pending' (first-write-wins).
     /// Returns true if the update was applied, false if already attested.

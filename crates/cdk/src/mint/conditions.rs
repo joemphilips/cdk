@@ -19,6 +19,9 @@ use tracing::instrument;
 use super::Mint;
 use crate::Error;
 
+mod pagination;
+use self::pagination::{page_limit, validate_since, ListingFilter};
+
 /// Maximum number of items returned per paginated request.
 const MAX_PAGE_SIZE: u64 = 100;
 
@@ -753,9 +756,7 @@ impl Mint {
         Ok(keysets)
     }
 
-    /// Get all conditions (GET /v1/conditions)
-    ///
-    /// Supports cursor-based pagination via `since`+`limit` and repeatable `status` filter.
+    /// Read the first bounded page of conditions.
     #[instrument(skip_all)]
     pub async fn get_conditions(
         &self,
@@ -763,31 +764,62 @@ impl Mint {
         limit: Option<u64>,
         status: &[String],
     ) -> Result<GetConditionsResponse, Error> {
-        // Validate status filter values
-        for s in status {
-            if !VALID_CONDITION_STATUSES.contains(&s.as_str()) {
-                return Err(Error::Custom(format!(
-                    "Invalid status filter value: '{}'. Valid values are: {}",
-                    s,
-                    VALID_CONDITION_STATUSES.join(", ")
-                )));
+        self.get_conditions_page(since, limit, status, None).await
+    }
+
+    /// Read a condition page using an opaque continuation and fixed filters.
+    #[instrument(skip_all)]
+    pub async fn get_conditions_page(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        status: &[String],
+        cursor: Option<&str>,
+    ) -> Result<GetConditionsResponse, Error> {
+        for value in status {
+            if !VALID_CONDITION_STATUSES.contains(&value.as_str()) {
+                return Err(Error::Custom("Invalid condition status filter".to_string()));
             }
         }
-
-        // Cap limit to MAX_PAGE_SIZE
-        let limit = limit.map(|l| l.min(MAX_PAGE_SIZE));
-
-        let conditions = self.localstore.get_conditions(since, limit, status).await?;
-        let mut infos = Vec::new();
-
-        // TODO: N+1 query — build_condition_info loads keysets per condition.
-        // Batch when condition count grows.
-        for condition in conditions {
-            let info = self.build_condition_info(condition, false).await?;
-            infos.push(info);
-        }
-
-        Ok(GetConditionsResponse { conditions: infos })
+        validate_since(since)?;
+        let limit = page_limit(limit)?;
+        let mut status = status.to_vec();
+        status.sort();
+        status.dedup();
+        let filter = ListingFilter::Conditions {
+            since: since.unwrap_or(0),
+            status: status.clone(),
+        };
+        let after = filter.decode(cursor)?;
+        let mut conditions = self
+            .localstore
+            .get_conditions_page(since, Some(limit + 1), &status, after.as_ref())
+            .await?;
+        let has_more = conditions.len() > limit as usize;
+        conditions.truncate(limit as usize);
+        let next_cursor = match conditions.last().filter(|_| has_more) {
+            Some(last) => Some(filter.encode(last.created_at, last.condition_id.clone())?),
+            None => None,
+        };
+        let ids = conditions
+            .iter()
+            .map(|condition| condition.condition_id.clone())
+            .collect::<Vec<_>>();
+        let mut keysets = self
+            .localstore
+            .get_conditional_keysets_for_conditions(&ids)
+            .await?;
+        let infos = conditions
+            .into_iter()
+            .map(|condition| {
+                let keys = keysets.remove(&condition.condition_id).unwrap_or_default();
+                Self::condition_info(condition, keys, false)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(GetConditionsResponse {
+            conditions: infos,
+            next_cursor,
+        })
     }
 
     /// Get a specific condition (GET /v1/conditions/{condition_id})
@@ -820,14 +852,20 @@ impl Mint {
         condition: StoredCondition,
         include_oracle_sigs: bool,
     ) -> Result<ConditionInfo, Error> {
-        condition.validate()?;
-        let announcements: Vec<String> = serde_json::from_str(&condition.announcements_json)?;
-
         let keysets = self
             .localstore
             .get_conditional_keysets_for_condition(&condition.condition_id)
             .await?;
+        Self::condition_info(condition, keysets, include_oracle_sigs)
+    }
 
+    fn condition_info(
+        condition: StoredCondition,
+        keysets: HashMap<String, cdk_common::nuts::Id>,
+        include_oracle_sigs: bool,
+    ) -> Result<ConditionInfo, Error> {
+        condition.validate()?;
+        let announcements: Vec<String> = serde_json::from_str(&condition.announcements_json)?;
         Ok(ConditionInfo {
             condition_id: condition.condition_id,
             threshold: condition.threshold,
@@ -863,9 +901,7 @@ impl Mint {
         })
     }
 
-    /// Get all conditional keysets (GET /v1/conditional_keysets)
-    ///
-    /// Supports cursor-based pagination via `since`+`limit` and `active` filter.
+    /// Read the first bounded page of conditional keysets.
     #[instrument(skip_all)]
     pub async fn get_conditional_keysets(
         &self,
@@ -873,15 +909,40 @@ impl Mint {
         limit: Option<u64>,
         active: Option<bool>,
     ) -> Result<ConditionalKeysetsResponse, Error> {
-        // Cap limit to MAX_PAGE_SIZE
-        let limit = limit.map(|l| l.min(MAX_PAGE_SIZE));
+        self.get_conditional_keysets_page(since, limit, active, None)
+            .await
+    }
 
-        let keysets = self
+    /// Read conditional keysets using an opaque continuation and fixed filters.
+    #[instrument(skip_all)]
+    pub async fn get_conditional_keysets_page(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        active: Option<bool>,
+        cursor: Option<&str>,
+    ) -> Result<ConditionalKeysetsResponse, Error> {
+        validate_since(since)?;
+        let limit = page_limit(limit)?;
+        let filter = ListingFilter::ConditionalKeysets {
+            since: since.unwrap_or(0),
+            active: active.into(),
+        };
+        let after = filter.decode(cursor)?;
+        let mut keysets = self
             .localstore
-            .get_all_conditional_keyset_infos(since, limit, active)
+            .get_conditional_keyset_infos_page(since, Some(limit + 1), active, after.as_ref())
             .await?;
-
-        Ok(ConditionalKeysetsResponse { keysets })
+        let has_more = keysets.len() > limit as usize;
+        keysets.truncate(limit as usize);
+        let next_cursor = match keysets.last().filter(|_| has_more) {
+            Some(last) => Some(filter.encode(last.registered_at, last.id.to_string())?),
+            None => None,
+        };
+        Ok(ConditionalKeysetsResponse {
+            keysets,
+            next_cursor,
+        })
     }
 }
 

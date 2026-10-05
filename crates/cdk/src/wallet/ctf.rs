@@ -11,17 +11,20 @@ use super::Wallet;
 use crate::error::Error;
 
 impl Wallet {
-    /// Get all conditions from the mint
+    /// Get a page of conditions from the mint
     ///
-    /// Supports cursor-based pagination via `since`+`limit` and repeatable `status` filter.
+    /// Pass `next_cursor` as `cursor` with the same filters to get the next page.
     #[instrument(skip(self))]
     pub async fn get_conditions(
         &self,
         since: Option<u64>,
         limit: Option<u64>,
         status: &[String],
+        cursor: Option<&str>,
     ) -> Result<GetConditionsResponse, Error> {
-        self.client.get_conditions(since, limit, status).await
+        self.client
+            .get_conditions(since, limit, status, cursor)
+            .await
     }
 
     /// Get a specific condition from the mint
@@ -39,18 +42,19 @@ impl Wallet {
         self.client.post_register_condition(request).await
     }
 
-    /// Get all conditional keysets from the mint
+    /// Get a page of conditional keysets from the mint
     ///
-    /// Supports cursor-based pagination via `since`+`limit` and `active` filter.
+    /// Pass `next_cursor` as `cursor` with the same filters to get the next page.
     #[instrument(skip(self))]
     pub async fn get_conditional_keysets(
         &self,
         since: Option<u64>,
         limit: Option<u64>,
         active: Option<bool>,
+        cursor: Option<&str>,
     ) -> Result<ConditionalKeysetsResponse, Error> {
         self.client
-            .get_conditional_keysets(since, limit, active)
+            .get_conditional_keysets(since, limit, active, cursor)
             .await
     }
 

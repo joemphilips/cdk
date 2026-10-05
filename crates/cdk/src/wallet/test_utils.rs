@@ -899,6 +899,7 @@ impl MintConnector for MockMintConnector {
         _since: Option<u64>,
         _limit: Option<u64>,
         _status: &[String],
+        _cursor: Option<&str>,
     ) -> Result<crate::nuts::nut_ctf::GetConditionsResponse, Error> {
         unimplemented!()
     }
@@ -925,6 +926,7 @@ impl MintConnector for MockMintConnector {
         _since: Option<u64>,
         _limit: Option<u64>,
         _active: Option<bool>,
+        _cursor: Option<&str>,
     ) -> Result<crate::nuts::nut_ctf::ConditionalKeysetsResponse, Error> {
         unimplemented!()
     }

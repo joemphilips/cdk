@@ -34,6 +34,7 @@ moka = { version = "0.12.10", features = ["future"] }
 serde_json.workspace = true
 paste.workspace = true
 serde.workspace = true
+url.workspace = true
 mime = "0.3.17"
 uuid.workspace = true
 sha2 = "0.10.8"
@@ -48,6 +49,9 @@ redis = { version = "0.31.0", default-features = false, features = [
 uuid = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
+cdk-sql-common = { workspace = true, features = ["mint", "conditional-tokens"] }
+cdk-common = { workspace = true, features = ["mint", "conditional-tokens"] }
+cdk-postgres = { workspace = true, features = ["conditional-tokens"] }
 cdk = { workspace = true, features = ["test-utils"] }
 cdk-fake-wallet = { workspace = true }
 cdk-sqlite = { workspace = true, features = ["mint"] }

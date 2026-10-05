@@ -328,7 +328,10 @@ where
         .bind("condition_id", condition_id.clone())
         .bind("outcome_collection", outcome_collection.clone())
         .bind("outcome_collection_id", outcome_collection_id.clone())
-        .bind("created_at", created_at as i64)
+        .bind(
+            "created_at",
+            super::conditions::checked_sql_integer(created_at)?,
+        )
         .execute(&*conn)
         .await?;
 
@@ -340,7 +343,7 @@ where
         &self,
     ) -> Result<Vec<MintKeySetInfo>, Self::Err> {
         Ok(self
-            .query_conditional_keysets(None, None, None)
+            .query_conditional_keysets(None, None, None, None)
             .await?
             .into_iter()
             .map(|(info, _)| info)
