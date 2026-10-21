@@ -1682,13 +1682,6 @@ listen_por = 8085
         assert!(!message.contains("info.signatory_url"));
     }
 
-    fn config_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        // Share the single process-wide env lock with the rest of the crate's
-        // tests. `std::env` is global, so config.rs and lib.rs tests must
-        // serialize on the *same* mutex or they race over env vars.
-        crate::test_utils::env_lock()
-    }
-
     #[cfg(feature = "management-rpc")]
     #[test]
     fn strict_management_rpc_requires_expected_dns_name() {

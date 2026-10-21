@@ -508,3 +508,53 @@ where
         "conditions should be sorted ascending by created_at"
     );
 }
+
+/// Conditional keysets share the epoch and rollback boundary with condition writes.
+pub async fn conditional_keyset_epoch_transaction<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let condition = test_condition(&"ab".repeat(32));
+    let id = Id::from_str("009a1f293253e41e").unwrap();
+    let info = test_conditional_keyset_info(id, &condition.condition_id, "YES", &"cd".repeat(32));
+    let before = db.keysets_epoch().await.unwrap();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.acquire_conditional_keyset_write_lock().await.unwrap();
+    tx.add_condition(condition.clone()).await.unwrap();
+    tx.add_conditional_keyset(info.clone(), 1).await.unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(before, db.keysets_epoch().await.unwrap());
+    assert!(db
+        .get_condition(&condition.condition_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .get_all_conditional_mint_keyset_infos()
+        .await
+        .unwrap()
+        .is_empty());
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.acquire_conditional_keyset_write_lock().await.unwrap();
+    tx.add_condition(condition).await.unwrap();
+    tx.add_conditional_keyset(info.clone(), 1).await.unwrap();
+    tx.commit().await.unwrap();
+    let committed = db.keysets_epoch().await.unwrap();
+    assert_eq!(committed, before + 1);
+    let mut keys = KeysDatabase::begin_transaction(&db).await.unwrap();
+    assert!(keys.get_keyset_infos().await.unwrap().is_empty());
+    assert_eq!(
+        keys.get_all_conditional_mint_keyset_infos().await.unwrap()[0].id,
+        id
+    );
+    keys.commit().await.unwrap();
+
+    let mut inactive = info;
+    inactive.active = false;
+    KeysDatabase::add_conditional_keyset(&db, inactive, 1)
+        .await
+        .unwrap();
+    assert_eq!(db.keysets_epoch().await.unwrap(), committed + 1);
+    assert!(!db.get_all_conditional_mint_keyset_infos().await.unwrap()[0].active);
+}

@@ -228,6 +228,7 @@ impl Mint {
                 return Err(Error::ConditionAlreadyExists);
             }
 
+            self.refresh_registered_keysets().await?;
             return Ok(RegisterConditionResponse {
                 condition_id,
                 keysets: existing_keysets,
@@ -305,6 +306,7 @@ impl Mint {
             .collect::<HashMap<_, _>>();
 
         let mut tx = self.localstore.begin_transaction().await?;
+        tx.acquire_conditional_keyset_write_lock().await?;
         if let Some(fee_verification) = &fee_verification {
             let operation = cdk_common::mint::Operation::new(
                 uuid::Uuid::new_v4(),
@@ -368,10 +370,7 @@ impl Mint {
         }
         tx.commit().await?;
 
-        let _store = self.keyset_store_lock.lock().await;
-        self.signatory.reload_keysets_from_storage().await?;
-        let new_keysets = self.signatory.keysets().await?;
-        self.keysets.store(new_keysets.keysets.into());
+        self.refresh_registered_keysets().await?;
 
         Ok(RegisterConditionResponse {
             condition_id,
@@ -380,6 +379,16 @@ impl Mint {
                 (!verification.change.is_empty()).then_some(verification.change)
             }),
         })
+    }
+
+    async fn refresh_registered_keysets(&self) -> Result<(), Error> {
+        // No database transaction remains open while the signatory reloads.
+        let _store = self.keyset_store_lock.lock().await;
+        let _lifecycle = self.ctf_keyset_lifecycle.write().await;
+        self.signatory.reload_keysets_from_storage().await?;
+        let latest = self.signatory.keysets().await?;
+        self.keysets.store(latest.keysets.into());
+        Ok(())
     }
 
     async fn required_registration_fee(

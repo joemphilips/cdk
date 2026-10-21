@@ -184,10 +184,12 @@ impl MintBuilder {
         keystore: &(dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync),
         allowed_units: &HashSet<CurrencyUnit>,
     ) -> Result<(), Error> {
+        let mut tx = keystore.begin_transaction().await?;
         #[cfg_attr(not(feature = "conditional-tokens"), allow(unused_mut))]
-        let mut keysets = keystore.get_keyset_infos().await?;
+        let mut keysets = tx.get_keyset_infos().await?;
         #[cfg(feature = "conditional-tokens")]
-        keysets.extend(keystore.get_all_conditional_mint_keyset_infos().await?);
+        keysets.extend(tx.get_all_conditional_mint_keyset_infos().await?);
+        tx.commit().await?;
         if keysets.iter().any(|keyset| {
             keyset.unit != CurrencyUnit::Auth && !allowed_units.contains(&keyset.unit)
         }) {
@@ -1042,7 +1044,11 @@ mod tests {
             .validate_stored_monetary_units(store.as_ref(), &HashSet::from([CurrencyUnit::Msat]))
             .await
             .unwrap();
-        assert!(store.get_keyset_infos().await.unwrap().is_empty());
+        let mut keys = MintKeysDatabase::begin_transaction(store.as_ref())
+            .await
+            .unwrap();
+        assert!(keys.get_keyset_infos().await.unwrap().is_empty());
+        keys.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -1052,13 +1058,21 @@ mod tests {
             .build_with_seed(store.clone(), &seed())
             .await
             .unwrap();
-        let before = store.get_active_keysets().await.unwrap();
+        let mut keys = MintKeysDatabase::begin_transaction(store.as_ref())
+            .await
+            .unwrap();
+        let before = keys.get_active_keysets().await.unwrap();
+        keys.commit().await.unwrap();
         let error = MintBuilder::new(store.clone())
             .validate_stored_monetary_units(store.as_ref(), &HashSet::from([CurrencyUnit::Msat]))
             .await
             .unwrap_err();
         assert!(matches!(error, Error::UnsupportedUnit));
-        assert_eq!(store.get_active_keysets().await.unwrap(), before);
+        let mut keys = MintKeysDatabase::begin_transaction(store.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(keys.get_active_keysets().await.unwrap(), before);
+        keys.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -1079,11 +1093,15 @@ mod tests {
             .validate_stored_monetary_units(store.as_ref(), &HashSet::from([CurrencyUnit::Msat]))
             .await
             .unwrap();
-        assert!(store
+        let mut keys = MintKeysDatabase::begin_transaction(store.as_ref())
+            .await
+            .unwrap();
+        assert!(keys
             .get_active_keysets()
             .await
             .unwrap()
             .contains_key(&CurrencyUnit::Auth));
+        keys.commit().await.unwrap();
     }
 
     #[cfg(feature = "conditional-tokens")]
@@ -1171,7 +1189,11 @@ mod tests {
                     .unwrap(),
                 Some(bytes)
             );
-            assert!(store.get_keyset_infos().await.unwrap().is_empty());
+            let mut keys = MintKeysDatabase::begin_transaction(store.as_ref())
+                .await
+                .unwrap();
+            assert!(keys.get_keyset_infos().await.unwrap().is_empty());
+            keys.commit().await.unwrap();
         }
     }
 

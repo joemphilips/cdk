@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anyhow::{bail, Result};
 use cdk::nuts::CurrencyUnit;
 
-use crate::config::{PaymentBackendType, OnchainBackend, Settings};
+use crate::config::{OnchainBackend, PaymentBackendType, Settings};
 
 pub(crate) fn configured_units(settings: &Settings) -> Result<HashSet<CurrencyUnit>> {
     let mut units = HashSet::new();

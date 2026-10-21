@@ -36,6 +36,7 @@ prometheus = ["cdk/prometheus", "dep:cdk-prometheus", "cdk-sqlite?/prometheus", 
 info-page = ["cdk-axum/info-page"]
 
 [dependencies]
+futures.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true

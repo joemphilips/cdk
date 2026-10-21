@@ -235,7 +235,11 @@ impl DbSignatory {
         let db_active_keysets = tx.get_active_keysets().await?;
         let db_infos = tx.get_keyset_infos().await?;
 
-        self.publish_snapshot(epoch, db_active_keysets, db_infos);
+        #[cfg(feature = "conditional-tokens")]
+        let conditional_infos = tx.get_all_conditional_mint_keyset_infos().await?;
+        #[cfg(not(feature = "conditional-tokens"))]
+        let conditional_infos = Vec::new();
+        self.publish_snapshot(epoch, db_active_keysets, db_infos, conditional_infos)?;
         Ok(())
     }
 
@@ -256,7 +260,8 @@ impl DbSignatory {
         epoch: u64,
         db_active_keysets: HashMap<CurrencyUnit, Id>,
         db_infos: Vec<MintKeySetInfo>,
-    ) {
+        conditional_infos: Vec<MintKeySetInfo>,
+    ) -> Result<(), Error> {
         let current = self.keysets.load();
         let mut by_id = HashMap::with_capacity(db_infos.len());
         let mut active_by_unit = HashMap::new();
@@ -270,6 +275,36 @@ impl DbSignatory {
                 Some((_, keyset)) => keyset.clone(),
                 None => self.generate_keyset(&info),
             };
+            if by_id.insert(id, (info, keyset)).is_some() {
+                return Err(Error::Custom("Duplicate keyset ID in storage".to_owned()));
+            }
+        }
+
+        for info in conditional_infos {
+            #[cfg(feature = "conditional-tokens")]
+            if info.condition_id.as_ref().is_none_or(String::is_empty)
+                || info
+                    .outcome_collection
+                    .as_ref()
+                    .is_none_or(String::is_empty)
+                || info
+                    .outcome_collection_id
+                    .as_ref()
+                    .is_none_or(String::is_empty)
+            {
+                return Err(Error::Custom(
+                    "Incomplete conditional keyset metadata".to_owned(),
+                ));
+            }
+            let id = info.id;
+            if by_id.contains_key(&id) {
+                return Err(Error::Custom("Duplicate keyset ID in storage".to_owned()));
+            }
+            let keyset = match current.by_id.get(&id) {
+                Some((_, keyset)) => keyset.clone(),
+                None => self.generate_keyset(&info),
+            };
+            // Conditional activity belongs to the collection, not the unit pointer.
             by_id.insert(id, (info, keyset));
         }
 
@@ -283,7 +318,7 @@ impl DbSignatory {
             let current = self.keysets.load();
             if current.epoch.is_some_and(|cur| epoch <= cur) {
                 // A concurrent reload already published an equal-or-newer view.
-                return;
+                return Ok(());
             }
             let prev = self.keysets.compare_and_swap(&current, snapshot.clone());
             if Arc::ptr_eq(&prev, &current) {
@@ -293,6 +328,7 @@ impl DbSignatory {
             // and CAS. Retry to re-check its epoch against ours.
         }
         self.publish_latest();
+        Ok(())
     }
 
     /// Publish the latest stored keyset snapshot to watch subscribers.
@@ -531,7 +567,7 @@ impl Signatory for DbSignatory {
 
     #[cfg(feature = "conditional-tokens")]
     async fn reload_keysets_from_storage(&self) -> Result<(), Error> {
-        self.reload_keys_from_db().await
+        self.load_keys_from_db().await
     }
 }
 
@@ -805,7 +841,9 @@ mod test {
 
         let new_expiry = Some(unix_time() + 9_000);
         info.final_expiry = new_expiry;
-        signatory.publish_snapshot(epoch + 1, active, vec![info]);
+        signatory
+            .publish_snapshot(epoch + 1, active, vec![info], Vec::new())
+            .expect("snapshot");
 
         let published = signatory
             .keysets_snapshot()
@@ -1641,5 +1679,142 @@ mod test {
             pubkey,
             "025b6c1ca8bb741a6f2321c953266df7bf3f3f2c3be8c54c0a6e41bb00976046a4".to_string()
         );
+    }
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn conditional_epoch_reload_preserves_regular_authority_and_history() {
+        use crate::signatory::PrepareConditionalKeysetArguments;
+        use cdk_common::database::mint::ConditionsDatabase;
+        let store = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+        let seed = [37; 32];
+        let signer = DbSignatory::new(store.clone(), &seed, Default::default(), Default::default())
+            .await
+            .unwrap();
+        let regular = signer
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1, 2, 4],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version01,
+                final_expiry: None,
+            })
+            .await
+            .unwrap();
+        let condition = "ab".repeat(32);
+        store
+            .add_condition(cdk_common::mint::StoredCondition {
+                condition_id: condition.clone(),
+                threshold: 1,
+                tags_json: "[]".to_string(),
+                announcements_json: "[\"deadbeef\"]".to_string(),
+                collateral: Some(CurrencyUnit::Sat),
+                attestation_status: "pending".to_string(),
+                winning_outcome: None,
+                attested_at: None,
+                oracle_sigs: None,
+                created_at: 1,
+                condition_type: "enum".to_string(),
+                lo_bound: None,
+                hi_bound: None,
+                precision: None,
+            })
+            .await
+            .unwrap();
+        let before = store.keysets_epoch().await.unwrap();
+        let prepared = signer
+            .prepare_conditional_keyset(PrepareConditionalKeysetArguments {
+                unit: CurrencyUnit::Sat,
+                condition_id: condition,
+                outcome_collection: "YES".to_string(),
+                outcome_collection_id: "cd".repeat(32),
+                amounts: vec![1, 2, 4],
+                input_fee_ppk: 1,
+                final_expiry: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.keysets_epoch().await.unwrap(),
+            before,
+            "preparation has no writes"
+        );
+        store
+            .add_conditional_keyset(prepared.info.clone(), 1)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), signer.reload_keysets_from_storage())
+            .await
+            .expect("single-connection reload")
+            .unwrap();
+        let snapshot = signer.keysets.load();
+        assert_eq!(
+            snapshot.active_by_unit.get(&CurrencyUnit::Sat),
+            Some(&regular.id)
+        );
+        assert!(snapshot.by_id.get(&prepared.info.id).unwrap().0.active);
+        drop(snapshot);
+        let mut inactive = prepared.info.clone();
+        inactive.active = false;
+        store.add_conditional_keyset(inactive, 1).await.unwrap();
+        signer.reload_keysets_from_storage().await.unwrap();
+        assert!(
+            !signer
+                .keysets
+                .load()
+                .by_id
+                .get(&prepared.info.id)
+                .unwrap()
+                .0
+                .active
+        );
+        let restarted =
+            DbSignatory::new(store.clone(), &seed, Default::default(), Default::default())
+                .await
+                .unwrap();
+        let original = signer
+            .keysets()
+            .await
+            .unwrap()
+            .keysets
+            .into_iter()
+            .find(|row| row.id == prepared.info.id)
+            .unwrap();
+        let restored = restarted
+            .keysets()
+            .await
+            .unwrap()
+            .keysets
+            .into_iter()
+            .find(|row| row.id == prepared.info.id)
+            .unwrap();
+        assert_eq!(original.keys, restored.keys);
+        assert_eq!(original.id, restored.id);
+        assert!(!restored.active);
+
+        let epoch = store.keysets_epoch().await.unwrap();
+        let regular_info = signer
+            .keysets
+            .load()
+            .by_id
+            .get(&regular.id)
+            .unwrap()
+            .0
+            .clone();
+        let mut duplicate = prepared.info.clone();
+        duplicate.id = regular.id;
+        assert!(signer
+            .publish_snapshot(
+                epoch + 1,
+                HashMap::from([(CurrencyUnit::Sat, regular.id)]),
+                vec![regular_info],
+                vec![duplicate]
+            )
+            .is_err());
+        let mut incomplete = prepared.info;
+        incomplete.outcome_collection = None;
+        assert!(signer
+            .publish_snapshot(epoch + 1, HashMap::new(), Vec::new(), vec![incomplete])
+            .is_err());
+        assert_eq!(signer.keysets.load().epoch, Some(epoch));
     }
 }

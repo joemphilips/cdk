@@ -372,7 +372,11 @@ async fn test_condition_keyset_fees_restart_uses_regular_authority_in_either_ord
                 .unwrap();
             let (_, conditional) = register_test_condition(&mint, &["YES", "NO"], None).await;
             rotate_test_regular_fee(&mint, CurrencyUnit::Sat, 1).await;
-            let before = db.get_keyset_infos().await.unwrap();
+            let mut keys = MintKeysDatabase::begin_transaction(db.as_ref())
+                .await
+                .unwrap();
+            let before = keys.get_keyset_infos().await.unwrap();
+            keys.commit().await.unwrap();
             let current_regular = get_regular_keyset_id_for_unit(&mint, &CurrencyUnit::Sat);
             let signatory = mint.signatory.clone();
             mint.stop().await.unwrap();
@@ -393,7 +397,11 @@ async fn test_condition_keyset_fees_restart_uses_regular_authority_in_either_ord
                 }))
                 .await
                 .unwrap();
-            let after = db.get_keyset_infos().await.unwrap();
+            let mut keys = MintKeysDatabase::begin_transaction(db.as_ref())
+                .await
+                .unwrap();
+            let after = keys.get_keyset_infos().await.unwrap();
+            keys.commit().await.unwrap();
             let regular = get_regular_keyset_id_for_unit(&restarted, &CurrencyUnit::Sat);
             assert_eq!(
                 restarted.get_keyset_info(&regular).unwrap().input_fee_ppk,
@@ -725,6 +733,15 @@ async fn standard_settlement_fixture_for_coordinator(
     now: u64,
     coordinator: Option<&str>,
 ) -> StandardSettlementFixture {
+    standard_settlement_fixture_for_event(mint, now, coordinator, "test-event").await
+}
+
+async fn standard_settlement_fixture_for_event(
+    mint: &Mint,
+    now: u64,
+    coordinator: Option<&str>,
+    event: &str,
+) -> StandardSettlementFixture {
     let regular_keyset = get_regular_keyset_id(mint);
     let alice_source = mint_test_proofs_for_unit(mint, Amount::from(9), CurrencyUnit::Sat)
         .await
@@ -732,8 +749,12 @@ async fn standard_settlement_fixture_for_coordinator(
     let bob_source = mint_test_proofs_for_unit(mint, Amount::from(9), CurrencyUnit::Sat)
         .await
         .unwrap();
-    let (condition_id, keysets) =
-        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+    let (_, announcement) = create_test_announcement(&create_test_oracle(), &["YES", "NO"], event);
+    let mut request = enum_condition_request("Test condition", vec![announcement]);
+    request.collateral = Some(CurrencyUnit::Sat.to_string());
+    let registered = mint.register_condition(request).await.unwrap();
+    let condition_id = registered.condition_id;
+    let keysets = registered.keysets;
     let yes_keyset = *keysets.get("YES").unwrap();
     let no_keyset = *keysets.get("NO").unwrap();
     let (yes_outputs, _) = create_premint(mint, yes_keyset, Amount::from(15));
@@ -1276,7 +1297,7 @@ fn create_p2pk_premint(
     let conditions = Conditions::new(
         None,
         Some(vec![buyer_key.public_key()]),
-        Some(vec![seller_key.public_key()]),
+        None,
         Some(2),
         Some(SigFlag::SigInputs),
         None,
@@ -7249,3 +7270,328 @@ async fn test_redeem_requires_individual_spend_authorization() {
 }
 
 mod oracle_evidence_tests;
+
+struct RegistrationReloadGate {
+    inner: Arc<dyn cdk_signatory::signatory::Signatory + Send + Sync>,
+    mode: std::sync::atomic::AtomicU8,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl cdk_signatory::signatory::Signatory for RegistrationReloadGate {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+    async fn blind_sign(
+        &self,
+        messages: Vec<cdk_common::BlindedMessage>,
+    ) -> Result<Vec<cdk_common::BlindSignature>, Error> {
+        self.inner.blind_sign(messages).await
+    }
+    async fn verify_proofs(&self, proofs: cdk_common::Proofs) -> Result<(), Error> {
+        self.inner.verify_proofs(proofs).await
+    }
+    async fn keysets(&self) -> Result<cdk_signatory::signatory::SignatoryKeysets, Error> {
+        self.inner.keysets().await
+    }
+    async fn subscribe_keysets(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<cdk_signatory::signatory::SignatoryKeysets>, Error>
+    {
+        self.inner.subscribe_keysets().await
+    }
+    async fn rotate_keyset(
+        &self,
+        args: cdk_signatory::signatory::RotateKeyArguments,
+    ) -> Result<cdk_signatory::signatory::SignatoryKeySet, Error> {
+        if self
+            .mode
+            .compare_exchange(
+                4,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.rotate_keyset(args).await
+    }
+    async fn prepare_conditional_keyset(
+        &self,
+        args: cdk_signatory::signatory::PrepareConditionalKeysetArguments,
+    ) -> Result<cdk_signatory::signatory::PreparedConditionalKeySet, Error> {
+        let prepared = self.inner.prepare_conditional_keyset(args).await?;
+        if self
+            .mode
+            .compare_exchange(
+                3,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(prepared)
+    }
+    async fn reload_keysets_from_storage(&self) -> Result<(), Error> {
+        match self.mode.swap(0, std::sync::atomic::Ordering::SeqCst) {
+            1 => {
+                return Err(Error::Custom(
+                    "injected post-commit reload failure".to_string(),
+                ))
+            }
+            2 => {
+                self.entered.notify_one();
+                std::future::pending::<()>().await;
+            }
+            _ => {}
+        }
+        self.inner.reload_keysets_from_storage().await
+    }
+}
+
+#[tokio::test]
+async fn test_registration_retry_recovers_post_commit_reload_failure_and_cancellation() {
+    for mode in [1, 2] {
+        let mut mint = create_test_mint().await.unwrap();
+        let mut info = mint.mint_info().await.unwrap();
+        info.nuts.nut_ctf = Some(NutCtfSettings {
+            registration_fees: vec![registration_fee_setting(CurrencyUnit::Sat, 2, 3)],
+            ..Default::default()
+        });
+        mint.set_mint_info(info).await.unwrap();
+        let fee = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+        let ys = fee.ys().unwrap();
+        let (_, announcement) = create_test_announcement(
+            &create_test_oracle(),
+            &["YES", "NO"],
+            &format!("reload-recovery-{mode}"),
+        );
+        let mut request = enum_condition_request("reload recovery", vec![announcement]);
+        request.fee = Some(fee);
+        let gate = Arc::new(RegistrationReloadGate {
+            inner: mint.signatory.clone(),
+            mode: std::sync::atomic::AtomicU8::new(mode),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        mint.signatory = gate.clone();
+        if mode == 1 {
+            let error = mint.register_condition(request.clone()).await.unwrap_err();
+            assert!(error.to_string().contains("injected post-commit"));
+        } else {
+            timeout(Duration::from_secs(5), async {
+                let registration = mint.register_condition(request.clone());
+                tokio::pin!(registration);
+                tokio::select! {
+                    result = &mut registration => panic!("registration did not stop at reload: {result:?}"),
+                    _ = gate.entered.notified() => {}
+                }
+                // Dropping the future cancels after durable commit and before reload.
+            }).await.expect("post-commit cancellation barrier");
+        }
+        assert!(mint
+            .localstore()
+            .get_proofs_states(&ys)
+            .await
+            .unwrap()
+            .iter()
+            .all(|state| *state == Some(State::Spent)));
+        let recovered = timeout(Duration::from_secs(5), mint.register_condition(request))
+            .await
+            .expect("retry timeout")
+            .unwrap();
+        assert_eq!(recovered.keysets.len(), 2);
+        assert!(recovered.change.is_none());
+        for id in recovered.keysets.values() {
+            assert!(mint.keysets.load().iter().any(|keyset| keyset.id == *id));
+            let (outputs, _) = create_premint(&mint, *id, Amount::from(1));
+            assert_eq!(mint.signatory.blind_sign(outputs).await.unwrap().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in PG_DB_URL"]
+async fn test_postgres_registration_and_regular_rotation_preserve_both_changes() {
+    let url = std::env::var("PG_DB_URL").expect("isolated PostgreSQL test database");
+    let url = format!("{url} schema=ctf_port_{}", uuid::Uuid::new_v4().simple());
+    let db = Arc::new(
+        cdk_postgres::MintPgDatabase::new(url.as_str())
+            .await
+            .unwrap(),
+    );
+    let mut mint = build_test_mint_with_units(db.clone(), &[31; 32], &[(CurrencyUnit::Sat, 0)])
+        .await
+        .unwrap();
+    let gate = Arc::new(RegistrationReloadGate {
+        inner: mint.signatory.clone(),
+        mode: std::sync::atomic::AtomicU8::new(3),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    mint.signatory = gate.clone();
+    let (_, announcement) = create_test_announcement(
+        &create_test_oracle(),
+        &["YES", "NO"],
+        "rotation-registration",
+    );
+    let request = enum_condition_request("rotation registration", vec![announcement]);
+    let registration_mint = mint.clone();
+    let registration =
+        tokio::spawn(async move { registration_mint.register_condition(request).await });
+    timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("preparation barrier");
+    // Preparation must not hold the global database keyset lock. Rotation uses
+    // another pooled connection and must finish before preparation is released.
+    let rotated = timeout(
+        Duration::from_secs(5),
+        mint.rotate_keyset(CurrencyUnit::Sat, vec![1, 2, 4, 8], 0, true, None),
+    )
+    .await
+    .expect("rotation must not deadlock behind preparation")
+    .unwrap();
+    gate.release.notify_one();
+    let registered = timeout(Duration::from_secs(5), registration)
+        .await
+        .expect("registration must finish after rotation")
+        .unwrap()
+        .unwrap();
+    let snapshot = mint.keysets.load();
+    assert!(snapshot
+        .iter()
+        .any(|keyset| keyset.id == rotated.id && keyset.active));
+    for id in registered.keysets.values() {
+        assert!(snapshot
+            .iter()
+            .any(|keyset| keyset.id == *id && keyset.active));
+    }
+    drop(snapshot);
+    let mut keys = MintKeysDatabase::begin_transaction(db.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(
+        keys.get_active_keysets()
+            .await
+            .unwrap()
+            .get(&CurrencyUnit::Sat),
+        Some(&rotated.id)
+    );
+    assert_eq!(
+        keys.get_all_conditional_mint_keyset_infos()
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    keys.commit().await.unwrap();
+    mint.stop().await.unwrap();
+}
+
+async fn independent_settlements_overlap(mint: Mint) {
+    let now = unix_time();
+    let first = standard_settlement_fixture_for_event(&mint, now, None, "parallel-first").await;
+    let second = standard_settlement_fixture_for_event(&mint, now, None, "parallel-second").await;
+    assert_ne!(first.request.condition_id, second.request.condition_id);
+    let (reached, release) = mint.arm_atomic_ctf_test_pause().await;
+    let first_mint = mint.clone();
+    let first_task = tokio::spawn(async move {
+        first_mint
+            .process_ctf_settlement(&first.request, settlement_settings(), now)
+            .await
+    });
+    timeout(Duration::from_secs(5), reached)
+        .await
+        .expect("first settlement barrier")
+        .unwrap();
+    // Queue no writer here. A second reader must complete while the first
+    // reader is paused before opening its persistence transaction.
+    timeout(
+        Duration::from_secs(5),
+        mint.process_ctf_settlement(&second.request, settlement_settings(), now),
+    )
+    .await
+    .expect("independent settlement must not wait for another market")
+    .unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(5), first_task)
+        .await
+        .expect("first settlement completion")
+        .unwrap()
+        .unwrap();
+    mint.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_independent_condition_settlements_overlap() {
+    independent_settlements_overlap(
+        create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+            .await
+            .unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in PG_DB_URL"]
+async fn test_postgres_independent_condition_settlements_overlap() {
+    let url = std::env::var("PG_DB_URL").expect("isolated PostgreSQL test database");
+    let url = format!(
+        "{url} schema=ctf_parallel_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let db = Arc::new(
+        cdk_postgres::MintPgDatabase::new(url.as_str())
+            .await
+            .unwrap(),
+    );
+    let mint = build_test_mint_with_units(db, &[32; 32], &[(CurrencyUnit::Sat, 1)])
+        .await
+        .unwrap();
+    independent_settlements_overlap(mint).await;
+}
+
+#[tokio::test]
+async fn test_cancelled_enqueued_rotation_retains_lifecycle_lease() {
+    let mut mint = create_test_mint().await.unwrap();
+    let gate = Arc::new(RegistrationReloadGate {
+        inner: mint.signatory.clone(),
+        mode: std::sync::atomic::AtomicU8::new(4),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    mint.signatory = Arc::new(cdk_signatory::embedded::Service::new(gate.clone()));
+    let old_id = get_regular_keyset_id(&mint);
+    let rotating_mint = mint.clone();
+    let rotation = tokio::spawn(async move {
+        rotating_mint
+            .rotate_keyset(CurrencyUnit::Sat, vec![1, 2, 4, 8], 0, true, None)
+            .await
+    });
+    timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("embedded rotation entered");
+    rotation.abort();
+    assert!(rotation.await.unwrap_err().is_cancelled());
+    let reader_blocked = mint.ctf_keyset_lifecycle.try_read().is_err();
+    gate.release.notify_one();
+    assert!(
+        reader_blocked,
+        "caller cancellation must not release the lease while embedded rotation continues"
+    );
+    timeout(Duration::from_secs(5), async {
+        let _lease = mint.ctf_keyset_lifecycle.read().await;
+        assert_ne!(get_regular_keyset_id(&mint), old_id);
+    })
+    .await
+    .expect("cancelled rotation must finish and publish");
+    mint.stop().await.unwrap();
+}

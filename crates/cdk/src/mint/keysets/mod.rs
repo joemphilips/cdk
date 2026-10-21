@@ -104,29 +104,47 @@ impl Mint {
         use_keyset_v2: bool,
         final_expiry: Option<u64>,
     ) -> Result<MintKeySetInfo, Error> {
-        let _store = self.keyset_store_lock.lock().await;
-        let result = self
-            .signatory
-            .rotate_keyset(RotateKeyArguments {
-                unit,
-                amounts,
-                input_fee_ppk,
-                keyset_id_type: if use_keyset_v2 {
-                    cdk_common::nut02::KeySetVersion::Version01
-                } else {
-                    cdk_common::nut02::KeySetVersion::Version00
-                },
-                final_expiry,
-            })
-            .await?;
+        // Acquire in the caller. Cancellation while waiting remains a no-op,
+        // and waiting callers do not create detached rotation tasks.
+        let store_guard = self.keyset_store_lock.clone().lock_owned().await;
+        #[cfg(feature = "conditional-tokens")]
+        let lifecycle_guard = self.ctf_keyset_lifecycle.clone().write_owned().await;
+        let mint = self.clone();
+        let completion = async move {
+            let _store = store_guard;
+            #[cfg(feature = "conditional-tokens")]
+            let _lifecycle = lifecycle_guard;
+            let result = mint
+                .signatory
+                .rotate_keyset(RotateKeyArguments {
+                    unit,
+                    amounts,
+                    input_fee_ppk,
+                    keyset_id_type: if use_keyset_v2 {
+                        cdk_common::nut02::KeySetVersion::Version01
+                    } else {
+                        cdk_common::nut02::KeySetVersion::Version00
+                    },
+                    final_expiry,
+                })
+                .await?;
 
-        // Read the freshest snapshot and store it under the shared lock. The
-        // subscription drain task writes the same ArcSwap; serializing the
-        // read-then-store here keeps the last write the newest one, so a
-        // concurrent rotation's snapshot can never be clobbered by a stale read.
-        let new_keyset = self.signatory.keysets().await?;
-        self.keysets.store(new_keyset.keysets.into());
-
-        Ok(result.into())
+            // Read and store the freshest snapshot under both guards. The
+            // subscription publisher uses the same lock order.
+            let new_keyset = mint.signatory.keysets().await?;
+            mint.keysets.store(new_keyset.keysets.into());
+            Ok(result.into())
+        };
+        #[cfg(feature = "conditional-tokens")]
+        {
+            // The embedded signer can finish an enqueued request after its
+            // caller is cancelled. This task retains both guards until the
+            // rotation and snapshot publication finish.
+            tokio::spawn(completion)
+                .await
+                .map_err(|_| Error::Custom("Keyset rotation task did not complete".to_string()))?
+        }
+        #[cfg(not(feature = "conditional-tokens"))]
+        completion.await
     }
 }

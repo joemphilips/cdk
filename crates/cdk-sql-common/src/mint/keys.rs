@@ -261,6 +261,13 @@ where
         read_keyset_infos(&self.inner).await
     }
 
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_all_conditional_mint_keyset_infos(
+        &mut self,
+    ) -> Result<Vec<MintKeySetInfo>, Error> {
+        super::conditions::read_conditional_keyset_infos(&self.inner).await
+    }
+
     async fn keysets_epoch(&mut self) -> Result<u64, Error> {
         read_keysets_epoch(&self.inner).await
     }
@@ -280,7 +287,7 @@ where
     /// does not serialize concurrent reads, so it takes an explicit,
     /// non-standard lock. Dispatched by driver name, the same way migrations
     /// are.
-    async fn lock_keysets(&self) -> Result<(), Error> {
+    pub(super) async fn lock_keysets(&self) -> Result<(), Error> {
         if RM::Connection::name() == "postgres" {
             query(r#"SELECT pg_advisory_xact_lock(hashtext('cdk:keysets'))"#)?
                 .execute(&self.inner)
@@ -298,7 +305,7 @@ where
     /// zero rows if row 0 were ever absent, freezing the epoch at its fallback
     /// and stalling every peer's reload. The insert path makes the row
     /// self-healing.
-    async fn bump_keyset_epoch(&self) -> Result<(), Error> {
+    pub(super) async fn bump_keyset_epoch(&self) -> Result<(), Error> {
         // Qualify the existing value with the table name: on Postgres a bare
         // `epoch` in the update expression is ambiguous between the target row
         // and `excluded`. Matches the upsert style used elsewhere in this crate.
@@ -361,77 +368,9 @@ where
         keyset_info: MintKeySetInfo,
         created_at: u64,
     ) -> Result<(), Self::Err> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Database(Box::new(e)))?;
-
-        let condition_id = keyset_info.condition_id.as_ref().ok_or_else(|| {
-            Error::Internal("add_conditional_keyset: condition_id missing".to_string())
-        })?;
-        let outcome_collection = keyset_info.outcome_collection.as_ref().ok_or_else(|| {
-            Error::Internal("add_conditional_keyset: outcome_collection missing".to_string())
-        })?;
-        let outcome_collection_id =
-            keyset_info.outcome_collection_id.as_ref().ok_or_else(|| {
-                Error::Internal("add_conditional_keyset: outcome_collection_id missing".to_string())
-            })?;
-
-        query(
-            r#"
-            INSERT INTO conditional_keyset (
-                id, unit, active, valid_from, valid_to, derivation_path,
-                derivation_path_index, amounts, input_fee_ppk, issuer_version,
-                condition_id, outcome_collection, outcome_collection_id, created_at
-            ) VALUES (
-                :id, :unit, :active, :valid_from, :valid_to, :derivation_path,
-                :derivation_path_index, :amounts, :input_fee_ppk, :issuer_version,
-                :condition_id, :outcome_collection, :outcome_collection_id, :created_at
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                unit = excluded.unit,
-                active = excluded.active,
-                valid_from = excluded.valid_from,
-                valid_to = excluded.valid_to,
-                derivation_path = excluded.derivation_path,
-                derivation_path_index = excluded.derivation_path_index,
-                amounts = excluded.amounts,
-                input_fee_ppk = excluded.input_fee_ppk,
-                issuer_version = excluded.issuer_version,
-                condition_id = excluded.condition_id,
-                outcome_collection = excluded.outcome_collection,
-                outcome_collection_id = excluded.outcome_collection_id
-            "#,
-        )?
-        .bind("id", keyset_info.id.to_string())
-        .bind("unit", keyset_info.unit.to_string())
-        .bind("active", keyset_info.active)
-        .bind("valid_from", keyset_info.valid_from as i64)
-        .bind("valid_to", keyset_info.final_expiry.map(|v| v as i64))
-        .bind("derivation_path", keyset_info.derivation_path.to_string())
-        .bind("derivation_path_index", keyset_info.derivation_path_index)
-        .bind(
-            "amounts",
-            serde_json::to_string(&keyset_info.amounts)
-                .map_err(|e| Error::Internal(e.to_string()))?,
-        )
-        .bind("input_fee_ppk", keyset_info.input_fee_ppk as i64)
-        .bind(
-            "issuer_version",
-            keyset_info.issuer_version.map(|v| v.to_string()),
-        )
-        .bind("condition_id", condition_id.clone())
-        .bind("outcome_collection", outcome_collection.clone())
-        .bind("outcome_collection_id", outcome_collection_id.clone())
-        .bind(
-            "created_at",
-            super::conditions::checked_sql_integer(created_at)?,
-        )
-        .execute(&*conn)
-        .await?;
-
-        Ok(())
+        let mut tx = cdk_common::database::MintDatabase::begin_transaction(self).await?;
+        tx.add_conditional_keyset(keyset_info, created_at).await?;
+        tx.commit().await
     }
 
     #[cfg(feature = "conditional-tokens")]

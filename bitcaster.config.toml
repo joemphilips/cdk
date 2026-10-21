@@ -1,5 +1,5 @@
-[ln]
-ln_backend = "fakewallet"
+[[payment_backend]]
+backend = "fakewallet"
 unit = "msat"
 min_mint = 1000
 max_mint = 500000000

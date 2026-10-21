@@ -28,5 +28,5 @@ mod server;
 
 /// Protocol version for gRPC Mint RPC communication
 pub use cdk_common::MINT_RPC_PROTOCOL_VERSION as PROTOCOL_VERSION;
-pub use server::{MintMutationGuard, MintMutationGuardError, MintRPCServer};
 pub use peer_policy::{PeerPolicy, PeerPolicyError};
+pub use server::{MintMutationGuard, MintMutationGuardError, MintRPCServer};

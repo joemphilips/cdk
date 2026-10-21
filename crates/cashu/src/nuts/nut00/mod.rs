@@ -715,7 +715,7 @@ mod currency_unit_tests {
         assert_eq!(msat.to_string(), "msat");
 
         let mc = CurrencyUnit::from_str("milli-cent").expect("milli-cent should parse");
-        assert_eq!(mc, CurrencyUnit::Custom("milli-cent".to_string()));
+        assert_eq!(mc, CurrencyUnit::Custom("milli-cent".into()));
         assert_eq!(mc.to_string(), "milli-cent");
     }
 }
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(unit.to_string(), "usd");
 
         let milli_cent = CurrencyUnit::custom(" milli-cent\n");
-        assert_eq!(milli_cent, CurrencyUnit::Custom("milli-cent".to_string()));
+        assert_eq!(milli_cent, CurrencyUnit::Custom("milli-cent".into()));
     }
 
     #[test]

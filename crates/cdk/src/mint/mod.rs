@@ -4,9 +4,9 @@ use std::collections::HashMap;
 #[cfg(feature = "conditional-tokens")]
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
 #[cfg(feature = "conditional-tokens")]
 use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -27,7 +27,9 @@ use cdk_signatory::signatory::{Signatory, SignatoryKeySet, SignatoryKeysets};
 use futures::{Stream, StreamExt};
 use nut21::ProtectedEndpoint;
 use subscription::PubSubManager;
-use tokio::sync::{watch, Mutex, Notify, RwLock};
+#[cfg(feature = "conditional-tokens")]
+use tokio::sync::RwLock;
+use tokio::sync::{watch, Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::instrument;
 
@@ -123,6 +125,10 @@ pub struct Mint {
     /// freshest signatory snapshot, then store it" makes the last write always
     /// the newest one, so a stale snapshot can never overwrite a newer one.
     keyset_store_lock: Arc<Mutex<()>>,
+    /// Shared CTF lifecycle leases pin active keys through settlement commit.
+    /// Writers acquire the publication mutex first, then this exclusive lease.
+    #[cfg(feature = "conditional-tokens")]
+    ctf_keyset_lifecycle: Arc<RwLock<()>>,
     /// Serializes live melt dispatch and reconciliation for each quote within
     /// this mint process.
     ///
@@ -478,6 +484,8 @@ impl Mint {
             auth_localstore,
             keysets: Arc::new(ArcSwap::new(keysets.keysets.into())),
             keyset_store_lock: Arc::new(Mutex::new(())),
+            #[cfg(feature = "conditional-tokens")]
+            ctf_keyset_lifecycle: Arc::new(RwLock::new(())),
             melt_quote_locks: Arc::new(Mutex::new(HashMap::new())),
             task_state: Arc::new(Mutex::new(TaskState {
                 keyset_updates: Some(keyset_updates),
@@ -602,6 +610,8 @@ impl Mint {
             None => match self.signatory.subscribe_keysets().await {
                 Ok(mut rx) => {
                     let _store = self.keyset_store_lock.lock().await;
+                    #[cfg(feature = "conditional-tokens")]
+                    let _lifecycle = self.ctf_keyset_lifecycle.write().await;
                     let current = rx.borrow_and_update().keysets.clone();
                     if !current.is_empty() {
                         self.keysets.store(Arc::new(current));
@@ -618,6 +628,8 @@ impl Mint {
         let keyset_drain_handle = if let Some(mut keyset_updates) = keyset_updates {
             let keysets = self.keysets.clone();
             let keyset_store_lock = Arc::clone(&self.keyset_store_lock);
+            #[cfg(feature = "conditional-tokens")]
+            let ctf_keyset_lifecycle = Arc::clone(&self.ctf_keyset_lifecycle);
             let shutdown = shutdown_notify.clone();
             Some(tokio::spawn(async move {
                 // Register the shutdown waiter once and hold it across
@@ -643,6 +655,8 @@ impl Mint {
                             // concurrent rotate cannot land a stale snapshot after
                             // this newer one.
                             let _store = keyset_store_lock.lock().await;
+                            #[cfg(feature = "conditional-tokens")]
+                            let _lifecycle = ctf_keyset_lifecycle.write().await;
                             let updated =
                                 keyset_updates.borrow_and_update().keysets.clone();
                             if updated.is_empty() {
@@ -2836,5 +2850,49 @@ mod tests {
             "expected ExpiredKeyset error, got: {:?}",
             result
         );
+    }
+    #[cfg(feature = "conditional-tokens")]
+    #[tokio::test]
+    async fn watch_publication_waits_for_ctf_reader_and_then_reads_latest() {
+        let snapshots = rotated_snapshots(3).await;
+        let mock = Arc::new(MockSignatory::new(snapshots[0].clone()));
+        let mint = create_mint_with_signatory(mock.clone()).await;
+        mint.start().await.unwrap();
+        let reader = mint.ctf_keyset_lifecycle.read().await;
+        let before = mint.keysets.load_full();
+        mock.push(snapshots[1].clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if mint.keyset_store_lock.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watch publisher must reach the lifecycle writer wait");
+        assert!(
+            Arc::ptr_eq(&before, &mint.keysets.load_full()),
+            "watch publication changed a pinned snapshot"
+        );
+        let latest_id = active_sat_id(&snapshots[2]);
+        mock.push(snapshots[2].clone());
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if mint
+                    .keysets
+                    .load()
+                    .iter()
+                    .any(|keyset| keyset.id == latest_id && keyset.active)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watch publisher must read the latest snapshot after its lease is granted");
+        mint.stop().await.unwrap();
     }
 }

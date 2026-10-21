@@ -602,6 +602,12 @@ pub(crate) fn validate_settings(settings: &config::Settings) -> Result<()> {
     validate_listen_config(settings)?;
     validate_signing_config(settings)?;
     validate_payment_backend_config(settings)?;
+    monetary_units::configured_units(settings)?;
+    #[cfg(feature = "conditional-tokens")]
+    {
+        validate_ctf_config(settings)?;
+        validated_ctf_settlement(settings)?;
+    }
     validate_onchain_config(settings)?;
     validate_database_config(settings)?;
     validate_auth_config(settings)?;
@@ -876,6 +882,18 @@ fn validate_management_rpc_config(settings: &config::Settings) -> Result<()> {
     #[cfg(feature = "management-rpc")]
     if let Some(rpc_settings) = settings.mint_management_rpc.as_ref() {
         if rpc_settings.enabled {
+            if rpc_settings.strict_tls {
+                if rpc_settings
+                    .tls_dir
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().is_empty())
+                {
+                    bail!("Strict management RPC requires a TLS directory");
+                }
+                // Validate the public peer pin before saving configuration.
+                // Certificate loading remains a startup operation.
+                rpc_settings.build_peer_policy()?;
+            }
             let address = rpc_settings.address.as_deref().unwrap_or("127.0.0.1");
             let port = rpc_settings.port.unwrap_or(8086);
             format!("{address}:{port}")
@@ -1271,16 +1289,7 @@ fn configure_basic_info(
         builder = builder.with_ctf_registration_fees(fees);
     }
     #[cfg(feature = "conditional-tokens")]
-    if let Some(settlement) = &settings.mint_info.ctf_settlement {
-        let settlement = NutCtfSettlementSettings::new(
-            settlement.max_participants,
-            settlement.max_inputs,
-            settlement.max_outputs,
-            settlement.max_request_bytes,
-            settlement.max_expiry_seconds,
-            settlement.max_pool_entries,
-        )
-        .map_err(anyhow::Error::msg)?;
+    if let Some(settlement) = validated_ctf_settlement(settings)? {
         builder = builder
             .with_ctf_settlement_settings(settlement)
             .map_err(anyhow::Error::msg)?;
@@ -1290,6 +1299,46 @@ fn configure_basic_info(
 
     Ok(builder)
 }
+#[cfg(feature = "conditional-tokens")]
+fn validate_ctf_config(settings: &config::Settings) -> Result<()> {
+    if let Some(policy) = settings.mint_info.ctf_default_keyset_creation.as_deref() {
+        if !matches!(policy, "" | "none" | "one-vs-rest" | "all") {
+            bail!("Unsupported mint_info.ctf_default_keyset_creation policy");
+        }
+    }
+    let mut units = std::collections::HashSet::new();
+    if let Some(fees) = &settings.mint_info.ctf_registration_fees {
+        for fee in fees {
+            if !units.insert(&fee.unit) {
+                bail!("Duplicate CTF registration fee unit");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn validated_ctf_settlement(
+    settings: &config::Settings,
+) -> Result<Option<NutCtfSettlementSettings>> {
+    settings
+        .mint_info
+        .ctf_settlement
+        .as_ref()
+        .map(|settlement| {
+            NutCtfSettlementSettings::new(
+                settlement.max_participants,
+                settlement.max_inputs,
+                settlement.max_outputs,
+                settlement.max_request_bytes,
+                settlement.max_expiry_seconds,
+                settlement.max_pool_entries,
+            )
+            .map_err(anyhow::Error::msg)
+        })
+        .transpose()
+}
+
 /// Configures payment backends based on the specified backend types
 async fn configure_payment_backends(
     settings: &config::Settings,
@@ -2022,7 +2071,7 @@ async fn setup_authentication(
 
         Ok((mint_builder, Some(auth_localstore)))
     } else {
-        Ok(mint_builder)
+        Ok((mint_builder, None))
     }
 }
 
@@ -2217,11 +2266,14 @@ impl PreparedMintd {
                     let addr = rpc_settings.address.unwrap_or("127.0.0.1".to_string());
                     let port = rpc_settings.port.unwrap_or(8086);
                     let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(
-                        &addr, port, mint.clone(), monetary_units::configured_units(settings)?
+                        &addr,
+                        port,
+                        mint.clone(),
+                        monetary_units::configured_units(settings)?,
                     )?
-                        .with_mint_quote_payment_override(
-                            rpc_settings.allow_mint_quote_payment_override,
-                        );
+                    .with_mint_quote_payment_override(
+                        rpc_settings.allow_mint_quote_payment_override,
+                    );
                     if let Some(peer_policy) = peer_policy {
                         mint_rpc = mint_rpc.with_peer_policy(peer_policy);
                     }
@@ -2904,6 +2956,16 @@ pub async fn initialize_configuration(
     let database_pubkey = mint_builder.current_mint_info().pubkey;
     let mut keyset_transaction = keystore.begin_transaction().await?;
     let keysets = keyset_transaction.get_keyset_infos().await?;
+    #[cfg(feature = "conditional-tokens")]
+    let keysets = {
+        let mut combined = keysets;
+        combined.extend(
+            keyset_transaction
+                .get_all_conditional_mint_keyset_infos()
+                .await?,
+        );
+        combined
+    };
     keyset_transaction.commit().await?;
     let mut used_keysets = HashSet::new();
     if mode == MintInitializationMode::Existing {
@@ -3737,6 +3799,10 @@ engine = "sqlite"
                 listen_host: "not-an-ip-address".to_string(),
                 ..Default::default()
             },
+            payment_backend: vec![config::PaymentBackend {
+                backend: PaymentBackendType::FakeWallet,
+                ..Default::default()
+            }],
             ..Default::default()
         };
 
@@ -3787,6 +3853,7 @@ engine = "sqlite"
         let mut settings = config::Settings::try_new(Some(path)).unwrap();
         settings.info.mnemonic = Some(TEST_MNEMONIC.to_string());
         settings.info.listen_port = 0;
+        settings.fake_wallet = Some(config::FakeWallet::default());
         let error = run_mintd_with_shutdown(
             &work_dir,
             &settings,
@@ -3798,10 +3865,17 @@ engine = "sqlite"
         .await
         .expect_err("incompatible monetary metadata must stop startup");
 
-        assert!(error
-            .to_string()
-            .contains("Stored mint metadata is incompatible"));
-        assert!(store.get_keyset_infos().await.unwrap().is_empty());
+        assert!(
+            error
+                .to_string()
+                .contains("Stored mint metadata is incompatible"),
+            "unexpected startup error: {error:#}"
+        );
+        let mut keys = MintKeysDatabase::begin_transaction(store.as_ref())
+            .await
+            .unwrap();
+        assert!(keys.get_keyset_infos().await.unwrap().is_empty());
+        keys.commit().await.unwrap();
         assert_eq!(
             store
                 .kv_read("cdk_mint", "config", "mint_info")
@@ -4013,11 +4087,11 @@ backend = "fakewallet"
     #[cfg(feature = "fakewallet")]
     #[tokio::test]
     async fn non_sat_backend_normalization_converts_native_sat_to_msat() {
-        use crate::config::{FakeWallet, Ln, LnBackend};
+        use crate::config::{FakeWallet, PaymentBackend, PaymentBackendType};
 
         let settings = config::Settings {
-            ln: vec![Ln {
-                ln_backend: LnBackend::FakeWallet,
+            payment_backend: vec![PaymentBackend {
+                backend: PaymentBackendType::FakeWallet,
                 unit: CurrencyUnit::Sat,
                 ..Default::default()
             }],
@@ -4754,8 +4828,8 @@ backend = "fakewallet"
     fn operated_config_uses_msat_with_unchanged_economic_limits() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bitcaster.config.toml");
         let settings = config::Settings::try_new(Some(path)).expect("operated config must parse");
-        assert_eq!(settings.ln.len(), 1);
-        let rail = &settings.ln[0];
+        assert_eq!(settings.payment_backend.len(), 1);
+        let rail = &settings.payment_backend[0];
         assert_eq!(rail.unit, cdk::nuts::CurrencyUnit::Msat);
         assert_eq!(rail.min_mint, 1_000.into());
         assert_eq!(rail.max_mint, 500_000_000.into());

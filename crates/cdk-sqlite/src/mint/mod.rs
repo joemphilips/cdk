@@ -20,15 +20,15 @@ mod test {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use cdk_common::database::{self, MintAuthDatabase};
-    use cdk_common::secret::Secret;
-    use cdk_common::{mint_db_test, AuthProof, Id, SecretKey, State};
     #[cfg(feature = "conditional-tokens")]
     use cdk_common::database::mint::{ConditionsDatabase, Database};
+    use cdk_common::database::{self, MintAuthDatabase};
     #[cfg(feature = "conditional-tokens")]
     use cdk_common::mint::StoredCondition;
     #[cfg(feature = "conditional-tokens")]
     use cdk_common::mint_db_conditional_test;
+    use cdk_common::secret::Secret;
+    use cdk_common::{mint_db_test, AuthProof, Id, SecretKey, State};
     use cdk_sql_common::pool::Pool;
     use cdk_sql_common::stmt::query;
 

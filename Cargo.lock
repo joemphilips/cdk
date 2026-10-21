@@ -945,6 +945,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoin-private"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73290177011694f38ec25e165d0387ab7ea749a4b81cd4c80dae5988229f7a57"
+
+[[package]]
 name = "bitcoin-units"
 version = "0.1.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1208,6 +1214,8 @@ dependencies = [
  "bitcoin",
  "cbor-diag",
  "ciborium",
+ "ddk-dlc",
+ "ddk-messages",
  "lightning",
  "lightning-invoice",
  "nostr-sdk 0.44.1",
@@ -1676,6 +1684,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bip39",
+ "bitcoin",
  "cdk",
  "cdk-common",
  "cdk-fake-wallet",
@@ -1685,7 +1694,9 @@ dependencies = [
  "home",
  "prost 0.14.4",
  "rustls",
+ "rustls-webpki",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tonic 0.14.6",
@@ -1721,6 +1732,7 @@ dependencies = [
  "cdk-sqlite",
  "clap",
  "config",
+ "futures",
  "home",
  "serde",
  "serde_ignored",
@@ -1795,6 +1807,7 @@ name = "cdk-postgres"
 version = "0.18.2"
 dependencies = [
  "async-trait",
+ "bitcoin",
  "cdk-common",
  "cdk-sql-common",
  "futures-util",
@@ -1802,6 +1815,7 @@ dependencies = [
  "paste",
  "percent-encoding",
  "postgres-native-tls",
+ "serde_json",
  "tokio",
  "tokio-postgres",
  "uuid",
@@ -2613,6 +2627,30 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "ddk-dlc"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c44c6ac219a34a0e9b7d2418453ae815965e1159142d7e88ba6fdc6cc9ac29fc"
+dependencies = [
+ "bitcoin",
+ "miniscript",
+ "secp256k1-sys",
+ "secp256k1-zkp",
+]
+
+[[package]]
+name = "ddk-messages"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3663e44b26827cc955399e1dfe72858f9112308a57a78d527cd6f0f17c2b9d16"
+dependencies = [
+ "bitcoin",
+ "ddk-dlc",
+ "lightning",
+ "secp256k1-zkp",
+]
 
 [[package]]
 name = "defmt"
@@ -7053,6 +7091,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "secp256k1-zkp"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "403f6ab6ef5189ded7d11cb384a96a9f871001e50b391a8fcbb310c9ebc2099b"
+dependencies = [
+ "bitcoin-private",
+ "rand 0.8.8",
+ "secp256k1 0.29.1",
+ "secp256k1-zkp-sys",
+]
+
+[[package]]
+name = "secp256k1-zkp-sys"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57f08b2d0b143a22e07f798ae4f0ab20d5590d7c68e0d090f2088a48a21d1654"
+dependencies = [
+ "cc",
+ "secp256k1-sys",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9161,6 +9221,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9170,12 +9240,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

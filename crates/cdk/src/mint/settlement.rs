@@ -96,7 +96,7 @@ impl Mint {
         }
         let authorization = validate_range_protocol(inputs, manifest, limits)?;
 
-        let _keyset_snapshot = self.keyset_store_lock.read().await;
+        let _keyset_snapshot = self.ctf_keyset_lifecycle.read().await;
         let condition_id = condition_id.to_string();
         let condition = self.load_pending_condition(&condition_id).await?;
         let resolver = CtfCoverageResolver::new(self, &condition).map_err(coverage_error)?;
@@ -143,7 +143,7 @@ impl Mint {
             return replay_ctf_settlement_result(replay);
         }
 
-        let _keyset_snapshot = self.keyset_store_lock.lock().await;
+        let _keyset_snapshot = self.ctf_keyset_lifecycle.read().await;
         match self
             .prepare_ctf_settlement_for_execution(request, settings, now)
             .await?

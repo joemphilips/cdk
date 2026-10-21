@@ -10,6 +10,7 @@ use cdk_common::nuts::nut_ctf::ConditionalKeySetInfo;
 use cdk_common::nuts::{CurrencyUnit, Id};
 
 use super::{SQLMintDatabase, SQLTransaction};
+use crate::database::DatabaseExecutor;
 use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
 use crate::{column_as_string, unpack_into};
@@ -141,6 +142,22 @@ pub(crate) fn sql_row_to_conditional_mint_keyset_info(
         }
     };
     Ok((info, created_at_val))
+}
+
+pub(super) async fn read_conditional_keyset_infos<EX>(
+    executor: &EX,
+) -> Result<Vec<MintKeySetInfo>, Error>
+where
+    EX: DatabaseExecutor,
+{
+    query(&format!(
+        "SELECT {CONDITIONAL_KEYSET_COLUMNS} FROM conditional_keyset"
+    ))?
+    .fetch_all(executor)
+    .await?
+    .into_iter()
+    .map(|row| sql_row_to_conditional_mint_keyset_info(row).map(|(info, _)| info))
+    .collect()
 }
 
 fn mint_keyset_info_to_conditional_keyset_info(
@@ -390,36 +407,6 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
         insert_condition(&*conn, condition).await
-    }
-
-    async fn delete_condition_registration(&self, condition_id: &str) -> Result<(), Self::Err> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Database(Box::new(e)))?;
-
-        query(
-            r#"
-            DELETE FROM conditional_keyset
-            WHERE condition_id = :condition_id
-            "#,
-        )?
-        .bind("condition_id", condition_id.to_string())
-        .execute(&*conn)
-        .await?;
-
-        query(
-            r#"
-            DELETE FROM conditions
-            WHERE condition_id = :condition_id
-            "#,
-        )?
-        .bind("condition_id", condition_id.to_string())
-        .execute(&*conn)
-        .await?;
-
-        Ok(())
     }
 
     async fn get_condition(
@@ -769,12 +756,18 @@ where
         insert_condition(&self.inner, condition).await
     }
 
+    async fn acquire_conditional_keyset_write_lock(&mut self) -> Result<(), Self::Err> {
+        self.lock_keysets().await
+    }
+
     async fn add_conditional_keyset(
         &mut self,
         keyset_info: MintKeySetInfo,
         created_at: u64,
     ) -> Result<(), Self::Err> {
-        insert_conditional_keyset(&self.inner, keyset_info, created_at).await
+        self.lock_keysets().await?;
+        insert_conditional_keyset(&self.inner, keyset_info, created_at).await?;
+        self.bump_keyset_epoch().await
     }
 }
 

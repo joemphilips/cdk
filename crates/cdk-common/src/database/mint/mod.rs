@@ -173,6 +173,11 @@ pub trait KeysDatabaseTransaction<'a, Error>: DbTransactionFinalizer<Err = Error
     /// through the transaction.
     async fn get_keyset_infos(&mut self) -> Result<Vec<MintKeySetInfo>, Error>;
 
+    /// Read conditional history in this locked keyset transaction.
+    #[cfg(feature = "conditional-tokens")]
+    async fn get_all_conditional_mint_keyset_infos(&mut self)
+        -> Result<Vec<MintKeySetInfo>, Error>;
+
     /// Read the keyset epoch inside the transaction.
     ///
     /// Transaction-scoped counterpart of [`KeysDatabase::keysets_epoch`], used to
@@ -704,6 +709,9 @@ pub trait ConditionsTransaction {
     /// Conditions transaction error
     type Err: Into<Error> + From<Error>;
 
+    /// Acquire the shared keyset writer lock before other registration writes.
+    async fn acquire_conditional_keyset_write_lock(&mut self) -> Result<(), Self::Err>;
+
     /// Get a condition and lock it for update for the lifetime of this transaction.
     async fn get_condition_for_update(
         &mut self,
@@ -739,12 +747,6 @@ pub trait ConditionsDatabase {
 
     /// Add a stored condition
     async fn add_condition(&self, condition: StoredCondition) -> Result<(), Self::Err>;
-
-    /// Delete a condition and any conditional keysets created for the same registration attempt.
-    ///
-    /// Used to clean up partial condition registration failures so one-shot
-    /// condition registration cannot strand an unrepairable condition row.
-    async fn delete_condition_registration(&self, condition_id: &str) -> Result<(), Self::Err>;
 
     /// Get a condition by condition_id
     async fn get_condition(&self, condition_id: &str)

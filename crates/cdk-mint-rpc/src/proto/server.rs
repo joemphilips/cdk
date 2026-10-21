@@ -295,24 +295,15 @@ impl MintRPCServer {
                     ))
                     .add_service(PaymentMethodServiceServer::with_interceptor(
                         self.clone(),
-                        create_version_check_interceptor(
-                            cdk_common::grpc::VERSION_HEADER,
-                            cdk_common::MINT_RPC_PROTOCOL_VERSION,
-                        ),
+                        interceptor.clone(),
                     ))
                     .add_service(QuoteServiceServer::with_interceptor(
                         self.clone(),
-                        create_version_check_interceptor(
-                            cdk_common::grpc::VERSION_HEADER,
-                            cdk_common::MINT_RPC_PROTOCOL_VERSION,
-                        ),
+                        interceptor.clone(),
                     ))
                     .add_service(WalletServiceServer::with_interceptor(
                         self.clone(),
-                        create_version_check_interceptor(
-                            cdk_common::grpc::VERSION_HEADER,
-                            cdk_common::MINT_RPC_PROTOCOL_VERSION,
-                        ),
+                        interceptor.clone(),
                     ))
             }
             None => {
@@ -324,28 +315,19 @@ impl MintRPCServer {
                     ))
                     .add_service(KeysetServiceServer::with_interceptor(
                         self.clone(),
-                        interceptor,
+                        interceptor.clone(),
                     ))
                     .add_service(PaymentMethodServiceServer::with_interceptor(
                         self.clone(),
-                        create_version_check_interceptor(
-                            cdk_common::grpc::VERSION_HEADER,
-                            cdk_common::MINT_RPC_PROTOCOL_VERSION,
-                        ),
+                        interceptor.clone(),
                     ))
                     .add_service(QuoteServiceServer::with_interceptor(
                         self.clone(),
-                        create_version_check_interceptor(
-                            cdk_common::grpc::VERSION_HEADER,
-                            cdk_common::MINT_RPC_PROTOCOL_VERSION,
-                        ),
+                        interceptor.clone(),
                     ))
                     .add_service(WalletServiceServer::with_interceptor(
                         self.clone(),
-                        create_version_check_interceptor(
-                            cdk_common::grpc::VERSION_HEADER,
-                            cdk_common::MINT_RPC_PROTOCOL_VERSION,
-                        ),
+                        interceptor.clone(),
                     ))
             }
         };
@@ -1551,16 +1533,16 @@ mod tests {
     use std::time::Duration as StdDuration;
 
     use bip39::Mnemonic;
+    use bitcoin::hashes::{sha256, Hash};
     use cdk::amount::SplitTarget;
+    use cdk::mint::Mint;
     use cdk::mint::{MintBuilder, MintInput, MintMeltLimits};
     use cdk::nuts::{CurrencyUnit, MintRequest, PaymentMethod, PreMintSecrets};
-    use bitcoin::hashes::{sha256, Hash};
-    use cdk::mint::Mint;
     use cdk::types::QuoteTTL;
     use cdk_common::grpc::{VersionInterceptor, VERSION_HEADER};
     use cdk_common::nut00::KnownMethod;
-    use cdk_common::MintQuoteBolt11Request;
     use cdk_common::nuts::Id;
+    use cdk_common::MintQuoteBolt11Request;
     use cdk_fake_wallet::FakeWallet;
     use tempfile::TempDir;
     use tonic::codegen::InterceptedService;
@@ -2164,7 +2146,7 @@ mod tests {
         client_identity: Option<(&Path, &Path)>,
         server_name: &str,
         protocol_version: &str,
-    ) -> Result<(TestCdkClient, TestKeysetClient), tonic::transport::Error> {
+    ) -> Result<(TestCdkClient, TestKeysetClient, Channel), tonic::transport::Error> {
         let ca = Certificate::from_pem(
             fs::read_to_string(&fixtures.ca_pem).expect("read test CA certificate"),
         );
@@ -2191,7 +2173,8 @@ mod tests {
 
         Ok((
             CdkMintClient::with_interceptor(channel.clone(), interceptor.clone()),
-            KeysetServiceClient::with_interceptor(channel, interceptor),
+            KeysetServiceClient::with_interceptor(channel.clone(), interceptor),
+            channel,
         ))
     }
 
@@ -2219,7 +2202,7 @@ mod tests {
         case: PolicyRejectionCase<'_>,
     ) {
         let before = mint_state(mint).await;
-        let (mut cdk_client, mut keyset_client) = connect_test_clients(
+        let (mut cdk_client, mut keyset_client, channel) = connect_test_clients(
             addr,
             fixtures,
             case.client_identity,
@@ -2267,6 +2250,48 @@ mod tests {
             case.case_name
         );
 
+        let interceptor = VersionInterceptor::new(VERSION_HEADER, case.protocol_version);
+        let mut payment = crate::payment_method::payment_method_service_client::PaymentMethodServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let mut quote = crate::quote::quote_service_client::QuoteServiceClient::with_interceptor(
+            channel.clone(),
+            interceptor.clone(),
+        );
+        let mut wallet =
+            crate::wallet::wallet_service_client::WalletServiceClient::with_interceptor(
+                channel,
+                interceptor,
+            );
+        let payment_error = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            payment.update_disabled(Request::new(crate::payment_method::UpdateDisabledRequest {
+                mint_disabled: Some(true),
+                melt_disabled: Some(true),
+            })),
+        )
+        .await
+        .expect("payment RPC timeout")
+        .expect_err("peer policy must cover payment service");
+        assert_eq!(payment_error.code(), case.expected_code);
+        let quote_error = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            quote.update_quote_ttl(Request::new(crate::quote::UpdateQuoteTtlRequest {
+                mint_ttl: Some(1),
+                melt_ttl: Some(1),
+            })),
+        )
+        .await
+        .expect("quote RPC timeout")
+        .expect_err("peer policy must cover quote service");
+        assert_eq!(quote_error.code(), case.expected_code);
+        let wallet_error = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            wallet.get_balance(Request::new(crate::wallet::GetBalanceRequest {})),
+        )
+        .await
+        .expect("wallet RPC timeout")
+        .expect_err("peer policy must cover wallet service");
+        assert_eq!(wallet_error.code(), case.expected_code);
+
         assert_eq!(
             mint_state(mint).await,
             before,
@@ -2296,7 +2321,7 @@ mod tests {
             cdk_common::MINT_RPC_PROTOCOL_VERSION,
         )
         .await;
-        if let Ok((mut cdk_client, mut keyset_client)) = connection {
+        if let Ok((mut cdk_client, mut keyset_client, _channel)) = connection {
             let cdk_result = tokio::time::timeout(
                 StdDuration::from_secs(5),
                 cdk_client.update_tos_url(Request::new(UpdateTosUrlRequest {
@@ -2351,7 +2376,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_real_tls_peer_policy_covers_both_services_and_mutation_rejection() {
+    async fn test_real_tls_peer_policy_covers_all_services_and_mutation_rejection() {
         let fixtures = TlsFixtures::new();
         let policy = PeerPolicy::new("orchard", &fixtures.client_spki_pin).unwrap();
         let mut server = create_test_rpc_server().await.with_peer_policy(policy);
@@ -2367,7 +2392,7 @@ mod tests {
             .expect("start production RPC server with TLS");
         wait_for_server(addr).await;
 
-        let (mut cdk_client, mut keyset_client) = connect_test_clients(
+        let (mut cdk_client, mut keyset_client, _channel) = connect_test_clients(
             addr,
             &fixtures,
             Some((&fixtures.client_pem, &fixtures.client_key)),

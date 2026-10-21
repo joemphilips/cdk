@@ -472,6 +472,7 @@ macro_rules! mint_db_conditional_test {
             get_conditions_since,
             update_condition_attestation,
             add_and_get_conditional_keyset_info,
+            conditional_keyset_epoch_transaction,
             get_conditional_keysets_multiple,
             get_conditional_keyset_infos_preserve_rotated_rows,
             get_conditional_keysets_since_includes_boundary,

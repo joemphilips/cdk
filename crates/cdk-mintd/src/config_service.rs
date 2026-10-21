@@ -618,6 +618,40 @@ fn verify_local_keysets(
             info.final_expiry,
             info.id.get_version(),
         );
+        #[cfg(feature = "conditional-tokens")]
+        if info.condition_id.is_some()
+            || info.outcome_collection.is_some()
+            || info.outcome_collection_id.is_some()
+        {
+            let valid = (|| {
+                use cdk::nuts::nut_ctf::{compute_outcome_collection_id, from_hex, to_hex};
+                let condition = info.condition_id.as_ref()?;
+                let collection = info.outcome_collection.as_ref()?;
+                let stored_collection_id = info.outcome_collection_id.as_ref()?;
+                let condition_bytes: [u8; 32] = from_hex(condition).ok()?.try_into().ok()?;
+                let computed_collection_id =
+                    compute_outcome_collection_id(&[0; 32], &condition_bytes, collection).ok()?;
+                if to_hex(&computed_collection_id) != *stored_collection_id {
+                    return None;
+                }
+                let keys: cdk::nuts::Keys = derived.keys.clone().into();
+                let id = cdk::nuts::Id::v2_from_data_conditional(
+                    &keys,
+                    &info.unit,
+                    info.input_fee_ppk,
+                    info.final_expiry,
+                    condition,
+                    stored_collection_id,
+                );
+                (id == info.id).then_some(())
+            })();
+            if valid.is_none() {
+                return Err(ConfigurationServiceError::HistoricalKeysetMismatch {
+                    keyset_id: info.id,
+                });
+            }
+            continue;
+        }
         cdk::nuts::KeySet {
             id: info.id,
             unit: info.unit.clone(),
@@ -1415,6 +1449,12 @@ url = "postgresql://operator:plaintext-secret@localhost/cdk"
             input_fee_ppk: 0,
             final_expiry: None,
             issuer_version: None,
+            #[cfg(feature = "conditional-tokens")]
+            condition_id: None,
+            #[cfg(feature = "conditional-tokens")]
+            outcome_collection: None,
+            #[cfg(feature = "conditional-tokens")]
+            outcome_collection_id: None,
         }]
     }
 
@@ -1990,6 +2030,12 @@ engine = "sqlite"
             input_fee_ppk: 0,
             final_expiry: None,
             issuer_version: None,
+            #[cfg(feature = "conditional-tokens")]
+            condition_id: None,
+            #[cfg(feature = "conditional-tokens")]
+            outcome_collection: None,
+            #[cfg(feature = "conditional-tokens")]
+            outcome_collection_id: None,
         };
         let secret = crate::test_utils::unique_temp_path("nutshell_seed");
         std::fs::write(&secret, seed).expect("raw Nutshell seed");
@@ -2037,6 +2083,12 @@ engine = "sqlite"
                 cdk_common::common::IssuerVersion::from_str("nutshell/0.20.3")
                     .expect("Nutshell version"),
             ),
+            #[cfg(feature = "conditional-tokens")]
+            condition_id: None,
+            #[cfg(feature = "conditional-tokens")]
+            outcome_collection: None,
+            #[cfg(feature = "conditional-tokens")]
+            outcome_collection_id: None,
         };
         let used = HashSet::from([id]);
         let derived = cdk::nuts::MintKeySet::generate_from_xpriv(
@@ -2121,6 +2173,12 @@ engine = "sqlite"
                 input_fee_ppk: fee,
                 final_expiry: expiry,
                 issuer_version: None,
+                #[cfg(feature = "conditional-tokens")]
+                condition_id: None,
+                #[cfg(feature = "conditional-tokens")]
+                outcome_collection: None,
+                #[cfg(feature = "conditional-tokens")]
+                outcome_collection_id: None,
             });
             remote_keys.push(cdk_signatory::signatory::SignatoryKeySet::from(&(
                 infos.last().expect("keyset info").clone(),
@@ -2523,5 +2581,97 @@ tls_mode = "disable"
             .expect("stale document remains unapplied"));
 
         let _ = std::fs::remove_file(secret_path);
+    }
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn conditional_history_validates_seed_and_collection_string() {
+        use cdk::nuts::nut_ctf::{compute_outcome_collection_id, to_hex};
+        let seed = [42; 32];
+        let secp = Secp256k1::new();
+        let path = bitcoin::bip32::DerivationPath::from_str("m/101'/1'/2'").unwrap();
+        let derived = cdk::nuts::MintKeySet::generate_from_xpriv(
+            &secp,
+            Xpriv::new_master(Network::Bitcoin, &seed).unwrap(),
+            &[1, 2, 4],
+            cdk::nuts::CurrencyUnit::Msat,
+            path.clone(),
+            1,
+            Some(123456789),
+            cdk::nuts::nut02::KeySetVersion::Version01,
+        );
+        let condition = to_hex(&[11; 32]);
+        let collection = "YES".to_string();
+        let collection_id =
+            to_hex(&compute_outcome_collection_id(&[0; 32], &[11; 32], &collection).unwrap());
+        let keys: cdk::nuts::Keys = derived.keys.into();
+        let id = cdk::nuts::Id::v2_from_data_conditional(
+            &keys,
+            &cdk::nuts::CurrencyUnit::Msat,
+            1,
+            Some(123456789),
+            &condition,
+            &collection_id,
+        );
+        let info = cdk::mint::MintKeySetInfo {
+            id,
+            unit: cdk::nuts::CurrencyUnit::Msat,
+            active: false,
+            valid_from: 1,
+            derivation_path: path,
+            derivation_path_index: None,
+            amounts: vec![1, 2, 4],
+            input_fee_ppk: 1,
+            final_expiry: Some(123456789),
+            issuer_version: None,
+            condition_id: Some(condition),
+            outcome_collection: Some(collection),
+            outcome_collection_id: Some(collection_id),
+        };
+        let used = HashSet::from([id]);
+        verify_local_keysets(&seed, std::slice::from_ref(&info), &used).unwrap();
+        assert!(verify_local_keysets(&[43; 32], std::slice::from_ref(&info), &used).is_err());
+        let mut changed = info.clone();
+        changed.outcome_collection = Some("NO".to_string());
+        assert!(verify_local_keysets(&seed, &[changed], &used).is_err());
+        let mut changed = info.clone();
+        changed.outcome_collection_id = None;
+        assert!(verify_local_keysets(&seed, &[changed], &used).is_err());
+        let mut changed = info.clone();
+        changed.id = derived.id;
+        assert!(verify_local_keysets(&seed, &[changed], &used).is_err());
+        assert!(verify_local_keysets(&seed, &[], &used).is_err());
+    }
+    #[cfg(all(
+        feature = "fakewallet",
+        feature = "conditional-tokens",
+        feature = "management-rpc"
+    ))]
+    #[test]
+    fn configuration_rejects_invalid_ctf_and_strict_management_before_persistence() {
+        let mnemonic_path = crate::test_utils::unique_temp_path("validate_fork_config_mnemonic");
+        std::fs::write(&mnemonic_path, TEST_MNEMONIC_ONE).unwrap();
+        let valid = document(
+            &format!("file:{}", mnemonic_path.display()),
+            "fork config validation",
+        );
+        ConfigurationService::validate_document(&valid).unwrap();
+        for (field, expected) in [
+            ("ctf_default_keyset_creation = \"bad-policy\"", "Unsupported mint_info.ctf_default_keyset_creation"),
+            ("ctf_registration_fees = [{unit=\"sat\", registration_fee_base=1, registration_fee_per_keyset=1}, {unit=\"sat\", registration_fee_base=2, registration_fee_per_keyset=2}]", "Duplicate CTF registration fee unit"),
+        ] {
+            let invalid = valid.replace("[mint_info]", &format!("[mint_info]\n{field}"));
+            let error = ConfigurationService::validate_document(&invalid).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        for (fields, expected) in [
+            ("", "Strict management RPC requires a TLS directory"),
+            ("tls_dir = \"/not-loaded-at-validation\"", "expected client DNS SAN"),
+            ("tls_dir = \"/not-loaded-at-validation\"\nexpected_client_dns_name = \"client.example\"", "SPKI pin file path"),
+        ] {
+            let invalid = format!("{valid}\n[mint_management_rpc]\nenabled = true\nstrict_tls = true\n{fields}\n");
+            let error = ConfigurationService::validate_document(&invalid).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        std::fs::remove_file(mnemonic_path).unwrap();
     }
 }
