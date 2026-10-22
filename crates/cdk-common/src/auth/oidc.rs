@@ -411,6 +411,9 @@ impl OidcClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use serde_json::json;
 
     use super::*;
@@ -485,5 +488,218 @@ mod tests {
             validate_client_id_claims(&claims, "expected-client"),
             Err(Error::InvalidClientId)
         ));
+    }
+
+    #[derive(Debug)]
+    struct StaticOidcTransport {
+        jwks: String,
+    }
+
+    #[async_trait]
+    impl OidcHttpTransport for StaticOidcTransport {
+        async fn get(&self, url: &str) -> Result<OidcHttpResponse, HttpError> {
+            let body = if url == "https://issuer.example/.well-known/openid-configuration" {
+                r#"{"issuer":"https://issuer.example/","jwks_uri":"https://issuer.example/keys","token_endpoint":"https://issuer.example/token","device_authorization_endpoint":"https://issuer.example/device"}"#.to_owned()
+            } else if url == "https://issuer.example/keys" {
+                self.jwks.clone()
+            } else {
+                return Err(HttpError::Other(format!("unexpected URL: {url}")));
+            };
+            Ok(OidcHttpResponse::new(200, body.into_bytes()))
+        }
+
+        async fn post_form(
+            &self,
+            _url: &str,
+            _params: Vec<(String, String)>,
+        ) -> Result<OidcHttpResponse, HttpError> {
+            Err(HttpError::Other("unexpected POST".to_owned()))
+        }
+    }
+
+    fn fixture_keys() -> serde_json::Value {
+        serde_json::from_str(include_str!("fixtures/oidc_test_keys.json"))
+            .expect("test signing keys should be valid JSON")
+    }
+
+    fn test_client(jwks: serde_json::Value, client_id: Option<&str>) -> OidcClient {
+        OidcClient::with_transport(
+            "https://issuer.example/.well-known/openid-configuration".to_owned(),
+            client_id.map(str::to_owned),
+            Arc::new(StaticOidcTransport {
+                jwks: jwks.to_string(),
+            }),
+        )
+    }
+
+    fn signed_token(
+        algorithm: Algorithm,
+        kid: &str,
+        key: &EncodingKey,
+        claims: serde_json::Value,
+    ) -> String {
+        let mut header = Header::new(algorithm);
+        header.kid = Some(kid.to_owned());
+        encode(&header, &claims, key).expect("test token should encode")
+    }
+
+    #[tokio::test]
+    async fn verify_cat_accepts_valid_rsa_signature_and_client_claim() {
+        let keys = fixture_keys();
+        let rsa = &keys["rsa"];
+        let jwks = json!({"keys": [{"kty":"RSA","kid":"rsa-test","alg":"RS256","use":"sig","n":rsa["n"],"e":rsa["e"]}]});
+        let token = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &EncodingKey::from_rsa_pem(
+                rsa["private_pem"]
+                    .as_str()
+                    .expect("RSA fixture PEM")
+                    .as_bytes(),
+            )
+            .expect("RSA fixture key"),
+            json!({"iss":"https://issuer.example/","exp":2000000000,"client_id":"test-client"}),
+        );
+
+        assert!(test_client(jwks, Some("test-client"))
+            .verify_cat(&token)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_cat_accepts_valid_ec_signature() {
+        let keys = fixture_keys();
+        let ec = &keys["ec"];
+        let jwks = json!({"keys": [{"kty":"EC","kid":"ec-test","alg":"ES256","use":"sig","crv":"P-256","x":ec["x"],"y":ec["y"]}]});
+        let token = signed_token(
+            Algorithm::ES256,
+            "ec-test",
+            &EncodingKey::from_ec_pem(
+                ec["private_pem"]
+                    .as_str()
+                    .expect("EC fixture PEM")
+                    .as_bytes(),
+            )
+            .expect("EC fixture key"),
+            json!({"iss":"https://issuer.example/","exp":2000000000}),
+        );
+
+        assert!(test_client(jwks, None).verify_cat(&token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_cat_rejects_bad_signature_expiry_and_client_claim() {
+        let keys = fixture_keys();
+        let rsa = &keys["rsa"];
+        let jwks = json!({"keys": [{"kty":"RSA","kid":"rsa-test","alg":"RS256","use":"sig","n":rsa["n"],"e":rsa["e"]}]});
+        let signing_key = EncodingKey::from_rsa_pem(
+            rsa["private_pem"]
+                .as_str()
+                .expect("RSA fixture PEM")
+                .as_bytes(),
+        )
+        .expect("RSA fixture key");
+        let client = test_client(jwks, Some("test-client"));
+
+        let valid_claims =
+            json!({"iss":"https://issuer.example/","exp":2000000000,"client_id":"test-client"});
+        let mut bad_signature = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &signing_key,
+            valid_claims.clone(),
+        );
+        let signature_start = bad_signature.rfind('.').expect("JWT signature separator") + 1;
+        let signature_byte = bad_signature.as_bytes()[signature_start];
+        bad_signature.replace_range(
+            signature_start..signature_start + 1,
+            if signature_byte == b'A' { "B" } else { "A" },
+        );
+        assert!(client.verify_cat(&bad_signature).await.is_err());
+
+        let expired = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &signing_key,
+            json!({"iss":"https://issuer.example/","exp":1,"client_id":"test-client"}),
+        );
+        assert!(client.verify_cat(&expired).await.is_err());
+
+        let malformed_exp = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &signing_key,
+            json!({"iss":"https://issuer.example/","exp":"not-a-timestamp","client_id":"test-client"}),
+        );
+        assert!(client.verify_cat(&malformed_exp).await.is_err());
+
+        let missing_exp = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &signing_key,
+            json!({"iss":"https://issuer.example/","client_id":"test-client"}),
+        );
+        assert!(client.verify_cat(&missing_exp).await.is_err());
+
+        let wrong_client = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &signing_key,
+            json!({"iss":"https://issuer.example/","exp":2000000000,"client_id":42}),
+        );
+        assert!(matches!(
+            client.verify_cat(&wrong_client).await,
+            Err(Error::InvalidClientId)
+        ));
+
+        let wrong_issuer = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &signing_key,
+            json!({"iss":"https://other.example/","exp":2000000000,"client_id":"test-client"}),
+        );
+        assert!(client.verify_cat(&wrong_issuer).await.is_err());
+
+        // OIDC's current CAT policy intentionally does not validate aud or nbf.
+        let audience_and_nbf = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &signing_key,
+            json!({"iss":"https://issuer.example/","exp":2000000000,"aud":"another-client","nbf":"malformed"}),
+        );
+        assert!(test_client(
+            json!({"keys": [{"kty":"RSA","kid":"rsa-test","alg":"RS256","use":"sig","n":rsa["n"],"e":rsa["e"]}]}),
+            None,
+        ).verify_cat(&audience_and_nbf).await.is_ok());
+    }
+
+    #[test]
+    fn documented_nbf_validation_rejects_malformed_claim() {
+        // GHSA-h395-gr6q-cpjc regression: when an application enables nbf
+        // validation, a malformed nbf value must not be treated as absent.
+        let keys = fixture_keys();
+        let rsa = &keys["rsa"];
+        let token = signed_token(
+            Algorithm::RS256,
+            "rsa-test",
+            &EncodingKey::from_rsa_pem(
+                rsa["private_pem"]
+                    .as_str()
+                    .expect("RSA fixture PEM")
+                    .as_bytes(),
+            )
+            .expect("RSA fixture key"),
+            json!({"exp":2000000000,"nbf":"not-a-timestamp"}),
+        );
+        let decoding_key = DecodingKey::from_rsa_components(
+            rsa["n"].as_str().expect("RSA modulus"),
+            rsa["e"].as_str().expect("RSA exponent"),
+        )
+        .expect("RSA public components");
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_nbf = true;
+
+        assert!(decode::<serde_json::Value>(&token, &decoding_key, &validation).is_err());
     }
 }
