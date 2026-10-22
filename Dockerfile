@@ -23,12 +23,13 @@ WORKDIR /usr/src/app
 
 # Install needed runtime dependencies (if any)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends patchelf curl && \
+    apt-get install -y --no-install-recommends patchelf curl python3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the built application from the build stage
 COPY --from=builder /usr/src/app/target/release/cdk-mintd /usr/local/bin/cdk-mintd
 COPY bitcaster.config.toml /etc/cdk-mintd/bitcaster.toml
+COPY tools/bitcaster-mint-config/render.py /usr/local/lib/bitcaster-mint-config/render.py
 
 # Detect the architecture and set the interpreter accordingly
 RUN ARCH=$(uname -m) && \
@@ -41,4 +42,4 @@ RUN ARCH=$(uname -m) && \
     fi
 
 # Set the entry point for the container
-CMD ["cdk-mintd", "--config", "/etc/cdk-mintd/bitcaster.toml"]
+CMD ["cdk-mintd"]

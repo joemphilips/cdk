@@ -1,3 +1,26 @@
+# Local fakewallet example. Initialize an owned fresh store explicitly with
+# `cdk-mintd --work-dir <directory> config init --new-mint --file <this-file>`.
+# Supply a disposable mnemonic through CDK_MINTD_MNEMONIC.
+# Ordinary startup reads the stored configuration; it does not import this file.
+[info]
+url = "http://localhost:8085"
+listen_host = "0.0.0.0"
+listen_port = 8085
+mnemonic = "env:CDK_MINTD_MNEMONIC"
+input_fee_ppk = 1000
+use_keyset_v2 = true
+
+[info.http_cache]
+backend = "memory"
+
+[info.logging]
+output = "stderr"
+format = "json"
+console_level = "info"
+
+[database]
+engine = "sqlite"
+
 [[payment_backend]]
 backend = "fakewallet"
 unit = "msat"
@@ -6,7 +29,15 @@ max_mint = 500000000
 min_melt = 1000
 max_melt = 500000000
 
+[fake_wallet]
+
+[mint_info]
+ctf_default_keyset_creation = "one-vs-rest"
+
 [[mint_info.ctf_registration_fees]]
 unit = "msat"
 registration_fee_base = 1000
 registration_fee_per_keyset = 1000
+
+[mint_management_rpc]
+enabled = false
