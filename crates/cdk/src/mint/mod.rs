@@ -1528,17 +1528,12 @@ impl Mint {
                 request.outputs.into_iter().zip(blinded_signatures)
             {
                 if let Some(blinded_signature) = blinded_signature {
-                    if let Some(keyset_info) = self.get_keyset_info(&blinded_signature.keyset_id) {
-                        if keyset_info.is_expired() {
-                            tracing::debug!(
-                                "Skipping restore for expired keyset {}",
-                                blinded_signature.keyset_id
-                            );
-                            continue;
-                        }
+                    // Return stored signatures from known historical keysets.
+                    // Restore does not issue new signatures or establish spendability.
+                    if self.get_keyset_info(&blinded_signature.keyset_id).is_some() {
+                        outputs.push(blinded_message);
+                        signatures.push(blinded_signature);
                     }
-                    outputs.push(blinded_message);
-                    signatures.push(blinded_signature);
                 }
             }
 
@@ -2770,6 +2765,206 @@ mod tests {
         );
 
         mint.stop().await.expect("mint should stop");
+    }
+
+    async fn stored_restore_fixture() -> (Mint, Vec<BlindedMessage>, Vec<BlindSignature>, Proofs) {
+        use cdk_common::amount::SplitTarget;
+        use cdk_common::dhke::construct_proofs;
+        use cdk_common::mint::Operation;
+
+        let denominations = vec![1, 2, 4, 8];
+        let mut mint = create_mint(MintConfig {
+            seed: &[19; 32],
+            supported_units: HashMap::from([(CurrencyUnit::Sat, (0, denominations.clone()))]),
+            ..Default::default()
+        })
+        .await;
+        let mut outputs = Vec::new();
+        let mut signatures = Vec::new();
+        let mut proofs = Vec::new();
+        for index in 0..4 {
+            if index > 0 {
+                mint.rotate_keyset(CurrencyUnit::Sat, denominations.clone(), 0, false, None)
+                    .await
+                    .unwrap();
+            }
+            let id = mint.get_active_keysets()[&CurrencyUnit::Sat];
+            let keys = mint.keyset(&id).unwrap().keys;
+            let premint = PreMintSecrets::random(
+                id,
+                Amount::from(1_u64 << index),
+                &SplitTarget::None,
+                &(0, denominations.clone()).into(),
+            )
+            .unwrap();
+            let messages = premint.blinded_messages();
+            let signed = mint.blind_sign(messages.clone()).await.unwrap();
+            assert_eq!(signed.len(), 1);
+            assert!(signed[0].dleq.is_some());
+            proofs.extend(
+                construct_proofs(signed.clone(), premint.rs(), premint.secrets(), &keys).unwrap(),
+            );
+            outputs.extend(messages);
+            signatures.extend(signed);
+        }
+        let points: Vec<_> = outputs.iter().map(|output| output.blinded_secret).collect();
+        let mut transaction = mint.localstore.begin_transaction().await.unwrap();
+        transaction
+            .add_blind_signatures(&points, &signatures, None)
+            .await
+            .unwrap();
+        let operation = Operation::new(
+            uuid::Uuid::new_v4(),
+            OperationKind::Swap,
+            Amount::ZERO,
+            Amount::from(1),
+            Amount::from(1),
+            None,
+            None,
+        );
+        let mut records = transaction
+            .add_proofs(proofs[..1].to_vec(), None, &operation)
+            .await
+            .unwrap();
+        Mint::update_proofs_state(&mut transaction, &mut records, State::Spent)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        // This mint has no running subscription publisher. Control only the
+        // historical metadata; the signatures and DLEQ remain the stored bytes.
+        let mut metadata = mint.keysets.load().as_ref().clone();
+        for (index, signature) in signatures.iter().enumerate() {
+            let keyset = metadata
+                .iter()
+                .find(|keyset| keyset.id == signature.keyset_id)
+                .unwrap();
+            assert_eq!(keyset.active, index == 3);
+            assert_eq!(keyset.final_expiry, None);
+        }
+        metadata
+            .iter_mut()
+            .find(|keyset| keyset.id == signatures[0].keyset_id)
+            .unwrap()
+            .final_expiry = Some(1);
+        mint.keysets.store(Arc::new(metadata.clone()));
+        let pubkey = mint.signatory.keysets().await.unwrap().pubkey;
+        // Restore must not call signing or proof verification. Both operations
+        // return errors on this existing test signatory.
+        mint.signatory = Arc::new(MockSignatory::new(SignatoryKeysets {
+            pubkey,
+            keysets: metadata,
+        }));
+        (mint, outputs, signatures, proofs)
+    }
+
+    #[tokio::test]
+    async fn restore_returns_historical_signatures_in_request_order_without_new_issuance() {
+        let (mint, outputs, signatures, proofs) = stored_restore_fixture().await;
+        let unknown = BlindedMessage::new(
+            Amount::ZERO,
+            outputs[3].keyset_id,
+            SecretKey::generate().public_key(),
+        );
+        let mut requested = vec![
+            outputs[3].clone(),
+            unknown,
+            outputs[0].clone(),
+            outputs[2].clone(),
+            outputs[1].clone(),
+        ];
+        // NUT-09 looks up blinded points. The client need not know their value.
+        for output in &mut requested {
+            output.amount = Amount::ZERO;
+        }
+        let expected_outputs = vec![
+            requested[0].clone(),
+            requested[2].clone(),
+            requested[3].clone(),
+            requested[4].clone(),
+        ];
+        let expected_signatures = vec![
+            signatures[3].clone(),
+            signatures[0].clone(),
+            signatures[2].clone(),
+            signatures[1].clone(),
+        ];
+        let points: Vec<_> = requested
+            .iter()
+            .map(|output| output.blinded_secret)
+            .collect();
+        let ys = proofs.ys().unwrap();
+        let before_signatures = mint.localstore.get_blind_signatures(&points).await.unwrap();
+        let before_states = mint.localstore.get_proofs_states(&ys).await.unwrap();
+        assert_eq!(before_states, vec![Some(State::Spent), None, None, None]);
+        let before_issued = mint.total_issued().await.unwrap();
+        let before_redeemed = mint.total_redeemed().await.unwrap();
+
+        for expire_active in [false, true] {
+            if expire_active {
+                let mut metadata = mint.keysets.load().as_ref().clone();
+                let active = metadata
+                    .iter_mut()
+                    .find(|keyset| keyset.id == signatures[3].keyset_id)
+                    .unwrap();
+                assert!(active.active);
+                active.final_expiry = Some(1);
+                mint.keysets.store(Arc::new(metadata));
+            }
+            let response = mint
+                .restore(RestoreRequest {
+                    outputs: requested.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.outputs, expected_outputs);
+            assert_eq!(response.signatures, expected_signatures);
+            assert_eq!(
+                mint.localstore.get_blind_signatures(&points).await.unwrap(),
+                before_signatures
+            );
+            assert_eq!(
+                mint.localstore.get_proofs_states(&ys).await.unwrap(),
+                before_states
+            );
+            assert_eq!(mint.total_issued().await.unwrap(), before_issued);
+            assert_eq!(mint.total_redeemed().await.unwrap(), before_redeemed);
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_stored_signatures_without_known_keyset_metadata() {
+        let (mint, outputs, signatures, _) = stored_restore_fixture().await;
+        let unavailable = signatures[1].keyset_id;
+        let metadata = mint
+            .keysets
+            .load()
+            .iter()
+            .filter(|keyset| keyset.id != unavailable)
+            .cloned()
+            .collect();
+        mint.keysets.store(Arc::new(metadata));
+        assert_eq!(
+            mint.localstore
+                .get_blind_signatures(&[outputs[1].blinded_secret])
+                .await
+                .unwrap(),
+            vec![Some(signatures[1].clone())]
+        );
+        let response = mint
+            .restore(RestoreRequest {
+                outputs: vec![outputs[2].clone(), outputs[1].clone(), outputs[3].clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            response.outputs,
+            vec![outputs[2].clone(), outputs[3].clone()]
+        );
+        assert_eq!(
+            response.signatures,
+            vec![signatures[2].clone(), signatures[3].clone()]
+        );
     }
 
     #[tokio::test]
