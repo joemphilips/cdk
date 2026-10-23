@@ -199,18 +199,27 @@ pub(crate) async fn post_check(
 pub(crate) async fn get_mint_info(
     State(state): State<MintState>,
 ) -> Result<Json<MintInfo>, Response> {
-    Ok(Json(
-        state
-            .mint
-            .mint_info()
-            .await
-            .map_err(|err| {
-                tracing::error!("Could not get mint info: {}", err);
-                into_response(err)
-            })?
-            .clone()
-            .time(unix_time()),
-    ))
+    let mint_info = state
+        .mint
+        .mint_info()
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not get mint info: {}", err);
+            into_response(err)
+        })?
+        .clone();
+    #[cfg(feature = "conditional-tokens")]
+    let mint_info = {
+        let mut mint_info = mint_info;
+        let supports_condition_keyset_filter =
+            state.mint.localstore().supports_condition_keyset_filter();
+        if let Some(settings) = mint_info.nuts.nut_ctf.as_mut() {
+            settings.condition_keyset_filter =
+                Some(settings.supported && supports_condition_keyset_filter);
+        }
+        mint_info
+    };
+    Ok(Json(mint_info.time(unix_time())))
 }
 
 /// Swap inputs for outputs of the same value
@@ -1258,11 +1267,12 @@ pub(crate) async fn get_conditional_keysets(
 
     let response = state
         .mint
-        .get_conditional_keysets_page(
+        .get_conditional_keysets_page_with_condition(
             params.since,
             params.limit,
             params.active,
             params.cursor.as_deref(),
+            params.condition_id.as_deref(),
         )
         .await
         .map_err(|err| {

@@ -476,6 +476,7 @@ macro_rules! mint_db_conditional_test {
             get_conditional_keysets_multiple,
             get_conditional_keyset_infos_preserve_rotated_rows,
             get_conditional_keysets_since_includes_boundary,
+            conditional_keyset_condition_filter_is_scoped_before_pagination,
             ctf_settlement_replay_round_trip,
             ctf_settlement_rejection_round_trip,
             get_condition_for_keyset,

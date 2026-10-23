@@ -333,6 +333,7 @@ where
         since: Option<u64>,
         limit: Option<u64>,
         active: Option<bool>,
+        condition_id: Option<&str>,
         after: Option<&(u64, String)>,
     ) -> Result<Vec<(MintKeySetInfo, u64)>, Error> {
         let conn = self
@@ -354,6 +355,10 @@ where
             sql.push_str(" AND active = :active");
         }
 
+        if condition_id.is_some() {
+            sql.push_str(" AND condition_id = :condition_id");
+        }
+
         if after.is_some() {
             sql.push_str(
                 " AND (created_at > :after_time OR (created_at = :after_time AND id > :after_id))",
@@ -373,6 +378,10 @@ where
 
         if let Some(active_val) = active {
             stmt = stmt.bind("active", active_val as i64);
+        }
+
+        if let Some(condition_id) = condition_id {
+            stmt = stmt.bind("condition_id", condition_id.to_string());
         }
 
         if let Some((timestamp, id)) = after {
@@ -399,6 +408,10 @@ where
     RM: DatabasePool + 'static,
 {
     type Err = Error;
+
+    fn supports_condition_keyset_filter(&self) -> bool {
+        true
+    }
 
     async fn add_condition(&self, condition: StoredCondition) -> Result<(), Self::Err> {
         let conn = self
@@ -650,7 +663,25 @@ where
         after: Option<&(u64, String)>,
     ) -> Result<Vec<ConditionalKeySetInfo>, Self::Err> {
         let rows = self
-            .query_conditional_keysets(since, limit, active, after)
+            .query_conditional_keysets(since, limit, active, None, after)
+            .await?;
+        rows.into_iter()
+            .map(|(info, created_at)| {
+                mint_keyset_info_to_conditional_keyset_info(&info, created_at)
+            })
+            .collect()
+    }
+
+    async fn get_conditional_keyset_infos_page_with_condition(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        active: Option<bool>,
+        condition_id: Option<&str>,
+        after: Option<&(u64, String)>,
+    ) -> Result<Vec<ConditionalKeySetInfo>, Self::Err> {
+        let rows = self
+            .query_conditional_keysets(since, limit, active, condition_id, after)
             .await?;
         rows.into_iter()
             .map(|(info, created_at)| {

@@ -503,6 +503,9 @@ pub struct GetConditionalKeysetsRequest {
     /// Filter by active status
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<bool>,
+    /// Exact condition filter. Requires `condition_keyset_filter: true` in NUT-CTF settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_id: Option<String>,
 }
 
 /// GET /v1/conditional_keysets response
@@ -533,6 +536,9 @@ pub struct RegistrationFeeSetting {
 pub struct NutCtfSettings {
     /// Whether NUT-CTF is supported
     pub supported: bool,
+    /// Whether `/v1/conditional_keysets` supports condition-scoped discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_keyset_filter: Option<bool>,
     /// DLC protocol version
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dlc_version: Option<String>,
@@ -555,6 +561,7 @@ impl Default for NutCtfSettings {
     fn default() -> Self {
         Self {
             supported: true,
+            condition_keyset_filter: None,
             dlc_version: Some("0".to_string()),
             vesting_period: Some(2592000), // 30 days
             default_keyset_creation: default_keyset_creation(),
@@ -1072,6 +1079,7 @@ mod tests {
     fn test_ctf_settings_serde() {
         let settings = NutCtfSettings {
             supported: true,
+            condition_keyset_filter: Some(true),
             dlc_version: Some("0".to_string()),
             vesting_period: None,
             default_keyset_creation: "none".to_string(),
@@ -1085,6 +1093,12 @@ mod tests {
         assert!(!json.contains("vesting_period"));
         let deser: NutCtfSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(settings, deser);
+
+        let legacy: NutCtfSettings = serde_json::from_str(
+            r#"{"supported":true,"dlc_version":"0","default_keyset_creation":"none","registration_fees":[]}"#,
+        )
+        .expect("legacy NUT-CTF settings deserialize");
+        assert_eq!(legacy.condition_keyset_filter, None);
     }
 
     #[test]

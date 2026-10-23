@@ -20,7 +20,7 @@ use super::Mint;
 use crate::Error;
 
 mod pagination;
-use self::pagination::{page_limit, validate_since, ListingFilter};
+use self::pagination::{page_limit, validate_condition_id, validate_since, ListingFilter};
 
 /// Maximum number of items returned per paginated request.
 const MAX_PAGE_SIZE: u64 = 100;
@@ -931,16 +931,39 @@ impl Mint {
         active: Option<bool>,
         cursor: Option<&str>,
     ) -> Result<ConditionalKeysetsResponse, Error> {
+        self.get_conditional_keysets_page_with_condition(since, limit, active, cursor, None)
+            .await
+    }
+
+    /// Read conditional keysets using an opaque continuation and fixed filters,
+    /// optionally scoped to one exact condition identifier.
+    #[instrument(skip_all)]
+    pub async fn get_conditional_keysets_page_with_condition(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        active: Option<bool>,
+        cursor: Option<&str>,
+        condition_id: Option<&str>,
+    ) -> Result<ConditionalKeysetsResponse, Error> {
         validate_since(since)?;
+        validate_condition_id(condition_id)?;
         let limit = page_limit(limit)?;
         let filter = ListingFilter::ConditionalKeysets {
             since: since.unwrap_or(0),
             active: active.into(),
+            condition_id: condition_id.map(str::to_string),
         };
         let after = filter.decode(cursor)?;
         let mut keysets = self
             .localstore
-            .get_conditional_keyset_infos_page(since, Some(limit + 1), active, after.as_ref())
+            .get_conditional_keyset_infos_page_with_condition(
+                since,
+                Some(limit + 1),
+                active,
+                condition_id,
+                after.as_ref(),
+            )
             .await?;
         let has_more = keysets.len() > limit as usize;
         keysets.truncate(limit as usize);

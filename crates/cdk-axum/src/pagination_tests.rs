@@ -358,6 +358,114 @@ async fn assert_full_pages(router: &axum::Router) {
     }
 }
 
+#[tokio::test]
+async fn condition_scoped_keysets_filter_before_paging_and_bind_cursor() {
+    use cdk::nuts::nut_ctf::NutCtfSettings;
+
+    let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+    let (router, mint) = seeded_router(db.clone()).await;
+    let mut info = mint.mint_info().await.unwrap();
+    info.nuts.nut_ctf = Some(NutCtfSettings::default());
+    mint.set_mint_info(info).await.unwrap();
+    let condition_id = format!("{:064x}", 1);
+
+    // Add two later rows to the selected condition. One is inactive to prove
+    // that omitting `active` includes recoverable historical keysets.
+    for (index, active) in [(301, true), (302, false)] {
+        let mut info = stored_keyset(index);
+        info.condition_id = Some(condition_id.clone());
+        info.active = active;
+        db.add_conditional_keyset(info, BASE + index).await.unwrap();
+    }
+
+    let (status, first) = request(
+        &router,
+        &format!("/v1/conditional_keysets?condition_id={condition_id}&limit=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let rows = first["keysets"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["condition_id"], condition_id);
+    assert_eq!(rows[1]["condition_id"], condition_id);
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("scoped page continues");
+
+    let (status, second) = request(
+        &router,
+        &format!("/v1/conditional_keysets?condition_id={condition_id}&limit=2&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["keysets"].as_array().unwrap().len(), 1);
+    assert_eq!(second["keysets"][0]["condition_id"], condition_id);
+    assert_eq!(second["keysets"][0]["active"], false);
+    assert!(second["next_cursor"].is_null());
+
+    let other_condition = format!("{:064x}", 2);
+    for uri in [
+        format!("/v1/conditional_keysets?condition_id={other_condition}&cursor={cursor}"),
+        format!("/v1/conditional_keysets?cursor={cursor}"),
+    ] {
+        assert_eq!(
+            request(&router, &uri).await.0,
+            StatusCode::BAD_REQUEST,
+            "{uri}"
+        );
+    }
+
+    let (_, unscoped_first) = request(&router, "/v1/conditional_keysets?limit=1").await;
+    let unscoped_cursor = unscoped_first["next_cursor"].as_str().unwrap();
+    assert_eq!(
+        request(
+            &router,
+            &format!(
+                "/v1/conditional_keysets?condition_id={condition_id}&cursor={unscoped_cursor}"
+            )
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+
+    for query in [
+        "condition_id=".to_string(),
+        "condition_id=abc".to_string(),
+        format!("condition_id={}", "AB".repeat(32)),
+        format!("condition_id={condition_id}&condition_id={other_condition}"),
+        format!("condition_id={condition_id}&condition_id={condition_id}"),
+    ] {
+        assert_eq!(
+            request(&router, &format!("/v1/conditional_keysets?{query}"))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST,
+            "{query}"
+        );
+    }
+
+    let (_, unknown) = request(
+        &router,
+        &format!("/v1/conditional_keysets?condition_id={}", "ff".repeat(32)),
+    )
+    .await;
+    assert!(unknown["keysets"].as_array().unwrap().is_empty());
+    assert!(unknown["next_cursor"].is_null());
+
+    let (_, info) = request(&router, "/v1/info").await;
+    assert_eq!(info["nuts"]["CTF"]["condition_keyset_filter"], true);
+
+    let mut info = mint.mint_info().await.unwrap();
+    info.nuts.nut_ctf.as_mut().unwrap().supported = false;
+    mint.set_mint_info(info).await.unwrap();
+    let (_, unsupported_info) = request(&router, "/v1/info").await;
+    assert_eq!(
+        unsupported_info["nuts"]["CTF"]["condition_keyset_filter"],
+        false
+    );
+}
+
 async fn assert_limits(router: &axum::Router) {
     for (endpoint, field) in [
         ("conditions", "conditions"),

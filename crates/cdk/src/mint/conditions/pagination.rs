@@ -10,8 +10,16 @@ const MAX_CURSOR_LENGTH: usize = 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "endpoint", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ListingFilter {
-    Conditions { since: u64, status: Vec<String> },
-    ConditionalKeysets { since: u64, active: ActiveFilter },
+    Conditions {
+        since: u64,
+        status: Vec<String>,
+    },
+    ConditionalKeysets {
+        since: u64,
+        active: ActiveFilter,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        condition_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +57,20 @@ pub(super) fn validate_since(since: Option<u64>) -> Result<(), Error> {
     if since.is_some_and(|timestamp| timestamp > i64::MAX as u64) {
         return Err(Error::Custom(
             "Registration filter exceeds supported timestamp range".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_condition_id(condition_id: Option<&str>) -> Result<(), Error> {
+    if condition_id.is_some_and(|value| {
+        value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(Error::Custom(
+            "Condition identifier must be 64 lowercase hexadecimal characters".to_string(),
         ));
     }
     Ok(())
@@ -108,5 +130,81 @@ impl ListingFilter {
             filter: self.clone(),
         };
         Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_condition_id, ActiveFilter, ListingFilter};
+    use bitcoin::base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use bitcoin::base64::Engine;
+
+    #[test]
+    fn unscoped_keyset_cursor_keeps_legacy_json_shape() {
+        let filter = ListingFilter::ConditionalKeysets {
+            since: 1_700_000_000,
+            active: ActiveFilter::All,
+            condition_id: None,
+        };
+        let cursor = filter
+            .encode(1_700_000_001, "001711afb1de20ce".to_string())
+            .unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(cursor).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["filter"],
+            serde_json::json!({
+                "endpoint": "conditional_keysets",
+                "since": 1_700_000_000u64,
+                "active": "all"
+            })
+        );
+        assert_eq!(
+            filter.decode(Some(&URL_SAFE_NO_PAD.encode(bytes))).unwrap(),
+            Some((1_700_000_001, "001711afb1de20ce".to_string()))
+        );
+    }
+
+    #[test]
+    fn scoped_cursor_is_bound_to_exact_condition() {
+        let first = "ab".repeat(32);
+        let second = "cd".repeat(32);
+        let scoped = ListingFilter::ConditionalKeysets {
+            since: 0,
+            active: ActiveFilter::All,
+            condition_id: Some(first),
+        };
+        let cursor = scoped.encode(1, "001711afb1de20ce".to_string()).unwrap();
+        let other_condition = ListingFilter::ConditionalKeysets {
+            since: 0,
+            active: ActiveFilter::All,
+            condition_id: Some(second),
+        };
+        let unscoped = ListingFilter::ConditionalKeysets {
+            since: 0,
+            active: ActiveFilter::All,
+            condition_id: None,
+        };
+        assert!(other_condition.decode(Some(&cursor)).is_err());
+        assert!(unscoped.decode(Some(&cursor)).is_err());
+        assert!(scoped.decode(Some(&cursor)).is_ok());
+    }
+
+    #[test]
+    fn condition_id_requires_64_lowercase_hex_characters() {
+        assert!(validate_condition_id(None).is_ok());
+        assert!(validate_condition_id(Some(&"ab".repeat(32))).is_ok());
+        for value in [
+            "",
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &"AB".repeat(32),
+            &"g0".repeat(32),
+        ] {
+            assert!(
+                validate_condition_id(Some(value)).is_err(),
+                "accepted {value:?}"
+            );
+        }
     }
 }

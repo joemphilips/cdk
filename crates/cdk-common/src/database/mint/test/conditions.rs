@@ -307,6 +307,116 @@ where
     assert!(returned.iter().any(|keyset| keyset.id == second));
 }
 
+/// Condition filtering applies before pagination and keeps inactive history.
+pub async fn conditional_keyset_condition_filter_is_scoped_before_pagination<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    let selected_condition_id = "a7".repeat(32);
+    let other_condition_id = "a8".repeat(32);
+    db.add_condition(test_condition(&selected_condition_id))
+        .await
+        .unwrap();
+    db.add_condition(test_condition(&other_condition_id))
+        .await
+        .unwrap();
+
+    // These earlier unrelated rows would consume the first page if the
+    // condition predicate were applied after pagination.
+    for index in 1..=3 {
+        let info = test_conditional_keyset_info(
+            Id::from_str(&format!("00{index:014x}")).unwrap(),
+            &other_condition_id,
+            "OTHER",
+            &format!("{index:064x}"),
+        );
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info, 10 + index)
+            .await
+            .unwrap();
+    }
+
+    let selected = [
+        (11_u64, "001711afb1de20ce", true),
+        (12, "001711afb1de20cf", false),
+        (13, "001711afb1de20d0", true),
+    ];
+    for (created_at, raw_id, active) in selected {
+        let mut info = test_conditional_keyset_info(
+            Id::from_str(raw_id).unwrap(),
+            &selected_condition_id,
+            "SELECTED",
+            &format!("{created_at:064x}"),
+        );
+        info.active = active;
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info, created_at)
+            .await
+            .unwrap();
+    }
+
+    let first = db
+        .get_conditional_keyset_infos_page_with_condition(
+            None,
+            Some(2),
+            None,
+            Some(&selected_condition_id),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|row| row.id.to_string())
+            .collect::<Vec<_>>(),
+        ["001711afb1de20ce", "001711afb1de20cf"]
+    );
+    assert!(first[0].active);
+    assert!(
+        !first[1].active,
+        "active=None must retain historical inactive rows"
+    );
+
+    let after = (first[1].registered_at, first[1].id.to_string());
+    let second = db
+        .get_conditional_keyset_infos_page_with_condition(
+            None,
+            Some(2),
+            None,
+            Some(&selected_condition_id),
+            Some(&after),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id.to_string(), "001711afb1de20d0");
+
+    let unknown = db
+        .get_conditional_keyset_infos_page_with_condition(
+            None,
+            Some(2),
+            None,
+            Some(&"af".repeat(32)),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(unknown.is_empty());
+
+    let since_inactive = db
+        .get_conditional_keyset_infos_page_with_condition(
+            Some(12),
+            Some(1),
+            None,
+            Some(&selected_condition_id),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(since_inactive.len(), 1);
+    assert_eq!(since_inactive[0].id.to_string(), "001711afb1de20cf");
+    assert!(!since_inactive[0].active);
+}
+
 /// Test that a settlement response and its completed operation commit atomically.
 pub async fn ctf_settlement_replay_round_trip<DB>(db: DB)
 where

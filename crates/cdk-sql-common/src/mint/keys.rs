@@ -378,7 +378,7 @@ where
         &self,
     ) -> Result<Vec<MintKeySetInfo>, Self::Err> {
         Ok(self
-            .query_conditional_keysets(None, None, None, None)
+            .query_conditional_keysets(None, None, None, None, None)
             .await?
             .into_iter()
             .map(|(info, _)| info)

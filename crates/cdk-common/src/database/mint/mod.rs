@@ -745,6 +745,12 @@ pub trait ConditionsDatabase {
     /// Conditions Database Error
     type Err: Into<Error> + From<Error>;
 
+    /// Whether this backend applies condition filters before keyset paging.
+    /// Custom backends stay fail closed until they implement scoped paging.
+    fn supports_condition_keyset_filter(&self) -> bool {
+        false
+    }
+
     /// Add a stored condition
     async fn add_condition(&self, condition: StoredCondition) -> Result<(), Self::Err>;
 
@@ -783,6 +789,27 @@ pub trait ConditionsDatabase {
         active: Option<bool>,
         after: Option<&(u64, String)>,
     ) -> Result<Vec<cashu::nuts::nut_ctf::ConditionalKeySetInfo>, Self::Err>;
+
+    /// Read conditional keysets with an optional exact condition filter.
+    /// Backends that do not implement condition-scoped paging keep supporting
+    /// legacy unscoped requests and fail closed for scoped requests.
+    async fn get_conditional_keyset_infos_page_with_condition(
+        &self,
+        since: Option<u64>,
+        limit: Option<u64>,
+        active: Option<bool>,
+        condition_id: Option<&str>,
+        after: Option<&(u64, String)>,
+    ) -> Result<Vec<cashu::nuts::nut_ctf::ConditionalKeySetInfo>, Self::Err> {
+        if condition_id.is_some() {
+            return Err(Error::Internal(
+                "Condition-scoped keyset paging is not supported by this backend".to_string(),
+            )
+            .into());
+        }
+        self.get_conditional_keyset_infos_page(since, limit, active, after)
+            .await
+    }
 
     /// Update condition attestation state.
     /// Only succeeds if current status is 'pending' (first-write-wins).
@@ -966,3 +993,121 @@ pub type DynMintDatabase = std::sync::Arc<dyn Database<Error> + Send + Sync>;
 
 /// Type alias for Mint Transaction
 pub type DynMintTransaction = Box<dyn Transaction<Error> + Send + Sync>;
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod condition_filter_capability_tests {
+    use super::{ConditionsDatabase, Error};
+    use crate::mint::{MintKeySetInfo, StoredCondition};
+    use crate::nuts::nut_ctf::ConditionalKeySetInfo;
+    use crate::nuts::Id;
+    use std::collections::HashMap;
+
+    struct LegacyConditionsBackend;
+
+    #[async_trait::async_trait]
+    impl ConditionsDatabase for LegacyConditionsBackend {
+        type Err = Error;
+
+        async fn add_condition(&self, _: StoredCondition) -> Result<(), Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_condition(&self, _: &str) -> Result<Option<StoredCondition>, Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_conditions(
+            &self,
+            _: Option<u64>,
+            _: Option<u64>,
+            _: &[String],
+        ) -> Result<Vec<StoredCondition>, Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_conditions_page(
+            &self,
+            _: Option<u64>,
+            _: Option<u64>,
+            _: &[String],
+            _: Option<&(u64, String)>,
+        ) -> Result<Vec<StoredCondition>, Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_conditional_keysets_for_conditions(
+            &self,
+            _: &[String],
+        ) -> Result<HashMap<String, HashMap<String, Id>>, Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_conditional_keyset_infos_page(
+            &self,
+            _: Option<u64>,
+            _: Option<u64>,
+            _: Option<bool>,
+            _: Option<&(u64, String)>,
+        ) -> Result<Vec<ConditionalKeySetInfo>, Self::Err> {
+            unreachable!()
+        }
+
+        async fn update_condition_attestation(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<u64>,
+            _: &[crate::nuts::nut_ctf::OracleSig],
+        ) -> Result<bool, Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_conditional_keysets_for_condition(
+            &self,
+            _: &str,
+        ) -> Result<HashMap<String, Id>, Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_conditional_keyset_infos_for_condition(
+            &self,
+            _: &str,
+        ) -> Result<Vec<MintKeySetInfo>, Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_all_conditional_keyset_infos(
+            &self,
+            _: Option<u64>,
+            _: Option<u64>,
+            _: Option<bool>,
+        ) -> Result<Vec<ConditionalKeySetInfo>, Self::Err> {
+            unreachable!()
+        }
+
+        async fn get_condition_for_keyset(
+            &self,
+            _: &Id,
+        ) -> Result<Option<(String, String, String)>, Self::Err> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_backend_does_not_advertise_or_emulate_scoped_paging() {
+        let backend = LegacyConditionsBackend;
+        assert!(!backend.supports_condition_keyset_filter());
+        let error = backend
+            .get_conditional_keyset_infos_page_with_condition(
+                None,
+                Some(1),
+                None,
+                Some(&"ab".repeat(32)),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Internal(_)));
+    }
+}
