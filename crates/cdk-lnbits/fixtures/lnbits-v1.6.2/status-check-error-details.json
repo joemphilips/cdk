@@ -1,0 +1,27 @@
+{
+  "paid": false,
+  "details": {
+    "checking_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "payment_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "wallet_id": "0b6d4f1c2a3e4b5c8d9e0f1a2b3c4d5e",
+    "amount": -100000,
+    "fee": -2000,
+    "bolt11": "lnbc1fixtureinvoiceplaceholder",
+    "payment_request": "lnbc1fixtureinvoiceplaceholder",
+    "fiat_provider": null,
+    "status": "pending",
+    "memo": "fixture",
+    "expiry": "2027-01-15T08:10:00+00:00",
+    "webhook": null,
+    "webhook_status": null,
+    "preimage": null,
+    "tag": null,
+    "extension": null,
+    "time": "2027-01-15T08:00:00+00:00",
+    "created_at": "2027-01-15T08:00:00+00:00",
+    "updated_at": "2027-01-15T08:00:00+00:00",
+    "labels": [],
+    "extra": {},
+    "external_id": null
+  }
+}

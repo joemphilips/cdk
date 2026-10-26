@@ -57,6 +57,7 @@ cdk-common = { path = "./crates/cdk-common", default-features = false, version =
 cdk-axum = { path = "./crates/cdk-axum", default-features = false, version = "=0.18.2" }
 cdk-cln = { path = "./crates/cdk-cln", version = "=0.18.2" }
 cdk-lnd = { path = "./crates/cdk-lnd", version = "=0.18.2" }
+cdk-lnbits = { path = "./crates/cdk-lnbits", version = "=0.18.2" }
 cdk-ldk-node = { path = "./crates/cdk-ldk-node", version = "=0.18.2" }
 cdk-fake-wallet = { path = "./crates/cdk-fake-wallet", default-features = false, version = "=0.18.2" }
 cdk-ffi = { path = "./crates/cdk-ffi", default-features = false, version = "=0.18.2" }

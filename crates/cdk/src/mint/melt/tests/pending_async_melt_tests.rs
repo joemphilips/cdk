@@ -374,9 +374,13 @@ async fn status_check_rounds_msat_spend_up_before_signing_change() {
     assert_eq!(checked.state(), MeltQuoteState::Paid);
     let response = pending.await.unwrap();
     let change = response.change().expect("payment should leave change");
+    // The msat spend rounds up to 9_001 sat. The user is charged at most the
+    // quoted amount plus fee reserve; the mint absorbs any excess.
+    let cap: u64 = (quote.amount().value() + quote.fee_reserve().value()).into();
+    let charged = 9_001_u64.min(cap);
     assert_eq!(
         Amount::try_sum(change.iter().map(|sig| sig.amount)).unwrap(),
-        Amount::from(999)
+        Amount::from(10_000 - charged)
     );
 }
 

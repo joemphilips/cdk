@@ -486,6 +486,25 @@ async fn begin_melt_change_without_signatures(
 /// - Change calculation fails
 /// - Blind signing fails
 /// - Database operations fail
+/// The cost charged to the user: the actual cost, capped at the quoted amount
+/// plus fee reserve.
+pub(super) fn charged_melt_cost(
+    quote: &MeltQuote,
+    total_spent: &Amount<CurrencyUnit>,
+) -> Result<Amount<CurrencyUnit>, Error> {
+    let cap = quote.amount().checked_add(&quote.fee_reserve())?;
+    if total_spent.value() > cap.value() {
+        tracing::warn!(
+            quote_id = %quote.id,
+            total_spent = %total_spent,
+            charged = %cap,
+            "melt cost exceeds the quoted amount and fee reserve; the mint absorbs the excess",
+        );
+        return Ok(cap);
+    }
+    Ok(total_spent.clone())
+}
+
 pub(super) async fn process_melt_change(
     mint: &super::super::Mint,
     db: &DynMintDatabase,
@@ -998,13 +1017,18 @@ pub async fn finalize_melt_quote(
         (proofs, quote)
     };
 
+    // The user is charged at most the quoted amount plus fee reserve. A backend
+    // can report a larger actual cost; the mint absorbs that excess, and the
+    // recorded total_spent keeps the actual cost.
+    let charged = charged_melt_cost(&quote, &total_spent)?;
+
     // Process change (if needed) - opens new transaction
     let change_result = process_melt_change(
         mint,
         db,
         &quote.id,
         melt_request_info.inputs_amount.clone(),
-        total_spent.clone(),
+        charged,
         melt_request_info.inputs_fee.clone(),
         melt_request_info.change_outputs.clone(),
     )
@@ -1134,4 +1158,46 @@ pub async fn finalize_melt_quote(
     }
 
     Ok(change_sigs)
+}
+
+#[cfg(test)]
+mod charged_melt_cost_tests {
+    use cdk_common::mint::MeltPaymentRequest;
+    use cdk_common::nuts::PaymentMethod;
+
+    use super::*;
+
+    fn quote(amount: u64, fee_reserve: u64) -> MeltQuote {
+        MeltQuote::new(
+            None,
+            MeltPaymentRequest::Custom {
+                method: "test".to_string(),
+                request: "request".to_string(),
+            },
+            CurrencyUnit::Sat,
+            Amount::from(amount).with_unit(CurrencyUnit::Sat),
+            Amount::from(fee_reserve).with_unit(CurrencyUnit::Sat),
+            0,
+            None,
+            None,
+            PaymentMethod::Custom("test".to_string()),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn cost_within_the_reserve_is_charged_in_full() {
+        let spent = Amount::from(1_004).with_unit(CurrencyUnit::Sat);
+        assert_eq!(charged_melt_cost(&quote(1_000, 10), &spent).ok(), Some(spent));
+    }
+
+    #[test]
+    fn cost_above_the_reserve_is_capped_at_amount_plus_reserve() {
+        let spent = Amount::from(1_025).with_unit(CurrencyUnit::Sat);
+        assert_eq!(
+            charged_melt_cost(&quote(1_000, 10), &spent).ok(),
+            Some(Amount::from(1_010).with_unit(CurrencyUnit::Sat))
+        );
+    }
 }

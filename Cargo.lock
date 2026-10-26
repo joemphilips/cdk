@@ -1654,6 +1654,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdk-lnbits"
+version = "0.18.2"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "cdk-common",
+ "futures",
+ "reqwest 0.13.5",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "cdk-lnd"
 version = "0.18.2"
 dependencies = [
@@ -1723,6 +1744,7 @@ dependencies = [
  "cdk-fake-wallet",
  "cdk-http-client",
  "cdk-ldk-node",
+ "cdk-lnbits",
  "cdk-lnd",
  "cdk-mint-rpc",
  "cdk-payment-processor",

@@ -654,7 +654,11 @@ async fn test_msat_total_spent_rounds_up_when_recording_sat_melt() {
     let change_amount =
         Amount::try_sum(change.iter().map(|sig| sig.amount)).expect("change cannot overflow");
 
-    assert_eq!(change_amount, Amount::from(999));
+    // The msat spend rounds up to 9_001 sat. The user is charged at most the
+    // quoted amount plus fee reserve; the mint absorbs any excess.
+    let cap: u64 = (quote.amount().value() + quote.fee_reserve().value()).into();
+    let charged = 9_001_u64.min(cap);
+    assert_eq!(change_amount, Amount::from(10_000 - charged));
 }
 
 #[tokio::test]
