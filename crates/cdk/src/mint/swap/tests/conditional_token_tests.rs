@@ -1,6 +1,7 @@
 //! NUT-CTF conditional token tests for swap and redeem operations
 
 mod fixed_anchor_tests;
+mod merge_settlement_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::panic;
