@@ -118,7 +118,7 @@ pub const MAX_ANNOUNCEMENTS: usize = 32;
 pub const MAX_ORACLE_WITNESS_SIGS: usize = MAX_ANNOUNCEMENTS * 2;
 
 /// Maximum byte length of tags when serialized as JSON
-pub const MAX_TAGS_JSON_LENGTH: usize = 4096;
+pub const MAX_TAGS_JSON_LENGTH: usize = 16 * 1024;
 
 /// Maximum length of a single announcement hex string (64 KB)
 pub const MAX_ANNOUNCEMENT_HEX_LENGTH: usize = 131_072;

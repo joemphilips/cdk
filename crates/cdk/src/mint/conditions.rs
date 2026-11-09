@@ -1004,6 +1004,64 @@ mod tests {
         mint
     }
 
+    #[cfg(feature = "test-utils")]
+    fn metadata_boundary_request(description: String) -> RegisterConditionRequest {
+        use cdk_common::nuts::nut_ctf::test_helpers::{
+            create_test_announcement, create_test_oracle,
+        };
+        let oracle = create_test_oracle();
+        let (_, announcement) =
+            create_test_announcement(&oracle, &["Yes", "No"], "metadata-boundary");
+        RegisterConditionRequest {
+            threshold: 1,
+            tags: vec![vec!["description".to_string(), description]],
+            announcements: vec![announcement],
+            collateral: Some("sat".to_string()),
+            outcome_collections: Some(vec!["Yes".to_string(), "No".to_string()]),
+            fee: None,
+            outputs: None,
+            condition_type: "enum".to_string(),
+            lo_bound: None,
+            hi_bound: None,
+            precision: None,
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn registration_preserves_multilingual_tags_at_serialized_metadata_limit() {
+        let mint = mint_with_registration_fee(0, 0).await;
+        // 16,384 UTF-8 bytes including JSON punctuation; use a multi-byte value
+        // so a character count cannot accidentally replace the wire-byte bound.
+        let overhead = serde_json::to_vec(&vec![vec!["description", ""]])
+            .expect("serialize fixture")
+            .len();
+        let value_bytes = 16_384 - overhead;
+        let description = "題".repeat(value_bytes / 3) + &"x".repeat(value_bytes % 3);
+        let request = metadata_boundary_request(description);
+        assert_eq!(serde_json::to_vec(&request.tags).unwrap().len(), 16_384);
+        let expected_tags = request.tags.clone();
+
+        let result = mint.register_condition(request).await.expect("metadata fits");
+        let stored = mint.get_condition(&result.condition_id).await.unwrap();
+        assert_eq!(stored.tags, expected_tags);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn registration_rejects_serialized_metadata_limit_plus_one_before_fee_validation() {
+        let mint = mint_with_registration_fee(1, 1).await;
+        let overhead = serde_json::to_vec(&vec![vec!["description", ""]])
+            .expect("serialize fixture")
+            .len();
+        let request = metadata_boundary_request("x".repeat(16_385 - overhead));
+        assert_eq!(serde_json::to_vec(&request.tags).unwrap().len(), 16_385);
+
+        let result = mint.register_condition(request).await;
+        assert!(matches!(result, Err(Error::Custom(message))
+            if message == "Tags JSON exceeds maximum length of 16384"));
+    }
+
     #[tokio::test]
     async fn required_registration_fee_overflows_when_max_base_is_added_to_per_keyset_fee() {
         let mint = mint_with_registration_fee(u64::MAX, 1).await;
