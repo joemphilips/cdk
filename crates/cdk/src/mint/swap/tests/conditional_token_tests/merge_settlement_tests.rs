@@ -14,6 +14,10 @@ use cdk_common::nuts::{BlindedMessage, Keys, Proofs};
 use super::*;
 use crate::mint::settlement::PreparedCtfSettlement;
 
+mod bundle_shape_tests;
+mod production_limit_tests;
+mod reused_output_tests;
+
 const OFFER_LIFETIME_SECONDS: u64 = 60;
 static EIGHT_OUTCOMES: [&str; 8] = ["A", "B", "C", "D", "E", "F", "G", "H"];
 /// The registered one-vs-rest complement of `B`. It is not the complement of `A`.
@@ -209,13 +213,24 @@ async fn commit_and_check(
     now: u64,
     expected_fee: u64,
 ) -> CtfSettlementResponse {
+    commit_and_check_with(mint, request, settlement_settings(), now, expected_fee).await
+}
+
+/// [`commit_and_check`] under an explicit advertised settlement capability.
+async fn commit_and_check_with(
+    mint: &Mint,
+    request: &CtfSettlementRequest,
+    settings: NutCtfSettlementSettings,
+    now: u64,
+    expected_fee: u64,
+) -> CtfSettlementResponse {
     let db = mint.localstore();
     let before = db
         .get_completed_operations_by_kind(OperationKind::Swap)
         .await
         .unwrap();
     let response = mint
-        .process_ctf_settlement(request, settlement_settings(), now)
+        .process_ctf_settlement(request, settings, now)
         .await
         .expect("the settlement must commit");
 
@@ -272,8 +287,29 @@ async fn assert_request_absent(
         .unwrap()
         .iter()
         .all(Option::is_none));
+    let outputs = request
+        .participants
+        .iter()
+        .flat_map(|participant| participant.outputs.iter().cloned())
+        .collect::<Vec<_>>();
+    assert_outputs_have_no_rows(mint, &outputs).await;
     assert_eq!(completed_swap_count(mint).await, completed_before);
     assert_ctf_settlement_replay_absent(mint, request).await;
+}
+
+/// No signed or pending `blind_signature` row exists for any of the outputs.
+///
+/// A signature read sees only signed rows. A pending row has no signature, but
+/// it still makes a new insert of its output fail.
+async fn assert_outputs_have_no_rows(mint: &Mint, outputs: &[BlindedMessage]) {
+    let probe = Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO);
+    let mut tx = mint.localstore().begin_transaction().await.unwrap();
+    let inserted = tx.add_blinded_messages(None, outputs, &probe).await;
+    tx.rollback().await.unwrap();
+    assert!(
+        inserted.is_ok(),
+        "an output still has a signed or pending row: {inserted:?}"
+    );
 }
 
 /// The mint refuses the request before it signs or persists anything.
@@ -282,10 +318,20 @@ async fn refuse_without_writes(
     request: &CtfSettlementRequest,
     now: u64,
 ) -> CtfSettlementError {
+    refuse_without_writes_with(mint, request, settlement_settings(), now).await
+}
+
+/// [`refuse_without_writes`] under an explicit advertised settlement capability.
+async fn refuse_without_writes_with(
+    mint: &Mint,
+    request: &CtfSettlementRequest,
+    settings: NutCtfSettlementSettings,
+    now: u64,
+) -> CtfSettlementError {
     let signing_before = mint.blind_sign_attempts();
     let completed_before = completed_swap_count(mint).await;
     let error = mint
-        .process_ctf_settlement(request, settlement_settings(), now)
+        .process_ctf_settlement(request, settings, now)
         .await
         .expect_err("the settlement must be refused");
     assert_eq!(mint.blind_sign_attempts(), signing_before);
@@ -884,20 +930,25 @@ impl EightOutcomeMergeFixture {
 
 /// Register an eight-outcome condition with one-vs-rest keysets.
 async fn register_eight_outcome_condition(mint: &Mint) -> (String, HashMap<String, Id>) {
+    register_one_vs_rest_condition(mint, &EIGHT_OUTCOMES, "eight-outcome-merge").await
+}
+
+/// Register a categorical condition with one singleton and one rest keyset per outcome.
+async fn register_one_vs_rest_condition(
+    mint: &Mint,
+    outcomes: &[&str],
+    event_id: &str,
+) -> (String, HashMap<String, Id>) {
     let mut mint_info = mint.mint_info().await.unwrap();
     let mut nut_ctf = mint_info.nuts.nut_ctf.take().unwrap_or_default();
     nut_ctf.default_keyset_creation = "one-vs-rest".to_string();
     mint_info.nuts.nut_ctf = Some(nut_ctf);
     mint.set_mint_info(mint_info).await.unwrap();
-    let (_, announcement) = create_test_announcement(
-        &create_test_oracle(),
-        &EIGHT_OUTCOMES,
-        "eight-outcome-merge",
-    );
-    let mut request = enum_condition_request("Eight-outcome merge", vec![announcement]);
+    let (_, announcement) = create_test_announcement(&create_test_oracle(), outcomes, event_id);
+    let mut request = enum_condition_request("One-vs-rest condition", vec![announcement]);
     request.outcome_collections = None;
     let registered = mint.register_condition(request).await.unwrap();
-    assert_eq!(registered.keysets.len(), 2 * EIGHT_OUTCOMES.len());
+    assert_eq!(registered.keysets.len(), 2 * outcomes.len());
     (registered.condition_id, registered.keysets)
 }
 

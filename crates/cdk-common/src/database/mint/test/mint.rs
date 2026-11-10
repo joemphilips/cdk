@@ -1161,6 +1161,183 @@ where
     tx.rollback().await.unwrap();
 }
 
+/// Compensation deletes only pending outputs. A stored signature is permanent.
+pub async fn delete_blinded_messages_keeps_signed_rows<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
+{
+    let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
+    let message = |amount: u64| cashu::BlindedMessage {
+        blinded_secret: SecretKey::generate().public_key(),
+        keyset_id,
+        amount: Amount::from(amount),
+        witness: None,
+    };
+    let signature = |amount: u64| BlindSignature {
+        amount: Amount::from(amount),
+        keyset_id,
+        c: SecretKey::generate().public_key(),
+        dleq: None,
+    };
+    let operation = Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO);
+    let signed = message(8);
+    let pending = message(4);
+    let stored = signature(8);
+
+    // One operation stores both outputs as pending and then signs one of them.
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_blinded_messages(None, &[signed.clone(), pending.clone()], &operation)
+        .await
+        .unwrap();
+    tx.add_blind_signatures(
+        &[signed.blinded_secret],
+        std::slice::from_ref(&stored),
+        None,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // Compensation names both outputs.
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.delete_blinded_messages(&[signed.blinded_secret, pending.blinded_secret])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        db.get_blind_signatures(&[signed.blinded_secret, pending.blinded_secret])
+            .await
+            .unwrap(),
+        vec![Some(stored.clone()), None]
+    );
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(
+        tx.add_blinded_messages(None, std::slice::from_ref(&pending), &operation)
+            .await
+            .is_ok(),
+        "the pending row must be gone"
+    );
+    assert!(matches!(
+        tx.add_blinded_messages(None, std::slice::from_ref(&signed), &operation)
+            .await,
+        Err(Error::Duplicate)
+    ));
+    tx.rollback().await.unwrap();
+
+    // A later operation cannot replace the stored signature.
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(matches!(
+        tx.add_blind_signatures(&[signed.blinded_secret], &[signature(8)], None)
+            .await,
+        Err(Error::Duplicate)
+    ));
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        db.get_blind_signatures(&[signed.blinded_secret])
+            .await
+            .unwrap(),
+        vec![Some(stored)]
+    );
+}
+
+/// Deleting a melt request deletes only its pending change outputs.
+pub async fn delete_melt_request_keeps_signed_change<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
+{
+    let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
+    let message = |amount: u64| cashu::BlindedMessage {
+        blinded_secret: SecretKey::generate().public_key(),
+        keyset_id,
+        amount: Amount::from(amount),
+        witness: None,
+    };
+    let operation = Operation::new_melt(
+        Amount::ZERO,
+        Amount::ZERO,
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+    );
+    let signed = message(8);
+    let pending = message(4);
+    let stored = BlindSignature {
+        amount: Amount::from(8u64),
+        keyset_id,
+        c: SecretKey::generate().public_key(),
+        dleq: None,
+    };
+    let quote = MeltQuote::new(
+        None,
+        MeltPaymentRequest::Bolt11 {
+            bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap(),
+        },
+        CurrencyUnit::Sat,
+        Amount::new(33, CurrencyUnit::Sat),
+        Amount::new(0, CurrencyUnit::Sat),
+        0,
+        None,
+        None,
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        None,
+        None,
+    );
+
+    // The melt request stores two change outputs, and one of them is signed.
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_melt_quote(quote.clone()).await.unwrap();
+    tx.add_melt_request(
+        &quote.id,
+        Amount::new(100, CurrencyUnit::Sat),
+        Amount::new(1, CurrencyUnit::Sat),
+    )
+    .await
+    .unwrap();
+    tx.add_blinded_messages(
+        Some(&quote.id),
+        &[signed.clone(), pending.clone()],
+        &operation,
+    )
+    .await
+    .unwrap();
+    tx.add_blind_signatures(
+        &[signed.blinded_secret],
+        std::slice::from_ref(&stored),
+        Some(quote.id.clone()),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // The signed row keeps the quote id, so only `c IS NULL` protects it here.
+    assert_eq!(
+        db.get_blind_signatures_for_quote(&quote.id).await.unwrap(),
+        vec![stored.clone()]
+    );
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.delete_melt_request(&quote.id).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        db.get_blind_signatures(&[signed.blinded_secret, pending.blinded_secret])
+            .await
+            .unwrap(),
+        vec![Some(stored), None]
+    );
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(
+        tx.add_blinded_messages(None, std::slice::from_ref(&pending), &operation)
+            .await
+            .is_ok(),
+        "the pending change row must be gone"
+    );
+    assert!(matches!(
+        tx.add_blinded_messages(None, std::slice::from_ref(&signed), &operation)
+            .await,
+        Err(Error::Duplicate)
+    ));
+    tx.rollback().await.unwrap();
+}
+
 /// Test incrementing mint quote amount paid
 pub async fn increment_mint_quote_amount_paid<DB>(db: DB)
 where
