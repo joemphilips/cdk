@@ -26,6 +26,9 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 /// Bounds that keep the bucket arithmetic exact.
 const MAX_PER_MINUTE: u32 = 1_000_000;
 const MAX_BURST: u32 = 1_000_000;
+/// A client body must arrive within this time. A stalled body holds at most
+/// `max_body_bytes` of memory until then.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Rate limit configuration. The limits are off when this table is absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,7 +215,12 @@ impl RateLimiter {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let entry = (class, key);
-        if !buckets.arrival.contains_key(&entry) && buckets.arrival.len() >= self.capacity {
+        // The engine keys are the configured engine addresses, a bounded set. They skip the
+        // capacity check, so a table full of other clients never refuses the engine.
+        if class != RequestClass::Engine
+            && !buckets.arrival.contains_key(&entry)
+            && buckets.arrival.len() >= self.capacity
+        {
             if buckets.next_prune.is_none_or(|next| now >= next) {
                 // A full bucket holds no state, so removing it changes no decision.
                 buckets.arrival.retain(|_, arrival| *arrival > now);
@@ -291,10 +299,14 @@ async fn capped(request: Request, max_body_bytes: usize) -> Result<Request, Resp
         return Err(payload_too_large());
     }
     let (parts, body) = request.into_parts();
+    let bytes = tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        axum::body::to_bytes(body, max_body_bytes),
+    )
+    .await
+    .map_err(|_| StatusCode::REQUEST_TIMEOUT.into_response())?
     // A read failure also refuses the request: its body is not usable.
-    let bytes = axum::body::to_bytes(body, max_body_bytes)
-        .await
-        .map_err(|_| payload_too_large())?;
+    .map_err(|_| payload_too_large())?;
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 

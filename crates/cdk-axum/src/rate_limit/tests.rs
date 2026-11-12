@@ -8,6 +8,7 @@ use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use cdk::mint::MintBuilder;
 use cdk::nuts::CurrencyUnit;
+use futures::StreamExt;
 use tower::ServiceExt;
 
 use super::{ClassLimit, Config, RateLimiter, RequestClass};
@@ -366,6 +367,53 @@ fn full_table_refuses_a_new_client_until_a_bucket_is_full_again() {
     // One token each 60 s: after that both buckets are full and hold no state.
     let later = start + Duration::from_secs(60);
     assert_eq!(check("198.51.100.3", later), Ok(()));
+}
+
+#[test]
+fn full_table_still_admits_the_engine() {
+    let limiter = RateLimiter::with_capacity(&config(1), 1).unwrap();
+    let start = Instant::now();
+    let client: IpAddr = CLIENT.parse().unwrap();
+    let engine: IpAddr = ENGINE.parse().unwrap();
+    assert_eq!(limiter.check(RequestClass::Read, client, start), Ok(()));
+    assert_eq!(
+        limiter.check(RequestClass::Read, OTHER_CLIENT.parse().unwrap(), start),
+        Err(Duration::from_secs(1))
+    );
+    // The engine bucket is not counted, so the table stays full for other clients.
+    for _ in 0..3 {
+        assert_eq!(limiter.check(RequestClass::Engine, engine, start), Ok(()));
+    }
+    assert_eq!(
+        limiter.check(RequestClass::Read, OTHER_CLIENT.parse().unwrap(), start),
+        Err(Duration::from_secs(1))
+    );
+}
+
+#[tokio::test]
+async fn stalled_client_body_is_refused_within_the_read_timeout() {
+    let router = router(config(10)).await;
+    // The paused clock advances only when every task waits, so the timeout
+    // fires at once in virtual time, with no real-time wait.
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let mut stalled = post("/v1/swap", CLIENT);
+    stalled.body = Body::from_stream(
+        futures::stream::iter([Ok::<_, std::io::Error>(padded(10))])
+            .chain(futures::stream::pending()),
+    );
+    // A bounded wait: without the read timeout the request never ends.
+    let answered = tokio::time::timeout(super::BODY_READ_TIMEOUT * 2, status(&router, stalled))
+        .await
+        .expect("the limiter must answer a stalled body");
+    assert_eq!(answered, StatusCode::REQUEST_TIMEOUT);
+    // The timer wheel rounds a deadline up to the next millisecond.
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= super::BODY_READ_TIMEOUT
+            && elapsed < super::BODY_READ_TIMEOUT + Duration::from_secs(1),
+        "{elapsed:?}"
+    );
 }
 
 #[test]
