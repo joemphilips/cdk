@@ -2996,6 +2996,146 @@ mod tests {
         );
     }
 
+    /// Rotation makes a keyset inactive but keeps it known. Restore must still
+    /// return the stored signatures of that keyset. Otherwise NUT-09 reports a
+    /// signed output on a rotated-out keyset as unsigned.
+    #[tokio::test]
+    async fn restore_returns_stored_signatures_of_a_rotated_out_keyset() {
+        use cdk_common::amount::SplitTarget;
+        use cdk_common::dhke::construct_proofs;
+
+        let denominations = vec![1, 2, 4, 8];
+        let mut mint = create_mint(MintConfig {
+            seed: &[23; 32],
+            supported_units: HashMap::from([(CurrencyUnit::Sat, (0, denominations.clone()))]),
+            ..Default::default()
+        })
+        .await;
+        let rotated_out = mint.get_active_keysets()[&CurrencyUnit::Sat];
+
+        // Inputs 1 + 2 + 4 fund a swap before the rotation. Input 8 funds a
+        // swap after it, because inputs of an inactive keyset stay spendable.
+        let input_secrets = PreMintSecrets::random(
+            rotated_out,
+            Amount::from(15),
+            &SplitTarget::None,
+            &(0, denominations.clone()).into(),
+        )
+        .unwrap();
+        let input_signatures = mint
+            .blind_sign(input_secrets.blinded_messages())
+            .await
+            .unwrap();
+        let (late_inputs, early_inputs): (Proofs, Proofs) = construct_proofs(
+            input_signatures,
+            input_secrets.rs(),
+            input_secrets.secrets(),
+            &mint.keyset(&rotated_out).unwrap().keys,
+        )
+        .unwrap()
+        .into_iter()
+        .partition(|proof| proof.amount == Amount::from(8));
+
+        // The swap is the production path that stores the signatures.
+        let early_outputs = PreMintSecrets::random(
+            rotated_out,
+            Amount::from(7),
+            &SplitTarget::None,
+            &(0, denominations.clone()).into(),
+        )
+        .unwrap()
+        .blinded_messages();
+        let early = mint
+            .process_swap_request(SwapRequest::new(early_inputs, early_outputs.clone()))
+            .await
+            .unwrap();
+        assert_eq!(early.signatures.len(), 3);
+
+        let rotated_in = mint
+            .rotate_keyset(CurrencyUnit::Sat, denominations.clone(), 0, false, None)
+            .await
+            .unwrap()
+            .id;
+        assert_ne!(rotated_in, rotated_out);
+        assert_eq!(mint.get_active_keysets()[&CurrencyUnit::Sat], rotated_in);
+        let rotated_out_info = mint
+            .get_keyset_info(&rotated_out)
+            .expect("rotation keeps the old keyset known");
+        assert!(!rotated_out_info.active);
+        assert_eq!(rotated_out_info.final_expiry, None);
+
+        let late_outputs = PreMintSecrets::random(
+            rotated_in,
+            Amount::from(8),
+            &SplitTarget::None,
+            &(0, denominations).into(),
+        )
+        .unwrap()
+        .blinded_messages();
+        let late = mint
+            .process_swap_request(SwapRequest::new(late_inputs, late_outputs.clone()))
+            .await
+            .unwrap();
+        assert_eq!(late.signatures.len(), 1);
+        assert!(early
+            .signatures
+            .iter()
+            .all(|signature| signature.keyset_id == rotated_out));
+        assert_eq!(late.signatures[0].keyset_id, rotated_in);
+
+        let never_signed = BlindedMessage::new(
+            Amount::from(1),
+            rotated_out,
+            SecretKey::generate().public_key(),
+        );
+        let requested = vec![
+            early_outputs[2].clone(),
+            never_signed,
+            early_outputs[0].clone(),
+            late_outputs[0].clone(),
+            early_outputs[1].clone(),
+        ];
+        // The expected signatures are the bytes that each swap returned.
+        let expected_outputs = vec![
+            requested[0].clone(),
+            requested[2].clone(),
+            requested[3].clone(),
+            requested[4].clone(),
+        ];
+        let expected_signatures = vec![
+            early.signatures[2].clone(),
+            early.signatures[0].clone(),
+            late.signatures[0].clone(),
+            early.signatures[1].clone(),
+        ];
+        let points: Vec<_> = requested
+            .iter()
+            .map(|output| output.blinded_secret)
+            .collect();
+        let before_signatures = mint.localstore.get_blind_signatures(&points).await.unwrap();
+        let before_issued = mint.total_issued().await.unwrap();
+        let before_redeemed = mint.total_redeemed().await.unwrap();
+        assert_eq!(before_issued[&rotated_out], Amount::from(7));
+        assert_eq!(before_issued[&rotated_in], Amount::from(8));
+
+        // Restore must not sign. This signatory refuses every signing request.
+        let keysets = mint.signatory.keysets().await.unwrap();
+        mint.signatory = Arc::new(MockSignatory::new(keysets));
+        let response = mint
+            .restore(RestoreRequest { outputs: requested })
+            .await
+            .unwrap();
+
+        assert_eq!(response.outputs, expected_outputs);
+        assert_eq!(response.signatures, expected_signatures);
+        assert_eq!(
+            mint.localstore.get_blind_signatures(&points).await.unwrap(),
+            before_signatures
+        );
+        assert_eq!(mint.total_issued().await.unwrap(), before_issued);
+        assert_eq!(mint.total_redeemed().await.unwrap(), before_redeemed);
+    }
+
     #[tokio::test]
     async fn verify_outputs_keyset_rejects_expired_keyset() {
         use cdk_common::nuts::SecretKey;
