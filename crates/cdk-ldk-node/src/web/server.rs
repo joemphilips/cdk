@@ -4,6 +4,7 @@ use std::sync::Arc;
 use axum::routing::{get, post};
 use axum::{middleware, Router};
 
+use crate::web::access::{require_access, WebAccess};
 use crate::web::csrf::ensure_csrf_token;
 use crate::web::handlers::{
     balance_page, channels_page, close_channel_page, dashboard, force_close_channel_page,
@@ -17,11 +18,15 @@ use crate::CdkLdkNode;
 
 pub struct WebServer {
     pub node: Arc<CdkLdkNode>,
+    access: Arc<WebAccess>,
 }
 
 impl WebServer {
-    pub fn new(node: Arc<CdkLdkNode>) -> Self {
-        Self { node }
+    pub fn new(node: Arc<CdkLdkNode>, access: WebAccess) -> Self {
+        Self {
+            node,
+            access: Arc::new(access),
+        }
     }
 
     pub fn create_router(&self) -> Router {
@@ -64,6 +69,11 @@ impl WebServer {
             // Static files - now embedded
             .route("/static/{*file}", get(static_handler))
             .layer(middleware::from_fn(ensure_csrf_token))
+            // Outermost: no handler and no CSRF cookie without access (MS2).
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&self.access),
+                require_access,
+            ))
             .with_state(state)
     }
 
@@ -93,7 +103,21 @@ mod tests {
     use tower::ServiceExt;
 
     use super::WebServer;
+    use crate::web::access::WebAccess;
     use crate::{CdkLdkNodeBuilder, ChainSource, GossipSource};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The headers of the operator browser on the tunnel: host, token and origin.
+    fn operator(builder: axum::http::request::Builder) -> axum::http::request::Builder {
+        use cdk_common::bitcoin::base64::Engine;
+        let basic = cdk_common::bitcoin::base64::engine::general_purpose::STANDARD
+            .encode(format!("operator:{TOKEN}"));
+        builder
+            .header("host", "127.0.0.1:8091")
+            .header("authorization", format!("Basic {basic}"))
+            .header("origin", "http://127.0.0.1:8091")
+    }
 
     const NODE_ID: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
@@ -125,13 +149,21 @@ mod tests {
                 .to_string(),
         );
         node.inner = Arc::new(builder.build().unwrap());
-        (storage, WebServer::new(Arc::new(node)).create_router())
+        let access = WebAccess::new(TOKEN.to_owned(), 8091).unwrap();
+        (
+            storage,
+            WebServer::new(Arc::new(node), access).create_router(),
+        )
     }
 
     async fn csrf_session(router: &Router) -> (String, String) {
         let response = router
             .clone()
-            .oneshot(Request::get("/channels/open").body(Body::empty()).unwrap())
+            .oneshot(
+                operator(Request::get("/channels/open"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -142,7 +174,6 @@ mod tests {
             .next()
             .unwrap()
             .to_string();
-        let token = cookie.split_once('=').unwrap().1.to_string();
         let html = String::from_utf8(
             to_bytes(response.into_body(), 2 * 1024 * 1024)
                 .await
@@ -151,7 +182,14 @@ mod tests {
         )
         .unwrap();
         assert!(html.contains("action=\"/channels/open\""));
-        assert!(html.contains(&format!("name=\"_csrf\" value=\"{token}\"")));
+        // The form token is an HMAC of the cookie, not the cookie value.
+        let token = html
+            .split("name=\"_csrf\" value=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap()
+            .to_string();
+        assert_ne!(token, cookie.split_once('=').unwrap().1);
         assert!(!html.contains("/channels/open/private"));
         (cookie, token)
     }
@@ -170,7 +208,7 @@ mod tests {
         router
             .clone()
             .oneshot(
-                Request::post("/channels/open/private")
+                operator(Request::post("/channels/open/private"))
                     .header("content-type", "application/x-www-form-urlencoded")
                     .header("cookie", cookie)
                     .body(Body::from(serde_urlencoded::to_string(fields).unwrap()))
@@ -190,7 +228,7 @@ mod tests {
         let (_storage, router) = test_router().await;
         let response = router
             .oneshot(
-                Request::post("/channels/open/private")
+                operator(Request::post("/channels/open/private"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -271,6 +309,23 @@ mod tests {
         assert_eq!(body["error"], "channel_open_failed");
         assert_eq!(body["message"], ldk_node::NodeError::NotRunning.to_string());
         assert_eq!(body["outcome"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn the_router_serves_nothing_without_access() {
+        let (_storage, router) = test_router().await;
+        let response = router
+            .oneshot(
+                Request::get("/channels/open")
+                    .header("host", "127.0.0.1:8091")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // No CSRF session is created for a refused request.
+        assert!(response.headers().get("set-cookie").is_none());
     }
 
     #[test]

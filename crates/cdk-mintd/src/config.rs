@@ -724,6 +724,11 @@ pub struct LdkNode {
     /// LDK node mnemonic
     /// If not set, LDK node will use its default seed storage mechanism
     pub ldk_node_mnemonic: Option<String>,
+    /// Access token of the web UI, as an `env:` or `file:` reference. Every
+    /// UI request presents it as the HTTP Basic password. Without it the web
+    /// UI does not start.
+    #[serde(default)]
+    pub webserver_token: Option<String>,
 }
 
 #[cfg(feature = "ldk-node")]
@@ -750,6 +755,7 @@ impl Default for LdkNode {
             webserver_host: default_webserver_host(),
             webserver_port: default_webserver_port(),
             ldk_node_mnemonic: None,
+            webserver_token: None,
         }
     }
 }
@@ -787,6 +793,7 @@ impl fmt::Debug for LdkNode {
             .field("webserver_host", &self.webserver_host)
             .field("webserver_port", &self.webserver_port)
             .field("ldk_node_mnemonic", &"[REDACTED]")
+            .field("webserver_token", &"[REDACTED]")
             .finish()
     }
 }
@@ -1194,6 +1201,7 @@ pub struct Prometheus {
 
 /// Transaction limits configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Maximum number of inputs allowed per transaction (swap/melt)
     #[serde(default = "default_max_inputs")]
@@ -1204,6 +1212,14 @@ pub struct Limits {
     /// Maximum number of outcomes allowed per conditional-token condition
     #[serde(default = "default_max_outcomes_per_condition")]
     pub max_outcomes_per_condition: usize,
+    /// The largest number of unexpired unpaid mint quotes. A new quote above it
+    /// gets 429. No cap without the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unpaid_mint_quotes: Option<u64>,
+    /// Rolling melt outflow budget of each unit, keyed by the unit name. When
+    /// the table is present, every configured unit needs a budget.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub melt_budget: std::collections::BTreeMap<String, MeltBudget>,
 }
 
 impl Default for Limits {
@@ -1212,8 +1228,20 @@ impl Default for Limits {
             max_inputs: 1000,
             max_outputs: 1000,
             max_outcomes_per_condition: default_max_outcomes_per_condition(),
+            max_unpaid_mint_quotes: None,
+            melt_budget: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// Rolling melt outflow budget of one unit, in that unit
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeltBudget {
+    /// The largest outflow in any rolling hour
+    pub per_hour: u64,
+    /// The largest outflow in any rolling day
+    pub per_day: u64,
 }
 
 fn default_max_inputs() -> usize {

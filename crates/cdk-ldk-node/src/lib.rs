@@ -40,6 +40,9 @@ mod error;
 mod log;
 mod web;
 
+/// The shortest access token of the web UI.
+pub const WEB_ACCESS_TOKEN_MIN_LEN: usize = web::access::MIN_TOKEN_LEN;
+
 /// Primary KV namespace for the ldk-node backend's durable bookkeeping
 const LDK_KV_PRIMARY_NAMESPACE: &str = "cdk_ldk_node_lightning_backend";
 /// Secondary KV namespace holding the bolt12 melt quote id -> payment id
@@ -50,6 +53,18 @@ const PAYMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capacity for terminal outgoing payment notifications
 const PAYMENT_EVENT_CHANNEL_CAPACITY: usize = 64;
 const LDK_KV_BOLT12_CLEANUP_MARKER: &[u8] = b"cleanup-in-progress";
+/// The longest expiry of an incoming BOLT11 invoice. The startup sweep relies on it.
+pub(crate) const MAX_INVOICE_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
+/// Time after the longest expiry before the startup sweep removes an unpaid
+/// record. LDK accepts an HTLC up to two hours after the invoice expiry.
+const UNPAID_RECORD_RETENTION_SECS: u64 = 24 * 60 * 60;
+
+/// An unpaid incoming BOLT11 invoice: the only record that the backend removes.
+fn is_unpaid_inbound_bolt11(details: &PaymentDetails) -> bool {
+    details.direction == PaymentDirection::Inbound
+        && details.status == PaymentStatus::Pending
+        && matches!(details.kind, PaymentKind::Bolt11 { .. })
+}
 
 /// Result of looking up the payment id recorded for a bolt12 melt quote
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +159,8 @@ pub struct CdkLdkNode {
     outgoing_payment_sender: tokio::sync::broadcast::Sender<PaymentId>,
     events_cancel_token: CancellationToken,
     web_addr: Option<SocketAddr>,
+    /// The per-start access token of the web UI. Without it the UI does not start.
+    web_access_token: Option<String>,
 }
 
 impl fmt::Debug for CdkLdkNode {
@@ -390,6 +407,7 @@ impl CdkLdkNodeBuilder {
             outgoing_payment_sender,
             events_cancel_token: CancellationToken::new(),
             web_addr: None,
+            web_access_token: None,
         })
     }
 }
@@ -401,6 +419,12 @@ impl CdkLdkNode {
     /// * `addr` - Socket address for the web server. If None, no web server will be started.
     pub fn set_web_addr(&mut self, addr: Option<SocketAddr>) {
         self.web_addr = addr;
+    }
+
+    /// Set the access token of the web UI: the HTTP Basic password of every
+    /// request. Without a token the web UI does not start.
+    pub fn set_web_access_token(&mut self, token: Option<String>) {
+        self.web_access_token = token;
     }
 
     /// Get a default web server address using an unused port
@@ -602,8 +626,12 @@ impl CdkLdkNode {
     ///
     /// # Errors
     /// Returns an error if the web server fails to start
-    pub fn start_web_server(&self, web_addr: SocketAddr) -> Result<(), Error> {
-        let web_server = crate::web::WebServer::new(Arc::new(self.clone()));
+    pub fn start_web_server(
+        &self,
+        web_addr: SocketAddr,
+        access: crate::web::WebAccess,
+    ) -> Result<(), Error> {
+        let web_server = crate::web::WebServer::new(Arc::new(self.clone()), access);
 
         tokio::spawn(async move {
             if let Err(e) = web_server.serve(web_addr).await {
@@ -811,6 +839,25 @@ impl CdkLdkNode {
     pub fn node(&self) -> Arc<Node> {
         Arc::clone(&self.inner)
     }
+
+    /// Remove the unpaid incoming BOLT11 records last updated before `cutoff`.
+    ///
+    /// The mint releases the record of each expired quote that it deletes.
+    /// This sweep removes the records that no quote releases, for example
+    /// after a crash between the two steps. Returns the number of removed records.
+    pub fn sweep_unpaid_inbound_records(&self, cutoff: u64) -> usize {
+        let stale = self.inner.list_payments_with_filter(|details| {
+            is_unpaid_inbound_bolt11(details) && details.latest_update_timestamp < cutoff
+        });
+        let mut removed = 0;
+        for details in stale {
+            match self.inner.remove_payment(&details.id) {
+                Ok(()) => removed += 1,
+                Err(err) => tracing::warn!("Could not remove an unpaid payment record: {}", err),
+            }
+        }
+        removed
+    }
 }
 
 /// Mint payment trait
@@ -828,13 +875,28 @@ impl MintPayment for CdkLdkNode {
 
         tracing::info!("CdkLdkNode payment processor started successfully");
 
-        // Start web server if configured
+        let cutoff =
+            unix_time().saturating_sub(MAX_INVOICE_EXPIRY_SECS + UNPAID_RECORD_RETENTION_SECS);
+        let removed = self.sweep_unpaid_inbound_records(cutoff);
+        if removed > 0 {
+            tracing::info!(removed, "removed old unpaid incoming payment records");
+        }
+
+        // Start web server if configured. It can spend the node funds, so it
+        // never starts without an access token.
         if let Some(web_addr) = self.web_addr {
-            tracing::info!("Starting LDK Node web interface on {}", web_addr);
-            self.start_web_server(web_addr).map_err(|e| {
-                tracing::error!("Failed to start web server: {}", e);
-                e
-            })?;
+            match self.web_access_token.clone() {
+                Some(token) => {
+                    let access = crate::web::WebAccess::new(token, web_addr.port())
+                        .map_err(|e| Error::WebAccess(e.to_string()))?;
+                    tracing::info!("Starting LDK Node web interface on {}", web_addr);
+                    self.start_web_server(web_addr, access).map_err(|e| {
+                        tracing::error!("Failed to start web server: {}", e);
+                        e
+                    })?;
+                }
+                None => tracing::warn!("LDK Node web interface disabled: no access token"),
+            }
         } else {
             tracing::info!("No web server address configured, skipping web interface");
         }
@@ -889,6 +951,11 @@ impl MintPayment for CdkLdkNode {
                         .ok_or(payment::Error::InvalidExpiry)?,
                     None => 36000,
                 };
+                // The startup sweep removes an unpaid record only after the
+                // longest expiry, so a longer invoice could lose its record.
+                if time > MAX_INVOICE_EXPIRY_SECS {
+                    return Err(payment::Error::InvalidExpiry);
+                }
 
                 let description = Bolt11InvoiceDescription::Direct(
                     Description::new(description).map_err(|_| Error::InvalidDescription)?,
@@ -1393,6 +1460,28 @@ impl MintPayment for CdkLdkNode {
         self.wait_invoice_cancel_token.cancel()
     }
 
+    /// Remove the record of an expired unpaid invoice. A received or
+    /// in-flight payment keeps its record.
+    async fn release_incoming_payment_request(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<(), Self::Err> {
+        let PaymentIdentifier::PaymentHash(hash) = payment_identifier else {
+            return Ok(());
+        };
+        let payment_id = PaymentId(*hash);
+        if self
+            .inner
+            .payment(&payment_id)
+            .is_some_and(|details| is_unpaid_inbound_bolt11(&details))
+        {
+            self.inner
+                .remove_payment(&payment_id)
+                .map_err(Error::LdkNode)?;
+        }
+        Ok(())
+    }
+
     /// Check the status of an incoming payment
     async fn check_incoming_payment_status(
         &self,
@@ -1879,6 +1968,104 @@ mod tests {
         }
         drop(node);
         std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    async fn unstarted_node(storage: &std::path::Path) -> CdkLdkNode {
+        CdkLdkNodeBuilder::new(
+            Network::Regtest,
+            ChainSource::Esplora("http://127.0.0.1:1".to_owned()),
+            GossipSource::P2P,
+            storage.to_str().unwrap().to_owned(),
+            FeeReserve {
+                min_fee_reserve: Amount::ZERO,
+                percent_fee_reserve: 0.0,
+            },
+            vec!["127.0.0.1:0".parse().unwrap()],
+            test_kv_store().await,
+        )
+        .build()
+        .unwrap()
+    }
+
+    fn bolt11_request(expires_in: u64) -> IncomingPaymentOptions {
+        IncomingPaymentOptions::Bolt11(Bolt11IncomingPaymentOptions {
+            description: None,
+            amount: Amount::new(1_000, CurrencyUnit::Msat),
+            unix_expiry: Some(unix_time() + expires_in),
+        })
+    }
+
+    #[tokio::test]
+    async fn expired_unpaid_invoice_records_return_to_the_baseline() {
+        let storage = tempfile::tempdir().unwrap();
+        let node = unstarted_node(storage.path()).await;
+        let baseline = node.inner.list_payments().len();
+        let mut identifiers = Vec::new();
+        for _ in 0..4 {
+            let created = node
+                .create_incoming_payment_request(bolt11_request(600))
+                .await
+                .unwrap();
+            identifiers.push(created.request_lookup_id);
+        }
+        assert_eq!(node.inner.list_payments().len(), baseline + 4);
+
+        // The mint releases the record of each quote that it deletes.
+        node.release_incoming_payment_request(&identifiers[0])
+            .await
+            .unwrap();
+        node.release_incoming_payment_request(&PaymentIdentifier::PaymentHash([9; 32]))
+            .await
+            .unwrap();
+        node.release_incoming_payment_request(&PaymentIdentifier::OfferId("lno".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(node.inner.list_payments().len(), baseline + 3);
+
+        // The sweep removes only records older than its cutoff.
+        let created = unix_time();
+        assert_eq!(
+            node.sweep_unpaid_inbound_records(created.saturating_sub(3600)),
+            0
+        );
+        assert_eq!(node.sweep_unpaid_inbound_records(created + 10), 3);
+        assert_eq!(node.inner.list_payments().len(), baseline);
+    }
+
+    #[test]
+    fn only_unpaid_inbound_bolt11_records_are_removable() {
+        let inbound = |status| PaymentDetails {
+            direction: PaymentDirection::Inbound,
+            ..test_payment_details(status, Some(1_000))
+        };
+        assert!(is_unpaid_inbound_bolt11(&inbound(PaymentStatus::Pending)));
+        assert!(!is_unpaid_inbound_bolt11(&inbound(
+            PaymentStatus::Succeeded
+        )));
+        assert!(!is_unpaid_inbound_bolt11(&inbound(PaymentStatus::Failed)));
+        assert!(!is_unpaid_inbound_bolt11(&test_payment_details(
+            PaymentStatus::Pending,
+            Some(1_000)
+        )));
+        assert!(!is_unpaid_inbound_bolt11(&PaymentDetails {
+            kind: PaymentKind::Spontaneous {
+                hash: PaymentHash([1; 32]),
+                preimage: None,
+            },
+            ..inbound(PaymentStatus::Pending)
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_invoice_expiry_above_the_sweep_bound_is_refused() {
+        let storage = tempfile::tempdir().unwrap();
+        let node = unstarted_node(storage.path()).await;
+        assert!(matches!(
+            node.create_incoming_payment_request(bolt11_request(MAX_INVOICE_EXPIRY_SECS + 60))
+                .await,
+            Err(payment::Error::InvalidExpiry)
+        ));
+        assert!(node.inner.list_payments().is_empty());
     }
 
     #[test]

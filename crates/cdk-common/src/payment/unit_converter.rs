@@ -95,6 +95,15 @@ impl MintPayment for SharedMintPayment {
             .await
     }
 
+    async fn release_incoming_payment_request(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<(), Self::Err> {
+        self.inner
+            .release_incoming_payment_request(payment_identifier)
+            .await
+    }
+
     async fn check_outgoing_payment(
         &self,
         payment_identifier: &PaymentIdentifier,
@@ -282,6 +291,15 @@ where
             .collect()
     }
 
+    async fn release_incoming_payment_request(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<(), Self::Err> {
+        self.inner
+            .release_incoming_payment_request(payment_identifier)
+            .await
+    }
+
     #[tracing::instrument(skip_all)]
     async fn check_outgoing_payment(
         &self,
@@ -437,6 +455,15 @@ where
             .into_iter()
             .map(convert_wait_payment_response_to_sat)
             .collect()
+    }
+
+    async fn release_incoming_payment_request(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<(), Self::Err> {
+        self.inner
+            .release_incoming_payment_request(payment_identifier)
+            .await
     }
 
     #[tracing::instrument(skip_all)]

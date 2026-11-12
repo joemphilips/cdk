@@ -28,6 +28,29 @@ use crate::auth::AuthHeader;
 use crate::router_handlers::into_response;
 use crate::MintState;
 
+/// Seconds that a client waits after the unpaid quote cap refuses a quote.
+const UNPAID_QUOTE_RETRY_AFTER_SECONDS: u32 = 60;
+
+/// Map a quote creation error. The unpaid quote cap is load shedding, not a
+/// request error, so it answers 429 with `Retry-After` (MS1).
+fn quote_creation_error(error: cdk::Error) -> Response {
+    if !matches!(error, cdk::Error::UnpaidQuoteLimitReached) {
+        return into_response(error);
+    }
+    let body: cdk::error::ErrorResponse = error.into();
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(UNPAID_QUOTE_RETRY_AFTER_SECONDS),
+    );
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        axum::http::HeaderValue::from_static("retry-after"),
+    );
+    response
+}
+
 const PREFER_HEADER_KEY: &str = "Prefer";
 
 /// Header extractor for the Prefer header
@@ -229,7 +252,7 @@ pub async fn post_mint_custom_quote(
                 .mint
                 .get_mint_quote(bolt11_request.into())
                 .await
-                .map_err(into_response)?;
+                .map_err(quote_creation_error)?;
 
             let response: MintQuoteBolt11Response<QuoteId> =
                 quote.try_into().map_err(into_response)?;
@@ -249,7 +272,7 @@ pub async fn post_mint_custom_quote(
                 .mint
                 .get_mint_quote(bolt12_request.into())
                 .await
-                .map_err(into_response)?;
+                .map_err(quote_creation_error)?;
 
             let response: MintQuoteBolt12Response<QuoteId> =
                 quote.try_into().map_err(into_response)?;
@@ -270,7 +293,7 @@ pub async fn post_mint_custom_quote(
                 .mint
                 .get_mint_quote(onchain_request.into())
                 .await
-                .map_err(into_response)?;
+                .map_err(quote_creation_error)?;
 
             let response: MintQuoteOnchainResponse<QuoteId> =
                 MintQuoteOnchainResponse::try_from(quote).map_err(into_response)?;
@@ -292,7 +315,7 @@ pub async fn post_mint_custom_quote(
                 .mint
                 .get_mint_quote(quote_request)
                 .await
-                .map_err(into_response)?;
+                .map_err(quote_creation_error)?;
 
             match response {
                 cdk::mint::MintQuoteResponse::Custom { response, .. } => {
@@ -1220,6 +1243,73 @@ mod tests {
             result.is_err(),
             "post_batch_check_mint_quote must reject cross-method quote checks"
         );
+    }
+
+    #[tokio::test]
+    async fn the_unpaid_quote_cap_answers_429_with_retry_after() {
+        let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(db.clone());
+        let fake = FakeWallet::new(
+            FeeReserve {
+                min_fee_reserve: 1.into(),
+                percent_fee_reserve: 0.0,
+            },
+            HashMap::default(),
+            HashSet::default(),
+            // The fake wallet pays an invoice after this many seconds.
+            3600,
+            CurrencyUnit::Sat,
+        );
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Known(KnownMethod::Bolt11),
+                MintMeltLimits::new(1, 10_000),
+                Arc::new(fake),
+            )
+            .await
+            .unwrap();
+        let mint = builder
+            .with_state_limits(cdk::mint::StateLimits {
+                max_unpaid_mint_quotes: Some(1),
+                ..Default::default()
+            })
+            .build_with_seed(db, &Mnemonic::generate(12).unwrap().to_seed_normalized(""))
+            .await
+            .unwrap();
+        mint.set_quote_ttl(QuoteTTL::new(10_000, 10_000))
+            .await
+            .unwrap();
+        let state = MintState {
+            mint: Arc::new(mint),
+            cache: Arc::new(HttpCache::default()),
+        };
+        let request = || Json(serde_json::json!({"amount": 10, "unit": "sat"}));
+        let first = post_mint_custom_quote(
+            AuthHeader::None,
+            State(state.clone()),
+            Path("bolt11".to_string()),
+            request(),
+        )
+        .await
+        .expect("the first unpaid quote fits the cap");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let refused = post_mint_custom_quote(
+            AuthHeader::None,
+            State(state.clone()),
+            Path("bolt11".to_string()),
+            request(),
+        )
+        .await
+        .expect_err("the second unpaid quote is over the cap");
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers()["retry-after"], "60");
+        assert_eq!(
+            refused.headers()["access-control-expose-headers"],
+            "retry-after"
+        );
+        assert_eq!(state.mint.mint_quotes().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -305,6 +305,15 @@ impl MintPayment for CanonicalPaymentEventOwner {
         Ok(payments)
     }
 
+    async fn release_incoming_payment_request(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<(), Self::Err> {
+        self.inner
+            .release_incoming_payment_request(payment_identifier)
+            .await
+    }
+
     async fn check_outgoing_payment(
         &self,
         payment_identifier: &PaymentIdentifier,

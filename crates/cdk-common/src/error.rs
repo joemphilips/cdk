@@ -240,6 +240,12 @@ pub enum Error {
     /// Minting is disabled
     #[error("Minting is disabled")]
     MintingDisabled,
+    /// The mint already holds its configured maximum of unpaid mint quotes
+    #[error("Too many unpaid mint quotes; try again later")]
+    UnpaidQuoteLimitReached,
+    /// The melt would exceed the rolling melt outflow budget of the mint
+    #[error("Melt outflow budget exceeded; try again later")]
+    MeltBudgetExceeded,
     /// Quote is not known
     #[error("Unknown quote")]
     UnknownQuote,
@@ -875,6 +881,8 @@ impl Error {
             | Self::UnsupportedPaymentMethod
             | Self::InvalidInvoice
             | Self::MintingDisabled
+            | Self::UnpaidQuoteLimitReached
+            | Self::MeltBudgetExceeded
             | Self::UnknownQuote
             | Self::ExpiredQuote(_, _)
             | Self::AmountOutofLimitRange(_, _, _)
@@ -1134,7 +1142,12 @@ impl From<Error> for ErrorResponse {
                     ),
                 }
             }
-            Error::MintingDisabled => ErrorResponse {
+            Error::MintingDisabled | Error::UnpaidQuoteLimitReached => ErrorResponse {
+                code: ErrorCode::MintingDisabled,
+                detail: err.to_string(),
+            },
+            // The same code as a disabled melt: no state changed, and a later retry can pass.
+            Error::MeltBudgetExceeded => ErrorResponse {
                 code: ErrorCode::MintingDisabled,
                 detail: err.to_string(),
             },

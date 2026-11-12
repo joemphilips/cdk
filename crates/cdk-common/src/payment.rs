@@ -498,6 +498,18 @@ pub trait MintPayment {
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err>;
 
+    /// Release the backend state of an incoming payment request that expired
+    /// without a payment. The mint calls this after it deletes the quote.
+    ///
+    /// A backend must keep a received or in-flight payment. The default keeps
+    /// everything: a backend without per-request state has nothing to release.
+    async fn release_incoming_payment_request(
+        &self,
+        _payment_identifier: &PaymentIdentifier,
+    ) -> Result<(), Self::Err> {
+        Ok(())
+    }
+
     /// Check the status of an outgoing payment
     ///
     /// The reported status must be conservative about finality. The mint
@@ -875,6 +887,15 @@ where
         metrics.record(result.is_ok());
 
         result
+    }
+
+    async fn release_incoming_payment_request(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<(), Self::Err> {
+        self.inner
+            .release_incoming_payment_request(payment_identifier)
+            .await
     }
 
     async fn check_outgoing_payment(

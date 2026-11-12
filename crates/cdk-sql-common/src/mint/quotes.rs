@@ -1241,6 +1241,62 @@ where
             .await
             .map(|quote| quote.map(|inner| inner.into()))
     }
+
+    async fn delete_expired_unpaid_mint_quotes(
+        &mut self,
+        expired_before: u64,
+        limit: u64,
+    ) -> Result<Vec<PaymentIdentifier>, Self::Err> {
+        // A quote with a payment or an issuance row is never unpaid. The
+        // NOT EXISTS terms also keep the delete clear of their foreign keys.
+        const UNPAID: &str = r#"
+            amount_paid = 0
+            AND amount_issued = 0
+            AND NOT EXISTS (SELECT 1 FROM mint_quote_payments p WHERE p.quote_id = mint_quote.id)
+            AND NOT EXISTS (SELECT 1 FROM mint_quote_issued i WHERE i.quote_id = mint_quote.id)
+        "#;
+        let candidates = query(&format!(
+            r#"
+            SELECT id, request, request_lookup_id, request_lookup_id_kind
+            FROM mint_quote
+            WHERE expiry > 0 AND expiry < :expired_before AND {UNPAID}
+            ORDER BY expiry
+            LIMIT :limit
+            "#
+        ))?
+        .bind("expired_before", expired_before as i64)
+        .bind("limit", limit.min(i64::MAX as u64) as i64)
+        .fetch_all(&self.inner)
+        .await?;
+
+        let mut released = Vec::with_capacity(candidates.len());
+        for row in candidates {
+            unpack_into!(let (id, request, request_lookup_id, request_lookup_id_kind) = row);
+            let id = column_as_string!(id);
+            let request = column_as_string!(&request);
+            let lookup_id = column_as_nullable_string!(&request_lookup_id).unwrap_or_else(|| {
+                Bolt11Invoice::from_str(&request)
+                    .map(|invoice| invoice.payment_hash().to_string())
+                    .unwrap_or_else(|_| request.clone())
+            });
+            let kind = column_as_string!(request_lookup_id_kind);
+            // The row predicate is repeated: a payment between the select and
+            // this delete keeps the quote.
+            let deleted = query(&format!(
+                r#"DELETE FROM mint_quote WHERE id = :id AND expiry < :expired_before AND {UNPAID}"#
+            ))?
+            .bind("id", id)
+            .bind("expired_before", expired_before as i64)
+            .execute(&self.inner)
+            .await?;
+            if deleted == 1 {
+                if let Ok(identifier) = PaymentIdentifier::new(&kind, &lookup_id) {
+                    released.push(identifier);
+                }
+            }
+        }
+        Ok(released)
+    }
 }
 
 #[async_trait]
@@ -1404,6 +1460,56 @@ where
         }
 
         result
+    }
+
+    async fn count_unexpired_unpaid_mint_quotes(&self, now: u64) -> Result<u64, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        let count = query(
+            r#"
+            SELECT CAST(COUNT(*) AS BIGINT)
+            FROM mint_quote
+            WHERE expiry > :now AND amount_paid = 0
+            "#,
+        )?
+        .bind("now", now as i64)
+        .pluck(&*conn)
+        .await?
+        .map(|value| Ok::<u64, Error>(column_as_number!(value)))
+        .transpose()?
+        .unwrap_or(0);
+        Ok(count)
+    }
+
+    async fn melt_outflow_since(&self, unit: &CurrencyUnit, since: u64) -> Result<u64, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        // Two sums, so that each one can use its index (state, paid_time). PostgreSQL
+        // stores both amounts as INTEGER: add them as BIGINT, so a large sum cannot overflow.
+        let outflow = query(
+            r#"
+            SELECT CAST(
+                COALESCE((SELECT SUM(CAST(amount AS BIGINT) + CAST(fee_reserve AS BIGINT)) FROM melt_quote
+                          WHERE unit = :unit AND state IN ('PENDING', 'UNKNOWN')), 0)
+              + COALESCE((SELECT SUM(CAST(amount AS BIGINT) + CAST(fee_reserve AS BIGINT)) FROM melt_quote
+                          WHERE unit = :unit AND paid_time >= :since AND state = 'PAID'), 0)
+            AS BIGINT)
+            "#,
+        )?
+        .bind("unit", unit.to_string())
+        .bind("since", since as i64)
+        .pluck(&*conn)
+        .await?
+        .map(|value| Ok::<u64, Error>(column_as_number!(value)))
+        .transpose()?
+        .unwrap_or(0);
+        Ok(outflow)
     }
 
     async fn get_melt_quotes(&self) -> Result<Vec<mint::MeltQuote>, Self::Err> {

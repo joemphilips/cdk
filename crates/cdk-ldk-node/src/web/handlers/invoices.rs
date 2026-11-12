@@ -209,6 +209,22 @@ pub async fn post_create_bolt11(
     };
 
     let expiry_seconds = form.expiry_seconds.unwrap_or(3600);
+    // The startup sweep removes an unpaid record after the longest expiry.
+    if u64::from(expiry_seconds) > crate::MAX_INVOICE_EXPIRY_SECS {
+        let content = html! {
+            (error_message("Expiry is longer than 7 days"))
+            div class="card" {
+                a href="/invoices" { button { "← Try Again" } }
+            }
+        };
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "text/html")
+            .body(Body::from(
+                layout_with_status("Invoice Error", content, true).into_string(),
+            ))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let invoice_result =
         state
             .node

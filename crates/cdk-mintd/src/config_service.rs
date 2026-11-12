@@ -815,6 +815,10 @@ fn validate_secret_references(settings: &Settings) -> Result<(), ConfigurationSe
             ldk_node.ldk_node_mnemonic.as_deref(),
             "ldk_node.ldk_node_mnemonic",
         )?;
+        validate_optional_secret_reference(
+            ldk_node.webserver_token.as_deref(),
+            "ldk_node.webserver_token",
+        )?;
     }
     #[cfg(feature = "redis")]
     if let cdk_axum::cache::Backend::Redis(redis) = &settings.info.http_cache.backend {
@@ -890,6 +894,7 @@ fn resolve_secrets(settings: &mut Settings) -> Result<(), ConfigurationServiceEr
             &mut ldk_node.ldk_node_mnemonic,
             "ldk_node.ldk_node_mnemonic",
         )?;
+        resolve_optional_trimmed_secret(&mut ldk_node.webserver_token, "ldk_node.webserver_token")?;
     }
     #[cfg(feature = "redis")]
     if let cdk_axum::cache::Backend::Redis(redis) = &mut settings.info.http_cache.backend {
@@ -1252,6 +1257,17 @@ ldk_node_mnemonic = "plaintext-secret"
 "#,
             ),
             "ldk_node.ldk_node_mnemonic",
+        );
+        #[cfg(feature = "ldk-node")]
+        assert_rejected(
+            remote_signatory_document(
+                "",
+                r#"
+[ldk_node]
+webserver_token = "plaintext-secret"
+"#,
+            ),
+            "ldk_node.webserver_token",
         );
         #[cfg(feature = "redis")]
         assert_rejected(
@@ -2641,6 +2657,77 @@ tls_mode = "disable"
         assert!(verify_local_keysets(&seed, &[changed], &used).is_err());
         assert!(verify_local_keysets(&seed, &[], &used).is_err());
     }
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn state_limits_are_parsed_and_validated_before_persistence() {
+        let mnemonic_path = crate::test_utils::unique_temp_path("validate_state_limits_mnemonic");
+        std::fs::write(&mnemonic_path, TEST_MNEMONIC_ONE).unwrap();
+        let base = document(&format!("file:{}", mnemonic_path.display()), "state limits");
+        // A sat rail also serves msat, so both units need a budget.
+        let budget = |unit: &str, hour: u64, day: u64| {
+            format!("[limits.melt_budget.{unit}]\nper_hour = {hour}\nper_day = {day}\n")
+        };
+        let both = format!(
+            "{}{}",
+            budget("sat", 1200, 6000),
+            budget("msat", 1_000_000, 5_000_000)
+        );
+        let with =
+            |limits: &str| format!("{base}\n[limits]\nmax_unpaid_mint_quotes = 500\n{limits}");
+
+        let valid = ConfigurationService::validate_document(&with(&both)).unwrap();
+        let limits = crate::state_limits(&valid.settings).unwrap();
+        assert_eq!(limits.max_unpaid_mint_quotes, Some(500));
+        assert_eq!(
+            limits.melt_budgets[&cdk::nuts::CurrencyUnit::Sat],
+            cdk::mint::MeltBudget {
+                per_hour: 1200,
+                per_day: 6000
+            }
+        );
+        let none = ConfigurationService::validate_document(&base).unwrap();
+        assert_eq!(
+            crate::state_limits(&none.settings).unwrap(),
+            cdk::mint::StateLimits::default()
+        );
+
+        let cases = [
+            (
+                with(&budget("sat", 1200, 6000)),
+                "no budget for the configured unit msat",
+            ),
+            (
+                format!("{}{}", with(&both), budget("usd", 1, 1)),
+                "not a configured unit",
+            ),
+            (
+                with(&both.replace("per_hour = 1200\n", "per_hour = 0\n")),
+                "0 < per_hour <= per_day",
+            ),
+            (
+                with(&both.replace("per_day = 6000\n", "per_day = 999\n")),
+                "0 < per_hour <= per_day",
+            ),
+            (
+                with(&both).replace("max_unpaid_mint_quotes = 500", "max_unpaid_mint_quotes = 0"),
+                "must be positive",
+            ),
+            (
+                with(&both).replace("max_unpaid_mint_quotes", "max_unpaid_quotes"),
+                "unknown field",
+            ),
+            (
+                with(&both.replace("per_day = 6000\n", "per_day = 6000\nper_week = 1\n")),
+                "unknown field",
+            ),
+        ];
+        for (invalid, expected) in cases {
+            let error = ConfigurationService::validate_document(&invalid).unwrap_err();
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
+        std::fs::remove_file(mnemonic_path).unwrap();
+    }
+
     #[cfg(all(feature = "fakewallet", feature = "conditional-tokens"))]
     #[test]
     fn rate_limit_table_is_parsed_and_validated_before_persistence() {

@@ -216,6 +216,9 @@ impl Mint {
             self.check_mint_request_acceptable(&mint_quote_request)
                 .await?;
 
+            // Each quote can store backend state before it expires (MS1).
+            self.check_unpaid_quote_cap().await?;
+
             // Extract pubkey using the getter
             let pubkey = mint_quote_request.pubkey();
 

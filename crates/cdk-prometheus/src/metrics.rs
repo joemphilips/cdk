@@ -80,6 +80,9 @@ pub struct CdkMetrics {
     mint_operations_total: IntCounterVec,
     mint_in_flight_requests: IntGaugeVec,
     mint_operation_duration: HistogramVec,
+
+    // Solvency metrics
+    mint_liabilities: IntGaugeVec,
 }
 
 impl CdkMetrics {
@@ -111,6 +114,15 @@ impl CdkMetrics {
         let (mint_operations_total, mint_operation_duration, mint_in_flight_requests) =
             Self::create_mint_metrics(&registry)?;
 
+        let mint_liabilities = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "cdk_mint_liabilities",
+                "Outstanding ecash of each unit, in that unit",
+            ),
+            &["unit"],
+        )?;
+        registry.register(Box::new(mint_liabilities.clone()))?;
+
         Ok(Self {
             registry,
             http_requests_total,
@@ -127,6 +139,7 @@ impl CdkMetrics {
             mint_operations_total,
             mint_in_flight_requests,
             mint_operation_duration,
+            mint_liabilities,
         })
     }
 
@@ -308,6 +321,13 @@ impl CdkMetrics {
             mint_operation_duration,
             mint_in_flight_requests,
         ))
+    }
+
+    /// Set the outstanding ecash of a unit. A value above `i64::MAX` is capped.
+    pub fn set_liabilities(&self, unit: &str, amount: u64) {
+        self.mint_liabilities
+            .with_label_values(&[unit])
+            .set(i64::try_from(amount).unwrap_or(i64::MAX));
     }
 
     /// Get the metrics registry

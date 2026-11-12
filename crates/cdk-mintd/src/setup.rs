@@ -596,6 +596,7 @@ impl PaymentBackendSetup for config::LdkNode {
         }
         let mut ldk_node = ldk_node_builder.build()?;
         ldk_node.set_web_addr(webserver_addr);
+        ldk_node.set_web_access_token(self.webserver_token.clone());
 
         Ok(ldk_node)
     }

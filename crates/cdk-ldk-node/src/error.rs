@@ -5,6 +5,10 @@ use thiserror::Error;
 /// LDK Node Error
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Invalid web UI access configuration
+    #[error("Invalid web UI access configuration: {0}")]
+    WebAccess(String),
+
     /// LDK Node error
     #[error("LDK Node error: {0}")]
     LdkNode(#[from] ldk_node::NodeError),

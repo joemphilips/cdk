@@ -5049,3 +5049,83 @@ async fn test_different_lookup_ids_allow_concurrent_pending() {
 
     // SUCCESS: Different lookup_ids allow concurrent pending!
 }
+
+// ============================================================================
+// Melt outflow budget (MS3)
+// ============================================================================
+
+async fn budget_melt(
+    mint: &crate::mint::Mint,
+    proofs: &cdk_common::nuts::Proofs,
+    quote: &cdk_common::mint::MeltQuote,
+) -> Result<PaymentOutcome, crate::Error> {
+    let melt_request = create_test_melt_request(proofs, quote);
+    let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
+    let saga = MeltSaga::new(
+        std::sync::Arc::new(mint.clone()),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    );
+    let setup = saga
+        .setup_melt(
+            &melt_request,
+            verification,
+            PaymentMethod::Known(KnownMethod::Bolt11),
+        )
+        .await
+        .unwrap();
+    let (payment, decision) = setup
+        .attempt_internal_settlement(&melt_request)
+        .await
+        .unwrap();
+    payment.make_payment(decision).await
+}
+
+/// An external melt above the rolling budget is refused before dispatch. Its
+/// inputs are released and its quote is unpaid again.
+#[tokio::test]
+async fn test_melt_budget_refuses_external_payment_and_releases_inputs() {
+    let started = create_test_mint().await.unwrap();
+    let probe = create_test_melt_quote(&started, Amount::from(4_000)).await;
+    // The budget counts the amount and the fee reserve of each melt.
+    let outflow = probe.amount().value() + probe.fee_reserve().value();
+    let limits = |per_hour| crate::mint::StateLimits {
+        max_unpaid_mint_quotes: None,
+        melt_budgets: std::collections::HashMap::from([(
+            CurrencyUnit::Sat,
+            crate::mint::MeltBudget {
+                per_hour,
+                per_day: 10 * outflow,
+            },
+        )]),
+    };
+
+    let mint = started.clone().with_state_limits(limits(outflow - 1));
+    let proofs = mint_test_proofs(&mint, Amount::from(10_000)).await.unwrap();
+    let ys = proofs.ys().unwrap();
+    let refused = budget_melt(&mint, &proofs, &probe).await;
+    assert!(matches!(refused, Err(crate::Error::MeltBudgetExceeded)));
+    assert_proofs_state(&mint, &ys, None).await;
+    let quote = mint
+        .localstore
+        .get_melt_quote(&probe.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(quote.state, MeltQuoteState::Unpaid);
+
+    // One melt fits the hour. A second one in the same hour does not.
+    let mint = started.with_state_limits(limits(outflow));
+    let PaymentOutcome::Confirmed(confirmed) = budget_melt(&mint, &proofs, &probe).await.unwrap()
+    else {
+        panic!("a melt inside the budget is paid");
+    };
+    confirmed.finalize().await.unwrap();
+    let second = create_test_melt_quote(&mint, Amount::from(4_000)).await;
+    let more = mint_test_proofs(&mint, Amount::from(10_000)).await.unwrap();
+    assert!(matches!(
+        budget_melt(&mint, &more, &second).await,
+        Err(crate::Error::MeltBudgetExceeded)
+    ));
+    assert_proofs_state(&mint, &more.ys().unwrap(), None).await;
+}

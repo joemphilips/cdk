@@ -6,6 +6,7 @@ use cdk_common::mint::{MeltFinalizationData, MeltSagaState, Operation, Saga, Sag
 use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::MeltQuoteState;
 use cdk_common::payment::OutgoingPaymentOptions;
+use cdk_common::util::unix_time;
 use cdk_common::{
     Amount, CurrencyUnit, Error, ProofsMethods, PublicKey, QuoteId, SpendingConditionVerification,
     State,
@@ -687,6 +688,15 @@ impl MeltSaga<SetupComplete> {
         let payment_result = match settlement {
             SettlementDecision::Internal { amount } => self.handle_internal_payment(amount),
             SettlementDecision::RequiresExternalPayment => {
+                // The quote is already pending, so the budget sum includes it.
+                if let Err(err) = self
+                    .mint
+                    .check_melt_budget(&self.state_data.quote.unit, unix_time())
+                    .await
+                {
+                    self.compensate_all().await?;
+                    return Err(err);
+                }
                 let response = self.attempt_external_payment().await?;
 
                 match response.status {

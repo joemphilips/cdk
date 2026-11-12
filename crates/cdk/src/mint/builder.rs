@@ -78,6 +78,7 @@ pub struct MintBuilder {
     custom_paths: HashMap<CurrencyUnit, DerivationPath>,
     use_keyset_v2: Option<bool>,
     keyset_rotations: Vec<KeysetRotation>,
+    state_limits: super::StateLimits,
     max_inputs: usize,
     max_outputs: usize,
     #[cfg(feature = "conditional-tokens")]
@@ -128,6 +129,7 @@ impl MintBuilder {
             custom_paths: HashMap::new(),
             use_keyset_v2: None,
             keyset_rotations: Vec::new(),
+            state_limits: super::StateLimits::default(),
             max_inputs: 1000,
             max_outputs: 1000,
             #[cfg(feature = "conditional-tokens")]
@@ -386,6 +388,12 @@ impl MintBuilder {
         custom_paths: HashMap<CurrencyUnit, DerivationPath>,
     ) -> Self {
         self.custom_paths = custom_paths;
+        self
+    }
+
+    /// Set the bounds on unpaid quote state and on melt outflow.
+    pub fn with_state_limits(mut self, limits: super::StateLimits) -> Self {
+        self.state_limits = limits;
         self
     }
 
@@ -848,7 +856,8 @@ impl MintBuilder {
                 #[cfg(feature = "conditional-tokens")]
                 self.max_outcomes_per_condition,
             )
-            .await;
+            .await
+            .map(|mint| mint.with_state_limits(self.state_limits));
         }
         Mint::new(
             self.mint_info,
@@ -861,6 +870,7 @@ impl MintBuilder {
             self.max_outcomes_per_condition,
         )
         .await
+        .map(|mint| mint.with_state_limits(self.state_limits))
     }
 
     /// Build the mint with the provided keystore and seed

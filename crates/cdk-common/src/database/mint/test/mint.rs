@@ -2173,3 +2173,151 @@ pub async fn concurrent_mint_quote_batches_use_consistent_lock_order(db: DynMint
     assert_eq!(second_quotes[0].as_ref().unwrap().id, quote2.id);
     assert_eq!(second_quotes[1].as_ref().unwrap().id, quote1.id);
 }
+
+fn bolt11_mint_quote(expiry: u64) -> MintQuote {
+    MintQuote::new(
+        None,
+        unique_string(),
+        cashu::CurrencyUnit::Sat,
+        Some(Amount::new(1000, cashu::CurrencyUnit::Sat)),
+        expiry,
+        PaymentIdentifier::CustomId(unique_string()),
+        None,
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+    )
+}
+
+/// Only an expired quote without a payment is deleted, and the limit bounds one call
+pub async fn delete_expired_unpaid_mint_quotes<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let expired = [bolt11_mint_quote(100), bolt11_mint_quote(200)];
+    let expired_paid = bolt11_mint_quote(100);
+    let live = bolt11_mint_quote(10_000);
+    // A quote without an expiry (a BOLT12 offer) is stored with expiry 0.
+    let without_expiry = bolt11_mint_quote(0);
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    for quote in expired.iter().chain([&live, &without_expiry]) {
+        tx.add_mint_quote(quote.clone()).await.unwrap();
+    }
+    let mut paid = tx.add_mint_quote(expired_paid.clone()).await.unwrap();
+    paid.add_payment(Amount::new(1000, CurrencyUnit::Sat), unique_string(), None)
+        .unwrap();
+    tx.update_mint_quote(&mut paid).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        db.count_unexpired_unpaid_mint_quotes(1000).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        db.count_unexpired_unpaid_mint_quotes(10_000).await.unwrap(),
+        0
+    );
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let first = tx.delete_expired_unpaid_mint_quotes(1000, 1).await.unwrap();
+    tx.commit().await.unwrap();
+    // The oldest expiry goes first.
+    assert_eq!(first, vec![expired[0].request_lookup_id.clone()]);
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let rest = tx
+        .delete_expired_unpaid_mint_quotes(1000, 10)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(rest, vec![expired[1].request_lookup_id.clone()]);
+
+    for quote in &expired {
+        assert!(db.get_mint_quote(&quote.id).await.unwrap().is_none());
+    }
+    for quote in [&expired_paid, &live, &without_expiry] {
+        assert!(db.get_mint_quote(&quote.id).await.unwrap().is_some());
+    }
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(tx
+        .delete_expired_unpaid_mint_quotes(1000, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    tx.commit().await.unwrap();
+}
+
+/// The melt outflow counts pending quotes and quotes paid in the window, with their fee reserve
+pub async fn melt_outflow_since<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    use cashu::MeltQuoteState;
+
+    let melt_quote = |amount: u64| {
+        MeltQuote::new(
+            None,
+            MeltPaymentRequest::Bolt11 {
+                bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap()
+            },
+            cashu::CurrencyUnit::Sat,
+            Amount::new(amount, cashu::CurrencyUnit::Sat),
+            Amount::new(2, cashu::CurrencyUnit::Sat),
+            0,
+            None,
+            None,
+            cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+            None,
+            None,
+        )
+    };
+    let unpaid = melt_quote(1000);
+    let pending = melt_quote(100);
+    let paid = melt_quote(30);
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    for quote in [&unpaid, &pending, &paid] {
+        tx.add_melt_quote(quote.clone()).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let before = crate::util::unix_time();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    for (quote, states) in [
+        (&pending, &[MeltQuoteState::Pending][..]),
+        (&paid, &[MeltQuoteState::Pending, MeltQuoteState::Paid][..]),
+    ] {
+        let mut acquired = tx.get_melt_quote(&quote.id).await.unwrap().unwrap();
+        for state in states {
+            tx.update_melt_quote_state(&mut acquired, *state, None)
+                .await
+                .unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        db.melt_outflow_since(&CurrencyUnit::Sat, before)
+            .await
+            .unwrap(),
+        102 + 32
+    );
+    // A payment before the window is not counted. A pending melt always is.
+    assert_eq!(
+        db.melt_outflow_since(&CurrencyUnit::Sat, before + 3600)
+            .await
+            .unwrap(),
+        102
+    );
+    assert_eq!(
+        db.melt_outflow_since(&CurrencyUnit::Msat, 0).await.unwrap(),
+        0
+    );
+}

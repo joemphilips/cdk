@@ -58,6 +58,7 @@ mod settlement;
 #[cfg(feature = "conditional-tokens")]
 mod split_merge;
 mod start_up_check;
+mod state_limits;
 mod subscription;
 mod swap;
 mod verification;
@@ -92,6 +93,10 @@ pub use issue::MintInput;
 pub use melt::PendingMelt;
 #[cfg(feature = "conditional-tokens")]
 pub use settlement::CtfSettlementError;
+pub use state_limits::{
+    MeltBudget, StateLimits, LIABILITIES_TOKEN, MELT_BUDGET_EXCEEDED_TOKEN,
+    UNPAID_QUOTE_RETENTION_SECS,
+};
 pub use verification::Verification;
 
 const CDK_MINT_PRIMARY_NAMESPACE: &str = "cdk_mint";
@@ -144,6 +149,8 @@ pub struct Mint {
     max_inputs: usize,
     /// Maximum number of outputs allowed per transaction
     max_outputs: usize,
+    /// Bounds on unpaid quote state and on melt outflow
+    state_limits: Arc<StateLimits>,
     /// Maximum number of outcomes allowed per conditional-token condition
     #[cfg(feature = "conditional-tokens")]
     max_outcomes_per_condition: usize,
@@ -176,6 +183,8 @@ struct TaskState {
     supervisor_handle: Option<JoinHandle<Result<(), Error>>>,
     /// Handle to the keyset drain task
     keyset_drain_handle: Option<JoinHandle<()>>,
+    /// Handle to the quote cleanup and liability task
+    maintenance_handle: Option<JoinHandle<()>>,
     /// Keyset subscription retained from construction, drained once by the first
     /// `start()`. `None` after it has been taken; a restart re-subscribes.
     keyset_updates: Option<watch::Receiver<SignatoryKeysets>>,
@@ -308,6 +317,12 @@ impl Mint {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(quote_id.clone(), Arc::downgrade(&lock));
         lock
+    }
+
+    /// Set the bounds on unpaid quote state and on melt outflow.
+    pub fn with_state_limits(mut self, limits: StateLimits) -> Self {
+        self.state_limits = Arc::new(limits);
+        self
     }
 
     /// Create new [`Mint`] without authentication
@@ -493,6 +508,7 @@ impl Mint {
             })),
             max_inputs: limits.max_inputs,
             max_outputs: limits.max_outputs,
+            state_limits: Arc::new(StateLimits::default()),
             #[cfg(feature = "conditional-tokens")]
             max_outcomes_per_condition: limits.max_outcomes_per_condition,
             #[cfg(feature = "conditional-tokens")]
@@ -594,6 +610,11 @@ impl Mint {
             .await
         });
 
+        let maintenance_handle = tokio::spawn(Self::maintenance_loop(
+            Arc::new(self.clone()),
+            shutdown_notify.clone(),
+        ));
+
         // Keyset refresh: drain signatory keyset updates into the in-memory
         // keysets. A signatory-side rotation reaches the mint here without a
         // restart or a mint-initiated rotate.
@@ -675,6 +696,7 @@ impl Mint {
         task_state.shutdown_notify = Some(shutdown_notify);
         task_state.supervisor_handle = Some(supervisor_handle);
         task_state.keyset_drain_handle = keyset_drain_handle;
+        task_state.maintenance_handle = Some(maintenance_handle);
 
         // Give the background task a tiny bit of time to start waiting
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -699,6 +721,7 @@ impl Mint {
         let shutdown_notify = task_state.shutdown_notify.take();
         let supervisor_handle = task_state.supervisor_handle.take();
         let keyset_drain_handle = task_state.keyset_drain_handle.take();
+        let maintenance_handle = task_state.maintenance_handle.take();
 
         // If nothing to stop, return early
         let (shutdown_notify, supervisor_handle) = match (shutdown_notify, supervisor_handle) {
@@ -734,6 +757,12 @@ impl Mint {
         if let Some(handle) = keyset_drain_handle {
             if let Err(join_error) = handle.await {
                 tracing::error!("Keyset drain task panicked: {:?}", join_error);
+            }
+        }
+
+        if let Some(handle) = maintenance_handle {
+            if let Err(join_error) = handle.await {
+                tracing::error!("Maintenance task panicked: {:?}", join_error);
             }
         }
 

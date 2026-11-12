@@ -614,7 +614,67 @@ pub(crate) fn validate_settings(settings: &config::Settings) -> Result<()> {
     validate_management_rpc_config(settings)?;
     validate_prometheus_config(settings)?;
     rate_limiter(settings)?;
+    state_limits(settings)?;
+    validate_web_access(settings)?;
 
+    Ok(())
+}
+
+/// Build the unpaid quote cap and the melt outflow budget (MS1, MS3). An
+/// invalid value refuses the configuration.
+fn state_limits(settings: &config::Settings) -> Result<cdk::mint::StateLimits> {
+    let limits = &settings.limits;
+    if limits.max_unpaid_mint_quotes == Some(0) {
+        bail!("limits.max_unpaid_mint_quotes must be positive");
+    }
+    let mut melt_budgets = HashMap::new();
+    for (name, budget) in &limits.melt_budget {
+        let unit = CurrencyUnit::from_str(name)
+            .map_err(|_| anyhow!("limits.melt_budget.{name} is not a currency unit"))?;
+        if budget.per_hour == 0 || budget.per_day < budget.per_hour {
+            bail!("limits.melt_budget.{name} needs 0 < per_hour <= per_day");
+        }
+        melt_budgets.insert(
+            unit,
+            cdk::mint::MeltBudget {
+                per_hour: budget.per_hour,
+                per_day: budget.per_day,
+            },
+        );
+    }
+    if !melt_budgets.is_empty() {
+        let units = monetary_units::configured_units(settings)?;
+        if let Some(unit) = melt_budgets.keys().find(|unit| !units.contains(*unit)) {
+            bail!("limits.melt_budget names {unit}, which is not a configured unit");
+        }
+        for unit in units {
+            if !melt_budgets.contains_key(&unit) {
+                bail!("limits.melt_budget has no budget for the configured unit {unit}");
+            }
+        }
+    }
+    Ok(cdk::mint::StateLimits {
+        max_unpaid_mint_quotes: limits.max_unpaid_mint_quotes,
+        melt_budgets,
+    })
+}
+
+/// The ldk-node web UI token must be long enough. The UI starts only with it.
+fn validate_web_access(settings: &config::Settings) -> Result<()> {
+    #[cfg(feature = "ldk-node")]
+    if let Some(token) = settings
+        .ldk_node
+        .as_ref()
+        .and_then(|ldk_node| ldk_node.webserver_token.as_deref())
+    {
+        if token.len() < cdk_ldk_node::WEB_ACCESS_TOKEN_MIN_LEN
+            || !token.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            bail!("ldk_node.webserver_token must be at least 32 printable ASCII characters");
+        }
+    }
+    #[cfg(not(feature = "ldk-node"))]
+    let _ = settings;
     Ok(())
 }
 
@@ -1186,8 +1246,9 @@ async fn configure_mint_builder_with_wallet_info(
     let mint_builder = configure_cache(settings, mint_builder, &payment_methods).await?;
 
     // Configure transaction limits
-    let mint_builder =
-        mint_builder.with_limits(settings.limits.max_inputs, settings.limits.max_outputs);
+    let mint_builder = mint_builder
+        .with_limits(settings.limits.max_inputs, settings.limits.max_outputs)
+        .with_state_limits(state_limits(settings)?);
 
     #[cfg(feature = "conditional-tokens")]
     let mint_builder = mint_builder.with_ctf_limits(settings.limits.max_outcomes_per_condition);
