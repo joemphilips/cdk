@@ -2641,6 +2641,85 @@ tls_mode = "disable"
         assert!(verify_local_keysets(&seed, &[changed], &used).is_err());
         assert!(verify_local_keysets(&seed, &[], &used).is_err());
     }
+    #[cfg(all(feature = "fakewallet", feature = "conditional-tokens"))]
+    #[test]
+    fn rate_limit_table_is_parsed_and_validated_before_persistence() {
+        let mnemonic_path = crate::test_utils::unique_temp_path("validate_rate_limit_mnemonic");
+        std::fs::write(&mnemonic_path, TEST_MNEMONIC_ONE).unwrap();
+        let base = document(&format!("file:{}", mnemonic_path.display()), "rate limits");
+        let class = |name: &str, per_minute: u32| {
+            format!("[rate_limit.{name}]\nper_minute = {per_minute}\nburst = 10\n")
+        };
+        let classes = ["engine", "quote", "read", "recovery", "value_write"]
+            .map(|name| class(name, 60))
+            .join("\n");
+        let table = |head: &str, classes: &str| format!("{base}\n[rate_limit]\n{head}\n{classes}");
+        let head = "max_body_bytes = 524288\ntrusted_proxies = [\"172.18.0.1\"]\nengine_addresses = [\"203.0.113.10\"]";
+
+        let valid = ConfigurationService::validate_document(&table(head, &classes)).unwrap();
+        let limits = valid.settings.rate_limit.expect("rate limit table");
+        assert_eq!(limits.max_body_bytes, 524_288);
+        assert_eq!(
+            limits.trusted_proxies,
+            vec!["172.18.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            limits.engine_addresses,
+            vec!["203.0.113.10".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            (limits.value_write.per_minute, limits.value_write.burst),
+            (60, 10)
+        );
+        assert!(ConfigurationService::validate_document(&base)
+            .unwrap()
+            .settings
+            .rate_limit
+            .is_none());
+
+        let settlement = "[mint_info.ctf_settlement]\nmax_participants = 64\nmax_inputs = 4096\nmax_outputs = 8192\nmax_request_bytes = 262144\nmax_expiry_seconds = 86400\nmax_pool_entries = 128\n";
+        let without_engine = classes.replace(&class("engine", 60), "");
+        let cases = [
+            (
+                table(&head.replace("524288", "1048577"), &classes),
+                "must not exceed 1048576",
+            ),
+            (
+                format!("{}\n{settlement}", table(head, &classes)),
+                "must not exceed 262144",
+            ),
+            (
+                table(&head.replace("524288", "0"), &classes),
+                "max_body_bytes must be positive",
+            ),
+            (
+                table(&head.replace("172.18.0.1", "not-an-address"), &classes),
+                "invalid IP address",
+            ),
+            (
+                table(&head.replace("172.18.0.1", "203.0.113.10"), &classes),
+                "both a trusted proxy and an engine address",
+            ),
+            (
+                table(
+                    head,
+                    &classes.replace(&class("read", 60), &class("read", 0)),
+                ),
+                "rate_limit.read",
+            ),
+            (table(head, &without_engine), "rate_limit.engine"),
+            (
+                table(&format!("{head}\nshared_secret = \"x\""), &classes),
+                "shared_secret",
+            ),
+        ];
+        for (invalid, expected) in cases {
+            let error = ConfigurationService::validate_document(&invalid).unwrap_err();
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
+        std::fs::remove_file(mnemonic_path).unwrap();
+    }
+
     #[cfg(all(
         feature = "fakewallet",
         feature = "conditional-tokens",

@@ -613,8 +613,35 @@ pub(crate) fn validate_settings(settings: &config::Settings) -> Result<()> {
     validate_auth_config(settings)?;
     validate_management_rpc_config(settings)?;
     validate_prometheus_config(settings)?;
+    rate_limiter(settings)?;
 
     Ok(())
+}
+
+/// Build the request rate limiter. An invalid table refuses the configuration.
+fn rate_limiter(settings: &config::Settings) -> Result<Option<cdk_axum::rate_limit::RateLimiter>> {
+    let Some(limits) = settings.rate_limit.as_ref() else {
+        return Ok(None);
+    };
+    // The cap is for clients. It must not admit more than the router or the
+    // advertised settlement limit admits.
+    #[cfg(feature = "conditional-tokens")]
+    let settlement_bytes = settings
+        .mint_info
+        .ctf_settlement
+        .as_ref()
+        .map(|settlement| settlement.max_request_bytes);
+    #[cfg(not(feature = "conditional-tokens"))]
+    let settlement_bytes: Option<u64> = None;
+    let limit = settlement_bytes.map_or(REQUEST_BODY_LIMIT_BYTES as u64, |bytes| {
+        bytes.min(REQUEST_BODY_LIMIT_BYTES as u64)
+    });
+    if limits.max_body_bytes as u64 > limit {
+        bail!("rate_limit.max_body_bytes must not exceed {limit}");
+    }
+    cdk_axum::rate_limit::RateLimiter::new(limits)
+        .map(Some)
+        .map_err(anyhow::Error::msg)
 }
 
 fn validate_payment_backends(settings: &config::Settings) -> Result<()> {
@@ -2531,6 +2558,7 @@ impl PreparedMintd {
             cache,
             custom_methods,
             settings.info.enable_info_page.unwrap_or(true),
+            rate_limiter(settings)?.map(Arc::new),
         )
         .await?;
 
@@ -2667,8 +2695,8 @@ impl RunningMintd {
         };
 
         // Wait for axum server to complete with custom shutdown signal
-        let axum_result =
-            axum::serve(self.listener, self.mint_service).with_graceful_shutdown(axum_shutdown);
+        let axum_result = axum::serve(self.listener, with_peer_address(self.mint_service))
+            .with_graceful_shutdown(axum_shutdown);
 
         match axum_result.await {
             Ok(_) => {
@@ -2703,6 +2731,13 @@ impl RunningMintd {
 
         Ok(())
     }
+}
+
+/// The rate limiter keys on the peer address, so the service records it.
+fn with_peer_address(
+    router: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+    router.into_make_service_with_connect_info::<SocketAddr>()
 }
 
 /// Starts all mintd services and blocks until the shutdown signal fires.
@@ -3106,6 +3141,59 @@ mod tests {
 
     fn temp_seed_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cdk_mintd_{name}_{}", std::process::id()))
+    }
+
+    /// Send one request over a real socket and return the status line.
+    async fn status_line(address: SocketAddr) -> String {
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .write_all(b"GET /v1/info HTTP/1.1\r\nHost: mint\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response.lines().next().unwrap_or_default().to_string()
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn served_router_gives_the_rate_limiter_the_peer_address() {
+        let limit = cdk_axum::rate_limit::ClassLimit {
+            per_minute: 1,
+            burst: 1,
+        };
+        let limiter = cdk_axum::rate_limit::RateLimiter::new(&cdk_axum::rate_limit::Config {
+            max_body_bytes: 1024,
+            trusted_proxies: Vec::new(),
+            engine_addresses: Vec::new(),
+            value_write: limit,
+            quote: limit,
+            recovery: limit,
+            read: limit,
+            engine: limit,
+        })
+        .unwrap();
+        let router = Router::new()
+            .route("/v1/info", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(limiter),
+                cdk_axum::rate_limit::middleware,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, with_peer_address(router)).await });
+
+        // Without the peer address the limiter answers 500 to every request.
+        assert!(status_line(address).await.starts_with("HTTP/1.1 200"));
+        assert!(status_line(address).await.starts_with("HTTP/1.1 429"));
+        server.abort();
     }
 
     #[cfg(all(feature = "sqlite", feature = "fakewallet"))]

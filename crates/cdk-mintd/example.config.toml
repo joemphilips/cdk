@@ -410,3 +410,32 @@ max_delay_time = 3
 max_inputs = 1000
 # Maximum number of outputs allowed per transaction (mint/swap/melt)
 max_outputs = 1000
+
+# Per-client HTTP request rate limits (optional). Without this table there is
+# no limit. With it, every field and every class table is required.
+# A refused request gets 429 with Retry-After. A client body above
+# max_body_bytes gets 413. max_body_bytes must not exceed the router limit
+# (1 MiB) or mint_info.ctf_settlement.max_request_bytes.
+# The client is the peer address. When the peer is in trusted_proxies, the
+# client is the right-most X-Forwarded-For entry. List only a proxy that
+# replaces or appends that entry. The server keys IPv6 clients by /64.
+# Requests from engine_addresses use the engine class and have no extra body cap.
+# [rate_limit]
+# max_body_bytes = 524288
+# trusted_proxies = ["172.18.0.1"]
+# engine_addresses = ["203.0.113.10"]
+# [rate_limit.value_write]
+# per_minute = 120
+# burst = 60
+# [rate_limit.quote]
+# per_minute = 20
+# burst = 10
+# [rate_limit.recovery]
+# per_minute = 600
+# burst = 300
+# [rate_limit.read]
+# per_minute = 1200
+# burst = 600
+# [rate_limit.engine]
+# per_minute = 60000
+# burst = 6000

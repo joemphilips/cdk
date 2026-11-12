@@ -1178,6 +1178,9 @@ pub struct Settings {
     #[cfg(feature = "prometheus")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prometheus: Option<Prometheus>,
+    /// Per-client HTTP request rate limits. The limits are off without this table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<cdk_axum::rate_limit::Config>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

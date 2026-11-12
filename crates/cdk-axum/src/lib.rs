@@ -24,6 +24,7 @@ mod custom_handlers;
 mod custom_router;
 #[cfg(feature = "conditional-tokens")]
 mod listing_query;
+pub mod rate_limit;
 mod router_handlers;
 mod ws;
 
@@ -40,7 +41,8 @@ pub struct MintState {
 /// The `custom_methods` parameter should include all custom payment methods supported
 /// by the payment processor, including "bolt11" and "bolt12" if they are supported.
 pub async fn create_mint_router(mint: Arc<Mint>, custom_methods: Vec<String>) -> Result<Router> {
-    create_mint_router_with_custom_cache(mint, Default::default(), custom_methods, false).await
+    create_mint_router_with_custom_cache(mint, Default::default(), custom_methods, false, None)
+        .await
 }
 
 async fn cors_middleware(
@@ -91,12 +93,16 @@ async fn cors_middleware(
 ///
 /// The `custom_methods` parameter should include all custom payment methods supported
 /// by the payment processor, including "bolt11" and "bolt12" if they are supported.
+///
+/// With a `rate_limiter`, the server must provide `ConnectInfo<SocketAddr>`
+/// (`into_make_service_with_connect_info`), because the limiter keys on the peer.
 #[allow(unused_mut, unused_variables)]
 pub async fn create_mint_router_with_custom_cache(
     mint: Arc<Mint>,
     cache: HttpCache,
     custom_methods: Vec<String>,
     enable_info_page: bool,
+    rate_limiter: Option<Arc<rate_limit::RateLimiter>>,
 ) -> Result<Router> {
     let state = MintState {
         mint,
@@ -155,6 +161,16 @@ pub async fn create_mint_router_with_custom_cache(
         mint_router.nest("/v1", custom_router)
     } else {
         mint_router
+    };
+
+    // Inside the metrics and CORS layers: refusals are counted, and a browser
+    // can read them. After routing: the class uses the matched route.
+    let mint_router = match rate_limiter {
+        Some(limiter) => mint_router.layer(axum::middleware::from_fn_with_state(
+            limiter,
+            rate_limit::middleware,
+        )),
+        None => mint_router,
     };
 
     #[cfg(feature = "prometheus")]
