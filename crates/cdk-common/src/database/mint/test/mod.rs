@@ -442,7 +442,7 @@ macro_rules! mint_db_test {
             get_mint_quotes_by_ids,
             get_melt_quotes_by_request_lookup_id,
             lock_melt_quote_and_related,
-            delete_expired_unpaid_mint_quotes,
+            get_unpaid_mint_quotes_expired_before,
             melt_outflow_since,
         );
     };

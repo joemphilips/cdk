@@ -53,12 +53,6 @@ const PAYMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capacity for terminal outgoing payment notifications
 const PAYMENT_EVENT_CHANNEL_CAPACITY: usize = 64;
 const LDK_KV_BOLT12_CLEANUP_MARKER: &[u8] = b"cleanup-in-progress";
-/// The longest expiry of an incoming BOLT11 invoice. The startup sweep relies on it.
-pub(crate) const MAX_INVOICE_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
-/// Time after the longest expiry before the startup sweep removes an unpaid
-/// record. LDK accepts an HTLC up to two hours after the invoice expiry.
-const UNPAID_RECORD_RETENTION_SECS: u64 = 24 * 60 * 60;
-
 /// An unpaid incoming BOLT11 invoice: the only record that the backend removes.
 fn is_unpaid_inbound_bolt11(details: &PaymentDetails) -> bool {
     details.direction == PaymentDirection::Inbound
@@ -839,25 +833,6 @@ impl CdkLdkNode {
     pub fn node(&self) -> Arc<Node> {
         Arc::clone(&self.inner)
     }
-
-    /// Remove the unpaid incoming BOLT11 records last updated before `cutoff`.
-    ///
-    /// The mint releases the record of each expired quote that it deletes.
-    /// This sweep removes the records that no quote releases, for example
-    /// after a crash between the two steps. Returns the number of removed records.
-    pub fn sweep_unpaid_inbound_records(&self, cutoff: u64) -> usize {
-        let stale = self.inner.list_payments_with_filter(|details| {
-            is_unpaid_inbound_bolt11(details) && details.latest_update_timestamp < cutoff
-        });
-        let mut removed = 0;
-        for details in stale {
-            match self.inner.remove_payment(&details.id) {
-                Ok(()) => removed += 1,
-                Err(err) => tracing::warn!("Could not remove an unpaid payment record: {}", err),
-            }
-        }
-        removed
-    }
 }
 
 /// Mint payment trait
@@ -874,13 +849,6 @@ impl MintPayment for CdkLdkNode {
         })?;
 
         tracing::info!("CdkLdkNode payment processor started successfully");
-
-        let cutoff =
-            unix_time().saturating_sub(MAX_INVOICE_EXPIRY_SECS + UNPAID_RECORD_RETENTION_SECS);
-        let removed = self.sweep_unpaid_inbound_records(cutoff);
-        if removed > 0 {
-            tracing::info!(removed, "removed old unpaid incoming payment records");
-        }
 
         // Start web server if configured. It can spend the node funds, so it
         // never starts without an access token.
@@ -951,11 +919,6 @@ impl MintPayment for CdkLdkNode {
                         .ok_or(payment::Error::InvalidExpiry)?,
                     None => 36000,
                 };
-                // The startup sweep removes an unpaid record only after the
-                // longest expiry, so a longer invoice could lose its record.
-                if time > MAX_INVOICE_EXPIRY_SECS {
-                    return Err(payment::Error::InvalidExpiry);
-                }
 
                 let description = Bolt11InvoiceDescription::Direct(
                     Description::new(description).map_err(|_| Error::InvalidDescription)?,
@@ -1533,10 +1496,11 @@ impl MintPayment for CdkLdkNode {
                 .map_err(|_| Error::InvalidPaymentIdLength)?,
         );
 
-        let payment_details = self
-            .inner
-            .payment(&payment_id)
-            .ok_or(Error::PaymentNotFound)?;
+        // The mint releases the record of an expired unpaid quote. The quote
+        // stays, so a status check of it must still answer: no payment.
+        let Some(payment_details) = self.inner.payment(&payment_id) else {
+            return Ok(vec![]);
+        };
 
         if payment_details.direction == PaymentDirection::Outbound {
             return Err(Error::InvalidPaymentDirection.into());
@@ -2010,7 +1974,7 @@ mod tests {
         }
         assert_eq!(node.inner.list_payments().len(), baseline + 4);
 
-        // The mint releases the record of each quote that it deletes.
+        // The mint releases the record of each expired quote that the backend reports unpaid.
         node.release_incoming_payment_request(&identifiers[0])
             .await
             .unwrap();
@@ -2022,13 +1986,17 @@ mod tests {
             .unwrap();
         assert_eq!(node.inner.list_payments().len(), baseline + 3);
 
-        // The sweep removes only records older than its cutoff.
-        let created = unix_time();
-        assert_eq!(
-            node.sweep_unpaid_inbound_records(created.saturating_sub(3600)),
-            0
-        );
-        assert_eq!(node.sweep_unpaid_inbound_records(created + 10), 3);
+        // A status check of a released quote answers: no payment.
+        assert!(node
+            .check_incoming_payment_status(&identifiers[0])
+            .await
+            .unwrap()
+            .is_empty());
+        for identifier in &identifiers[1..] {
+            node.release_incoming_payment_request(identifier)
+                .await
+                .unwrap();
+        }
         assert_eq!(node.inner.list_payments().len(), baseline);
     }
 
@@ -2054,18 +2022,6 @@ mod tests {
             },
             ..inbound(PaymentStatus::Pending)
         }));
-    }
-
-    #[tokio::test]
-    async fn an_invoice_expiry_above_the_sweep_bound_is_refused() {
-        let storage = tempfile::tempdir().unwrap();
-        let node = unstarted_node(storage.path()).await;
-        assert!(matches!(
-            node.create_incoming_payment_request(bolt11_request(MAX_INVOICE_EXPIRY_SECS + 60))
-                .await,
-            Err(payment::Error::InvalidExpiry)
-        ));
-        assert!(node.inner.list_payments().is_empty());
     }
 
     #[test]

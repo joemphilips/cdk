@@ -412,18 +412,6 @@ pub trait QuotesTransaction {
         &mut self,
         request_lookup_id: &PaymentIdentifier,
     ) -> Result<Option<Acquired<MintMintQuote>>, Self::Err>;
-
-    /// Delete at most `limit` mint quotes that received no payment, issued
-    /// nothing and expired before `expired_before`. A quote without an expiry
-    /// (stored as 0) is never deleted.
-    ///
-    /// Returns the request lookup identifiers of the deleted quotes, so that
-    /// the caller can release the matching payment backend state.
-    async fn delete_expired_unpaid_mint_quotes(
-        &mut self,
-        expired_before: u64,
-        limit: u64,
-    ) -> Result<Vec<PaymentIdentifier>, Self::Err>;
 }
 
 /// Mint Quote Database trait
@@ -473,6 +461,18 @@ pub trait QuotesDatabase {
     ) -> Result<Option<mint::MeltQuote>, Self::Err>;
     /// Get all [`mint::MeltQuote`]s
     async fn get_melt_quotes(&self) -> Result<Vec<mint::MeltQuote>, Self::Err>;
+
+    /// The mint quotes that received no payment and expired before `expired_before`,
+    /// ordered by expiry and then id, strictly after the `after` position.
+    ///
+    /// A quote without an expiry (stored as 0) is never returned. The caller
+    /// pages with the last returned (expiry, id) pair.
+    async fn get_unpaid_mint_quotes_expired_before(
+        &self,
+        expired_before: u64,
+        after: Option<(u64, QuoteId)>,
+        limit: u64,
+    ) -> Result<Vec<MintMintQuote>, Self::Err>;
 
     /// Count the mint quotes that received no payment and expire after `now`.
     async fn count_unexpired_unpaid_mint_quotes(&self, now: u64) -> Result<u64, Self::Err>;

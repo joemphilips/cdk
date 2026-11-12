@@ -323,6 +323,11 @@ impl CdkMetrics {
         ))
     }
 
+    /// Remove every liability value, so that a reader sees no current value.
+    pub fn clear_liabilities(&self) {
+        self.mint_liabilities.reset();
+    }
+
     /// Set the outstanding ecash of a unit. A value above `i64::MAX` is capped.
     pub fn set_liabilities(&self, unit: &str, amount: u64) {
         self.mint_liabilities

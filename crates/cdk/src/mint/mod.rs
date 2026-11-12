@@ -94,8 +94,8 @@ pub use melt::PendingMelt;
 #[cfg(feature = "conditional-tokens")]
 pub use settlement::CtfSettlementError;
 pub use state_limits::{
-    MeltBudget, StateLimits, LIABILITIES_TOKEN, MELT_BUDGET_EXCEEDED_TOKEN,
-    UNPAID_QUOTE_RETENTION_SECS,
+    Liabilities, LiabilityAnomaly, MeltBudget, ReleaseSummary, StateLimits, LIABILITIES_TOKEN,
+    LIABILITY_ANOMALY_TOKEN, MELT_BUDGET_EXCEEDED_TOKEN, UNPAID_QUOTE_RETENTION_SECS,
 };
 pub use verification::Verification;
 

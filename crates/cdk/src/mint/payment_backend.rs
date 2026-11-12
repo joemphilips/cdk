@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cdk_common::common::PaymentProcessorKey;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::mint::MintQuote;
-use cdk_common::payment::DynMintPayment;
+use cdk_common::payment::{DynMintPayment, WaitPaymentResponse};
 use cdk_common::util::unix_time;
 use cdk_common::MintQuoteState;
 use tracing::instrument;
@@ -96,6 +96,17 @@ impl Mint {
             return Ok(());
         }
 
+        Self::record_mint_quote_payments(localstore, pubsub_manager, quote, payment_status).await
+    }
+
+    /// Record the payments that a backend status check reported for a quote,
+    /// and notify the subscribers after the commit.
+    pub(crate) async fn record_mint_quote_payments(
+        localstore: DynMintDatabase,
+        pubsub_manager: Option<Arc<PubSubManager>>,
+        quote: &mut MintQuote,
+        payment_status: Vec<WaitPaymentResponse>,
+    ) -> Result<(), Error> {
         let mut tx = localstore.begin_transaction().await?;
 
         // reload the quote, as it state may have changed

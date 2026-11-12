@@ -2194,12 +2194,16 @@ fn bolt11_mint_quote(expiry: u64) -> MintQuote {
     )
 }
 
-/// Only an expired quote without a payment is deleted, and the limit bounds one call
-pub async fn delete_expired_unpaid_mint_quotes<DB>(db: DB)
+/// The expired unpaid quotes are read in expiry order, page by page, and stay in the database
+pub async fn get_unpaid_mint_quotes_expired_before<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    let expired = [bolt11_mint_quote(100), bolt11_mint_quote(200)];
+    let expired = [
+        bolt11_mint_quote(100),
+        bolt11_mint_quote(200),
+        bolt11_mint_quote(200),
+    ];
     let expired_paid = bolt11_mint_quote(100);
     let live = bolt11_mint_quote(10_000);
     // A quote without an expiry (a BOLT12 offer) is stored with expiry 0.
@@ -2224,34 +2228,42 @@ where
         0
     );
 
-    let mut tx = Database::begin_transaction(&db).await.unwrap();
-    let first = tx.delete_expired_unpaid_mint_quotes(1000, 1).await.unwrap();
-    tx.commit().await.unwrap();
-    // The oldest expiry goes first.
-    assert_eq!(first, vec![expired[0].request_lookup_id.clone()]);
+    // Expiry first, then id. Two quotes share the expiry 200.
+    let mut order: Vec<(u64, String)> = expired
+        .iter()
+        .map(|quote| (quote.expiry, quote.id.to_string()))
+        .collect();
+    order.sort();
 
-    let mut tx = Database::begin_transaction(&db).await.unwrap();
-    let rest = tx
-        .delete_expired_unpaid_mint_quotes(1000, 10)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(rest, vec![expired[1].request_lookup_id.clone()]);
-
-    for quote in &expired {
-        assert!(db.get_mint_quote(&quote.id).await.unwrap().is_none());
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = db
+            .get_unpaid_mint_quotes_expired_before(1000, after.clone(), 2)
+            .await
+            .unwrap();
+        for quote in &page {
+            assert_eq!(quote.amount_paid().value(), 0);
+            seen.push((quote.expiry, quote.id.to_string()));
+            after = Some((quote.expiry, quote.id.clone()));
+        }
+        if page.len() < 2 {
+            break;
+        }
     }
-    for quote in [&expired_paid, &live, &without_expiry] {
+    assert_eq!(seen, order);
+    // The read deletes nothing.
+    for quote in expired
+        .iter()
+        .chain([&expired_paid, &live, &without_expiry])
+    {
         assert!(db.get_mint_quote(&quote.id).await.unwrap().is_some());
     }
-
-    let mut tx = Database::begin_transaction(&db).await.unwrap();
-    assert!(tx
-        .delete_expired_unpaid_mint_quotes(1000, 10)
+    assert!(db
+        .get_unpaid_mint_quotes_expired_before(100, None, 10)
         .await
         .unwrap()
         .is_empty());
-    tx.commit().await.unwrap();
 }
 
 /// The melt outflow counts pending quotes and quotes paid in the window, with their fee reserve
