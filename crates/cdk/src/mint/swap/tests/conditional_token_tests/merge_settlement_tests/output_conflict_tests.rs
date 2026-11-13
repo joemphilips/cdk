@@ -570,6 +570,61 @@ async fn test_ctf_settlement_without_output_conflict_detail_answers_as_before() 
     commit_and_check_with(&mint, request, off, now, 1).await;
 }
 
+/// A record stays binding after the operator turns the capability off.
+///
+/// The record was written with the capability on. Until cleanup, an identical
+/// copy is refused with its list also with the capability off, after the
+/// other operation is removed. After cleanup the copy can only take the
+/// expiry path, because cleanup waits past the request's cutoff.
+#[tokio::test]
+async fn test_ctf_settlement_record_stays_binding_after_the_capability_is_turned_off() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let cutoff = now + OFFER_LIFETIME_SECONDS;
+    let fixture = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
+    let request = &fixture.request;
+    let reused = bare_seller_output(&fixture);
+    let melt = hold_melt(&mint, vec![reused.clone()]).await;
+    let conflicts = refuse_with_conflicts(&mint, request, now).await;
+    compensate_held_melt(&mint, melt).await;
+    assert_outputs_have_no_rows(&mint, std::slice::from_ref(&reused)).await;
+
+    let off = settlement_settings();
+    assert!(!off.output_conflict_detail());
+    let completed_before = completed_swap_count(&mint).await;
+    for at in [now, cutoff - 1] {
+        match mint.process_ctf_settlement(request, off, at).await {
+            Err(CtfSettlementError::OutputConflict(refused)) => {
+                assert_eq!(refused, conflicts, "at {at}")
+            }
+            other => panic!("at {at}: the record must still refuse the copy, got {other:?}"),
+        }
+    }
+    assert_no_other_writes(
+        &mint,
+        request,
+        std::slice::from_ref(&reused),
+        completed_before,
+    )
+    .await;
+    assert_conflict_record(&mint, request, &conflicts, cutoff).await;
+
+    let deleted_at = cutoff + OUTPUT_CONFLICT_RETENTION_SECS;
+    mint.run_maintenance(deleted_at).await;
+    assert_eq!(recorded_outcome(&mint, request).await, None);
+    let error = mint
+        .process_ctf_settlement(request, off, deleted_at)
+        .await
+        .expect_err("an expired request cannot commit");
+    assert!(
+        matches!(error, CtfSettlementError::AuthorizationExpired),
+        "{error:?}"
+    );
+    assert_eq!(completed_swap_count(&mint).await, completed_before);
+}
+
 /// Another operation can insert an output row after the conflict scan.
 ///
 /// PostgreSQL then refuses the insert as a duplicate. The mint scans again in
