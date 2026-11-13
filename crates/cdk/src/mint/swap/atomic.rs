@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use cdk_common::database;
 use cdk_common::database::mint::Acquired;
 #[cfg(feature = "conditional-tokens")]
-use cdk_common::database::mint::CtfSettlementReplay;
+use cdk_common::database::mint::{CtfSettlementReplay, OutputConflictRecord};
 use cdk_common::database::DynMintTransaction;
 use cdk_common::mint::{Operation, OperationKind, ProofsWithState};
 use cdk_common::nuts::{BlindSignature, BlindedMessage};
@@ -26,11 +26,12 @@ use super::super::{Mint, Verification};
 use crate::fees::ProofsFeeBreakdown;
 #[cfg(feature = "conditional-tokens")]
 use cdk_common::nuts::nut_ctf::settlement::{
-    CanonicalHash, CtfSettlementResponse, OutputConflict, OutputConflicts,
+    CanonicalHash, CtfSettlementResponse, OutputConflicts,
 };
 
 /// Attempts of one settlement commit when an output insert finds a row that
-/// the conflict scan did not see.
+/// the conflict scan did not see. After the last one the outcome is not
+/// definitive.
 #[cfg(feature = "conditional-tokens")]
 const SETTLEMENT_COMMIT_ATTEMPTS: usize = 3;
 
@@ -42,6 +43,9 @@ pub(in crate::mint) enum CtfSettlementOutcome {
     /// Outputs of the request are signed or pending in another operation.
     /// The mint recorded that the request can never commit.
     OutputConflict(OutputConflicts),
+    /// Another operation wrote an output row after each conflict scan. The
+    /// request did not commit and has no record.
+    OutputConflictUnresolved,
 }
 
 /// Controls how preparation verifies a swap's balance.
@@ -369,7 +373,7 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
         .get_ctf_settlement_replay(request_digest)
         .await?
     {
-        return replay_outcome_or_expiry(replay);
+        return replay_outcome_or_expiry(replay, &blinded_secrets(&settlement.outputs));
     }
 
     let PreparedCtfSettlement {
@@ -380,7 +384,7 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
         input_verification,
         output_verification,
         fee,
-        cutoff,
+        conflict_record_cutoff,
     } = settlement;
     let canonical_inputs = canonical_input_proofs(&inputs)?;
     let prepared = PreparedAtomicCtf::from_verified_settlement(
@@ -401,7 +405,7 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
         &condition_id,
         AtomicSettlementRecord {
             request_digest,
-            cutoff,
+            conflict_record_cutoff,
         },
         &canonical_inputs,
         &outputs,
@@ -442,13 +446,15 @@ pub(in crate::mint) async fn reject_atomic_ctf_settlement(
     Ok(outcome)
 }
 
-/// The key and cutoff of the request that a settlement commit records.
+/// The key of the request that a settlement commit records, and the end of a
+/// no-commit record for it.
 #[cfg(feature = "conditional-tokens")]
 #[derive(Clone, Copy)]
 struct AtomicSettlementRecord {
     request_digest: CanonicalHash,
-    /// The earliest authorization expiry of the request, if it has one.
-    cutoff: Option<u64>,
+    /// `None` when the mint gives this request the plain refusal: it scans
+    /// nothing and writes no conflict record.
+    conflict_record_cutoff: Option<u64>,
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -479,17 +485,25 @@ async fn finish_atomic_ctf_settlement(
         )
         .await;
         match outcome {
-            Ok(outcome) => {
-                tx.commit().await?;
-                break outcome;
-            }
             // The conflict scan reads committed rows. On PostgreSQL another
             // operation can commit an output row after the scan, and the
             // insert then fails as a duplicate. A new transaction scans again
-            // and finds that row.
-            Err(Error::DuplicateOutputs) if attempt < SETTLEMENT_COMMIT_ATTEMPTS => {
+            // and finds that row. Without a record, a plain refusal would look
+            // definitive, so the last miss is not definitive.
+            Ok(AtomicSettlementOutcome::ScanMissed) => {
                 tx.rollback().await?;
+                if attempt == SETTLEMENT_COMMIT_ATTEMPTS {
+                    tracing::warn!(
+                        attempts = attempt,
+                        "settlement output rows changed after every conflict scan"
+                    );
+                    return Ok(CtfSettlementOutcome::OutputConflictUnresolved);
+                }
                 attempt += 1;
+            }
+            Ok(outcome) => {
+                tx.commit().await?;
+                break outcome;
             }
             Err(error) => {
                 tx.rollback().await?;
@@ -510,6 +524,7 @@ async fn finish_atomic_ctf_settlement(
         AtomicSettlementOutcome::Refused(conflicts) => {
             CtfSettlementOutcome::OutputConflict(conflicts)
         }
+        AtomicSettlementOutcome::ScanMissed => return Err(Error::Internal),
     })
 }
 
@@ -576,6 +591,9 @@ enum AtomicSettlementOutcome {
     Replayed(CtfSettlementResponse),
     /// The request has a no-commit record: written now or before.
     Refused(OutputConflicts),
+    /// An output insert found a row that the conflict scan did not see. The
+    /// transaction must roll back.
+    ScanMissed,
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -587,7 +605,7 @@ async fn persist_atomic_ctf_settlement_transaction(
 ) -> Result<AtomicSettlementOutcome, Error> {
     let request_digest = record.request_digest;
     if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
-        return replay_atomic_outcome(replay);
+        return replay_atomic_outcome(replay, commit.blinded_secrets);
     }
 
     let condition = tx
@@ -595,7 +613,7 @@ async fn persist_atomic_ctf_settlement_transaction(
         .await?
         .ok_or(Error::ConditionNotFound)?;
     if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
-        return replay_atomic_outcome(replay);
+        return replay_atomic_outcome(replay, commit.blinded_secrets);
     }
     if condition.attestation_status != STATUS_PENDING {
         return Err(Error::ConvertNotPermitted);
@@ -603,14 +621,25 @@ async fn persist_atomic_ctf_settlement_transaction(
 
     // The scan runs before this transaction writes a row. So it sees only
     // rows of other operations, never a row of this request.
-    if let Some(conflicts) = scan_output_conflicts(tx, commit.blinded_secrets).await? {
-        tx.add_ctf_settlement_output_conflict(request_digest, &conflicts, record.cutoff)
-            .await?;
-        return Ok(AtomicSettlementOutcome::Refused(conflicts));
-    }
+    let scanned = match record.conflict_record_cutoff {
+        Some(cutoff) => {
+            if let Some((stored, conflicts)) =
+                scan_output_conflicts(tx, commit.blinded_secrets).await?
+            {
+                tx.add_ctf_settlement_output_conflict(request_digest, &stored, cutoff)
+                    .await?;
+                return Ok(AtomicSettlementOutcome::Refused(conflicts));
+            }
+            true
+        }
+        None => false,
+    };
 
     let operation_id = *commit.prepared.operation.id();
-    persist_atomic_ctf_body(tx, commit).await?;
+    match persist_atomic_ctf_body(tx, commit).await {
+        Err(Error::DuplicateOutputs) if scanned => return Ok(AtomicSettlementOutcome::ScanMissed),
+        result => result?,
+    }
     fail_if_requested("ADD_CTF_SETTLEMENT_REPLAY")?;
     tx.add_ctf_settlement_replay(request_digest, &operation_id, response)
         .await?;
@@ -640,53 +669,66 @@ async fn persist_ctf_settlement_rejection_transaction(
     Ok(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
 }
 
-/// List each output that is signed or pending in another operation, once, in request order.
+/// Find each output that is signed or pending in another operation.
+///
+/// Returns the record to store and the list in request order.
 #[cfg(feature = "conditional-tokens")]
 async fn scan_output_conflicts(
     tx: &mut DynMintTransaction,
     blinded_secrets: &[PublicKey],
-) -> Result<Option<OutputConflicts>, Error> {
+) -> Result<Option<(OutputConflictRecord, OutputConflicts)>, Error> {
     #[cfg(test)]
-    if crate::test_helpers::mint::should_fail_for("MISS_OUTPUT_CONFLICT_SCAN_ONCE") {
-        crate::test_helpers::mint::clear_fail_for("MISS_OUTPUT_CONFLICT_SCAN_ONCE");
-        return Ok(None);
+    {
+        use crate::test_helpers::mint::{clear_fail_for, should_fail_for};
+        if should_fail_for("MISS_OUTPUT_CONFLICT_SCAN") {
+            return Ok(None);
+        }
+        if should_fail_for("MISS_OUTPUT_CONFLICT_SCAN_ONCE") {
+            clear_fail_for("MISS_OUTPUT_CONFLICT_SCAN_ONCE");
+            return Ok(None);
+        }
     }
     let states = tx.get_ctf_output_states(blinded_secrets).await?;
     if states.len() != blinded_secrets.len() {
         return Err(Error::Internal);
     }
-    let conflicts = blinded_secrets
-        .iter()
-        .zip(states)
-        .filter_map(|(blinded_secret, state)| {
-            state.map(|state| OutputConflict {
-                blinded_secret: *blinded_secret,
-                state,
-            })
-        })
-        .collect();
-    Ok(OutputConflicts::new(conflicts))
+    let Some(record) = OutputConflictRecord::from_states(&states) else {
+        return Ok(None);
+    };
+    let conflicts = record.conflicts(blinded_secrets)?;
+    Ok(Some((record, conflicts)))
 }
 
 #[cfg(feature = "conditional-tokens")]
-fn replay_outcome_or_expiry(replay: CtfSettlementReplay) -> Result<CtfSettlementOutcome, Error> {
+fn blinded_secrets(outputs: &[BlindedMessage]) -> Vec<PublicKey> {
+    outputs.iter().map(|output| output.blinded_secret).collect()
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn replay_outcome_or_expiry(
+    replay: CtfSettlementReplay,
+    blinded_secrets: &[PublicKey],
+) -> Result<CtfSettlementOutcome, Error> {
     match replay {
         CtfSettlementReplay::Committed(response) => Ok(CtfSettlementOutcome::Committed(response)),
         CtfSettlementReplay::RejectedAfterCutoff { .. } => Err(Error::SettlementAfterExpiry),
-        CtfSettlementReplay::RejectedOutputConflict { conflicts, .. } => {
-            Ok(CtfSettlementOutcome::OutputConflict(conflicts))
-        }
+        CtfSettlementReplay::RejectedOutputConflict { record, .. } => Ok(
+            CtfSettlementOutcome::OutputConflict(record.conflicts(blinded_secrets)?),
+        ),
     }
 }
 
 #[cfg(feature = "conditional-tokens")]
-fn replay_atomic_outcome(replay: CtfSettlementReplay) -> Result<AtomicSettlementOutcome, Error> {
+fn replay_atomic_outcome(
+    replay: CtfSettlementReplay,
+    blinded_secrets: &[PublicKey],
+) -> Result<AtomicSettlementOutcome, Error> {
     match replay {
         CtfSettlementReplay::Committed(response) => Ok(AtomicSettlementOutcome::Replayed(response)),
         CtfSettlementReplay::RejectedAfterCutoff { .. } => Err(Error::SettlementAfterExpiry),
-        CtfSettlementReplay::RejectedOutputConflict { conflicts, .. } => {
-            Ok(AtomicSettlementOutcome::Refused(conflicts))
-        }
+        CtfSettlementReplay::RejectedOutputConflict { record, .. } => Ok(
+            AtomicSettlementOutcome::Refused(record.conflicts(blinded_secrets)?),
+        ),
     }
 }
 

@@ -33,9 +33,11 @@ pub(super) struct PreparedCtfSettlement {
     pub(super) input_verification: Verification,
     pub(super) output_verification: Verification,
     pub(super) fee: ProofsFeeBreakdown,
-    /// The earliest authorization expiry. A request without a
-    /// `PAY_TO_UNLOCK` input has none.
-    pub(super) cutoff: Option<u64>,
+    /// The end of a no-commit record for this request: its earliest
+    /// `PAY_TO_UNLOCK` expiry. `None` when the mint does not list output
+    /// conflicts for it, because the capability is off or the request has no
+    /// `PAY_TO_UNLOCK` input. Such a request gets the plain refusal.
+    pub(super) conflict_record_cutoff: Option<u64>,
 }
 
 /// The result of preparation before the settlement commit transaction starts.
@@ -83,6 +85,12 @@ pub enum CtfSettlementError {
     /// The mint recorded that the request can never commit.
     #[error("settlement outputs are signed or pending in another operation")]
     OutputConflict(OutputConflicts),
+    /// Another operation wrote an output row after each conflict scan.
+    ///
+    /// The request did not commit and has no record. The outcome is not
+    /// definitive: the client retries the identical request.
+    #[error("settlement output state changed during every commit attempt")]
+    OutputConflictUnresolved,
 }
 
 impl Mint {
@@ -139,7 +147,7 @@ impl Mint {
             .await
             .map_err(Error::from)?
         {
-            return replay_ctf_settlement_result(replay, now);
+            return replay_ctf_settlement_result(replay, now, request);
         }
 
         let flight = self.ctf_settlement_flight(request_digest);
@@ -150,7 +158,7 @@ impl Mint {
             .await
             .map_err(Error::from)?
         {
-            return replay_ctf_settlement_result(replay, now);
+            return replay_ctf_settlement_result(replay, now, request);
         }
 
         let _keyset_snapshot = self.ctf_keyset_lifecycle.read().await;
@@ -167,6 +175,9 @@ impl Mint {
                     CtfSettlementOutcome::OutputConflict(conflicts) => {
                         Err(CtfSettlementError::OutputConflict(conflicts))
                     }
+                    CtfSettlementOutcome::OutputConflictUnresolved => {
+                        Err(CtfSettlementError::OutputConflictUnresolved)
+                    }
                 }
             }
             CtfSettlementPreparation::Expired {
@@ -177,7 +188,7 @@ impl Mint {
                     reject_atomic_ctf_settlement(self, &condition_id, request_digest, cutoff)
                         .await
                         .map_err(CtfSettlementError::Mint)?;
-                replay_ctf_settlement_result(replay, now)
+                replay_ctf_settlement_result(replay, now, request)
             }
         }
     }
@@ -284,7 +295,7 @@ impl Mint {
             input_verification,
             output_verification,
             fee,
-            cutoff,
+            conflict_record_cutoff: cutoff.filter(|_| settings.output_conflict_detail()),
         }))
     }
 
@@ -438,24 +449,32 @@ impl Mint {
 
 /// Answer a request from its terminal outcome at time `now`.
 ///
-/// A conflict record refuses every copy of its request. From the request's
-/// cutoff, the request cannot commit for its expiry, so the copy gets the
-/// expiry refusal that it gets after the record is deleted.
+/// A conflict record refuses every copy of its request, also when the
+/// capability is now off. From the request's cutoff, the request cannot
+/// commit for its expiry, so the copy gets the expiry refusal that it gets
+/// after the record is deleted. Before it, the list is rebuilt from the
+/// outputs of the copy, which the request digest binds.
 fn replay_ctf_settlement_result(
     replay: CtfSettlementReplay,
     now: u64,
+    request: &CtfSettlementRequest,
 ) -> Result<CtfSettlementResponse, CtfSettlementError> {
     match replay {
         CtfSettlementReplay::Committed(response) => Ok(response),
         CtfSettlementReplay::RejectedAfterCutoff { .. } => {
             Err(CtfSettlementError::AuthorizationExpired)
         }
-        CtfSettlementReplay::RejectedOutputConflict { cutoff, .. }
-            if cutoff.is_some_and(|cutoff| cutoff <= now) =>
-        {
+        CtfSettlementReplay::RejectedOutputConflict { cutoff, .. } if cutoff <= now => {
             Err(CtfSettlementError::AuthorizationExpired)
         }
-        CtfSettlementReplay::RejectedOutputConflict { conflicts, .. } => {
+        CtfSettlementReplay::RejectedOutputConflict { record, .. } => {
+            let outputs = request
+                .participants
+                .iter()
+                .flat_map(|participant| &participant.outputs)
+                .map(|output| output.blinded_secret)
+                .collect::<Vec<_>>();
+            let conflicts = record.conflicts(&outputs).map_err(Error::from)?;
             Err(CtfSettlementError::OutputConflict(conflicts))
         }
     }

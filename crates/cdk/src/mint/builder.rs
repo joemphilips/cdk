@@ -1276,43 +1276,33 @@ mod tests {
         assert_eq!(limits.max_request_bytes, 1_048_576);
         assert_eq!(limits.max_pool_entries, 128);
         assert_eq!(advertised.max_expiry_seconds(), 86_400);
-        assert!(advertised.output_conflict_detail());
+        assert!(
+            !advertised.output_conflict_detail(),
+            "output conflict detail is off unless the operator enables it"
+        );
     }
 
-    /// Mint info stored before the field existed still advertises output conflict detail.
+    /// The operator enables output conflict detail through the advertised settings.
     #[cfg(feature = "conditional-tokens")]
     #[tokio::test]
-    async fn stored_ctf_mint_info_without_output_conflict_detail_still_advertises_it() {
+    async fn enabled_output_conflict_detail_is_advertised_in_mint_info() {
         let (builder, store) = builder_with_bolt11_processor().await;
         let settlement = NutCtfSettlementSettings::new(32, 512, 512, 1_048_576, 86_400, 128)
-            .expect("settlement settings");
+            .expect("settlement settings")
+            .with_output_conflict_detail(true);
         let mint = builder
             .with_ctf_settlement_settings(settlement)
             .expect("settlement advertisement")
             .build_with_seed(store.clone(), &seed())
             .await
             .expect("mint");
-        let mut stored = serde_json::to_value(mint.mint_info().await.expect("mint info"))
-            .expect("serialize mint info");
-        let removed = stored["nuts"]["CTF-split-merge"]
-            .as_object_mut()
-            .expect("split/merge settings")
-            .remove("output_conflict_detail");
-        assert_eq!(removed, Some(serde_json::Value::Bool(true)));
-        mint.set_mint_info(serde_json::from_value(stored).expect("older mint info"))
-            .await
-            .expect("store older mint info");
 
-        let advertised = mint
-            .mint_info()
-            .await
-            .expect("mint info")
-            .nuts
-            .nut_ctf_split_merge
-            .expect("split/merge settings")
-            .multi_party()
-            .expect("multi-party settings");
-        assert!(advertised.output_conflict_detail());
+        let info = serde_json::to_value(mint.mint_info().await.expect("mint info"))
+            .expect("serialize mint info");
+        assert_eq!(
+            info["nuts"]["CTF-split-merge"]["output_conflict_detail"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[tokio::test]

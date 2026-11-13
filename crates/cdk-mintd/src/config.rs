@@ -1318,6 +1318,17 @@ pub struct CtfSettlementConfig {
     pub max_expiry_seconds: u64,
     /// Maximum manifest entries for one pool participant.
     pub max_pool_entries: u64,
+    /// List the conflicting outputs of a refused settlement, and record that
+    /// the request can never commit (NUT-CTF-settle output conflict detail).
+    /// It also advertises `output_conflict_detail` in NUT-06. Off by default:
+    /// the mint then answers as before, with 11008, no list, no record, and
+    /// no info field.
+    ///
+    /// Once a mint has started with this on, do not roll back to a version
+    /// without it. The stored mint info then holds the new field, and the
+    /// older version ignores the no-commit records.
+    #[serde(default)]
+    pub output_conflict_detail: bool,
 }
 
 #[cfg(feature = "management-rpc")]
@@ -1982,6 +1993,57 @@ max_pool_entries = 128
             .expect("settlement config");
         assert_eq!(settlement.max_participants, 32);
         assert_eq!(settlement.max_pool_entries, 128);
+        assert!(
+            !settlement.output_conflict_detail,
+            "output conflict detail is off unless configured"
+        );
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn ctf_settlement_output_conflict_detail_is_a_boolean_key() {
+        let settlement = |value: &str| {
+            let config_content = format!(
+                r#"
+[mint_info.ctf_settlement]
+max_participants = 32
+max_inputs = 512
+max_outputs = 512
+max_request_bytes = 1048576
+max_expiry_seconds = 86400
+max_pool_entries = 128
+output_conflict_detail = {value}
+"#
+            );
+            Config::builder()
+                .add_source(
+                    Config::try_from(&Settings::default()).expect("default config should build"),
+                )
+                .add_source(config::File::from_str(
+                    &config_content,
+                    config::FileFormat::Toml,
+                ))
+                .build()
+                .expect("config source should build")
+                .try_deserialize::<Settings>()
+                .map(|settings| {
+                    settings
+                        .mint_info
+                        .ctf_settlement
+                        .expect("settlement config")
+                })
+        };
+
+        assert!(settlement("true").expect("enabled").output_conflict_detail);
+        assert!(
+            !settlement("false")
+                .expect("disabled")
+                .output_conflict_detail
+        );
+        assert!(
+            settlement("\"sometimes\"").is_err(),
+            "a non-boolean value must be rejected"
+        );
     }
 
     #[test]

@@ -1422,6 +1422,7 @@ fn validated_ctf_settlement(
                 settlement.max_expiry_seconds,
                 settlement.max_pool_entries,
             )
+            .map(|limits| limits.with_output_conflict_detail(settlement.output_conflict_detail))
             .map_err(anyhow::Error::msg)
         })
         .transpose()
@@ -3221,6 +3222,33 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[cfg(feature = "conditional-tokens")]
+    #[test]
+    fn validated_ctf_settlement_carries_the_output_conflict_detail_key() {
+        for enabled in [false, true] {
+            let mut settings = config::Settings::default();
+            settings.mint_info.ctf_settlement = Some(config::CtfSettlementConfig {
+                max_participants: 32,
+                max_inputs: 512,
+                max_outputs: 512,
+                max_request_bytes: 1_048_576,
+                max_expiry_seconds: 86_400,
+                max_pool_entries: 128,
+                output_conflict_detail: enabled,
+            });
+            let validated = validated_ctf_settlement(&settings)
+                .expect("valid settlement config")
+                .expect("configured settlement");
+            assert_eq!(validated.output_conflict_detail(), enabled);
+            let advertised = serde_json::to_value(validated).expect("serialize settings");
+            assert_eq!(
+                advertised.get("output_conflict_detail").is_some(),
+                enabled,
+                "the info field exists only when enabled"
+            );
+        }
     }
 
     #[tokio::test]

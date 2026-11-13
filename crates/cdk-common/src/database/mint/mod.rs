@@ -14,9 +14,7 @@ use crate::mint::{
     self, MeltQuote, MintKeySetInfo, MintQuote as MintMintQuote, Operation, ProofsWithState,
 };
 #[cfg(feature = "conditional-tokens")]
-use crate::nuts::nut_ctf::settlement::{
-    CanonicalHash, CtfSettlementResponse, OutputConflictState, OutputConflicts,
-};
+use crate::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse, OutputConflictState};
 use crate::nuts::{
     BlindSignature, BlindedMessage, CurrencyUnit, Id, MeltQuoteState, Proof, Proofs, PublicKey,
     State,
@@ -24,11 +22,15 @@ use crate::nuts::{
 use crate::payment::PaymentIdentifier;
 
 mod auth;
+#[cfg(feature = "conditional-tokens")]
+mod output_conflict;
 
 #[cfg(feature = "test")]
 pub mod test;
 
 pub use auth::{DynMintAuthDatabase, MintAuthDatabase, MintAuthTransaction};
+#[cfg(feature = "conditional-tokens")]
+pub use output_conflict::OutputConflictRecord;
 
 // Re-export KVStore types from shared module for backward compatibility
 pub use super::kvstore::{
@@ -890,11 +892,11 @@ pub enum CtfSettlementReplay {
     /// The mint refused the request because outputs are signed or pending in
     /// another operation. The request can never commit.
     RejectedOutputConflict {
-        /// The conflicting outputs in request order.
-        conflicts: OutputConflicts,
-        /// The earliest authorization expiry in the request. A request
-        /// without a `PAY_TO_UNLOCK` input has none.
-        cutoff: Option<u64>,
+        /// The state of every request output, in request order.
+        record: OutputConflictRecord,
+        /// The earliest `PAY_TO_UNLOCK` expiry in the request. Only a request
+        /// with such an input gets a record, so the record always ends.
+        cutoff: u64,
     },
 }
 
@@ -938,13 +940,12 @@ pub trait CtfSettlementReplayTransaction {
     async fn add_ctf_settlement_output_conflict(
         &mut self,
         request_digest: CanonicalHash,
-        conflicts: &OutputConflicts,
-        cutoff: Option<u64>,
+        record: &OutputConflictRecord,
+        cutoff: u64,
     ) -> Result<(), Self::Err>;
 
     /// Delete at most `limit` output conflict records whose cutoff is at or
-    /// before `expired_at`, and return the number deleted. A record without a
-    /// cutoff is kept.
+    /// before `expired_at`, oldest first, and return the number deleted.
     async fn delete_expired_ctf_settlement_output_conflicts(
         &mut self,
         expired_at: u64,

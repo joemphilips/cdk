@@ -1087,7 +1087,7 @@ fn nut06_multi_party_is_complete_and_round_trips() {
 }
 
 #[test]
-fn nut06_multi_party_advertises_output_conflict_detail() {
+fn nut06_output_conflict_detail_is_off_and_absent_by_default() {
     let settings = NutCtfSplitMergeSettings::default()
         .with_multi_party(
             NutCtfSettlementSettings::new(64, 4096, 8192, 1_048_576, 3600, 256)
@@ -1096,10 +1096,29 @@ fn nut06_multi_party_advertises_output_conflict_detail() {
         .expect("legacy convert is enabled");
     let value = serde_json::to_value(&settings).expect("serialize settings");
 
+    assert_eq!(value, multi_party_settings_without_output_conflict_detail());
+    assert!(!settings
+        .multi_party()
+        .expect("multi-party advertised")
+        .output_conflict_detail());
+}
+
+#[test]
+fn nut06_enabled_output_conflict_detail_is_advertised_and_round_trips() {
+    let settings = NutCtfSplitMergeSettings::default()
+        .with_multi_party(
+            NutCtfSettlementSettings::new(64, 4096, 8192, 1_048_576, 3600, 256)
+                .expect("valid multi-party settings")
+                .with_output_conflict_detail(true),
+        )
+        .expect("legacy convert is enabled");
+    let value = serde_json::to_value(&settings).expect("serialize settings");
+
     assert_eq!(value["output_conflict_detail"], true);
     assert_eq!(value["idempotent_retries"], true);
     let decoded: NutCtfSplitMergeSettings =
         serde_json::from_value(value).expect("deserialize settings");
+    assert_eq!(decoded, settings);
     assert!(decoded
         .multi_party()
         .expect("multi-party advertised")
@@ -1143,25 +1162,6 @@ fn nut06_output_conflict_detail_requires_the_multi_party_capability() {
         "output_conflict_detail": true
     }))
     .is_err());
-}
-
-#[test]
-fn nut06_stored_settings_advertise_output_conflict_detail_after_upgrade() {
-    let mut stored: NutCtfSplitMergeSettings =
-        serde_json::from_value(multi_party_settings_without_output_conflict_detail())
-            .expect("stored settings decode");
-    stored.advertise_output_conflict_detail();
-    assert!(stored
-        .multi_party()
-        .expect("multi-party advertised")
-        .output_conflict_detail());
-
-    let mut single_party = NutCtfSplitMergeSettings::default();
-    single_party.advertise_output_conflict_detail();
-    assert_eq!(
-        serde_json::to_value(&single_party).expect("serialize settings"),
-        json!({"supported": true})
-    );
 }
 
 #[test]

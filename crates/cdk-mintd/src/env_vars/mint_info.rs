@@ -47,6 +47,11 @@ pub const ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS: &str =
 #[cfg(feature = "conditional-tokens")]
 pub const ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES: &str =
     "CDK_MINTD_CTF_SETTLEMENT_MAX_POOL_ENTRIES";
+/// Optional. See `CtfSettlementConfig::output_conflict_detail`, including its
+/// rollback warning.
+#[cfg(feature = "conditional-tokens")]
+pub const ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL: &str =
+    "CDK_MINTD_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL";
 
 #[cfg(feature = "conditional-tokens")]
 fn registration_fee_from_env(
@@ -100,7 +105,13 @@ pub(crate) fn ctf_settlement_from_env() -> Result<Option<CtfSettlementConfig>> {
             read_optional_env(ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES)?,
         ),
     ];
+    let output_conflict_detail = read_optional_env(ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL)?;
     if fields.iter().all(|(_, value)| value.is_none()) {
+        if output_conflict_detail.is_some() {
+            bail!(
+                "{ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL} needs every CTF settlement limit"
+            );
+        }
         return Ok(None);
     }
 
@@ -120,6 +131,14 @@ pub(crate) fn ctf_settlement_from_env() -> Result<Option<CtfSettlementConfig>> {
         max_request_bytes: parse(3)?,
         max_expiry_seconds: parse(4)?,
         max_pool_entries: parse(5)?,
+        output_conflict_detail: output_conflict_detail
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .with_context(|| {
+                format!("{ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL} must be true or false")
+            })?
+            .unwrap_or(false),
     }))
 }
 
@@ -224,6 +243,16 @@ mod tests {
         env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_REQUEST_BYTES);
         env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS);
         env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES);
+        env::remove_var(ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL);
+    }
+
+    fn set_complete_settlement_limits() {
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_PARTICIPANTS, "32");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_INPUTS, "512");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_OUTPUTS, "512");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_REQUEST_BYTES, "1048576");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS, "86400");
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES, "128");
     }
 
     #[test]
@@ -345,5 +374,29 @@ mod tests {
         clear_settlement_env();
         assert_eq!(settlement.max_inputs, 512);
         assert_eq!(settlement.max_expiry_seconds, 86_400);
+        assert!(!settlement.output_conflict_detail);
+    }
+
+    #[test]
+    fn ctf_settlement_env_enables_output_conflict_detail_only_with_limits() {
+        let _guard = crate::test_utils::env_lock();
+        clear_settlement_env();
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL, "true");
+        let without_limits = ctf_settlement_from_env();
+
+        set_complete_settlement_limits();
+        let enabled = ctf_settlement_from_env();
+        env::set_var(ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL, "yes");
+        let malformed = ctf_settlement_from_env();
+
+        clear_settlement_env();
+        assert!(without_limits.is_err());
+        assert!(
+            enabled
+                .expect("settlement env")
+                .expect("configured settlement")
+                .output_conflict_detail
+        );
+        assert!(malformed.is_err());
     }
 }

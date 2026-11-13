@@ -399,7 +399,8 @@ impl Mint {
     ///
     /// Each transaction deletes one bounded batch. The pass ends: a new record
     /// is written only for a request whose cutoff is after its write time.
-    /// A record without a cutoff is kept, because its request has no expiry.
+    /// Every record has a cutoff, because only a request with a
+    /// `PAY_TO_UNLOCK` input gets one.
     #[cfg(feature = "conditional-tokens")]
     pub async fn delete_expired_output_conflicts(&self, now: u64) -> Result<u64, Error> {
         let expired_at = now.saturating_sub(OUTPUT_CONFLICT_RETENTION_SECS);

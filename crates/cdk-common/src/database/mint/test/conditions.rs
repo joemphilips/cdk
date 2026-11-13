@@ -7,12 +7,10 @@ use cashu::{CurrencyUnit, Id};
 
 use crate::database::mint::{
     ConditionsDatabase, CtfSettlementReplay, CtfSettlementReplayDatabase, Database, Error,
-    KeysDatabase,
+    KeysDatabase, OutputConflictRecord,
 };
 use crate::mint::{MintKeySetInfo, Operation, StoredCondition};
-use crate::nuts::nut_ctf::settlement::{
-    CanonicalHash, CtfSettlementResponse, OutputConflict, OutputConflictState, OutputConflicts,
-};
+use crate::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse, OutputConflictState};
 use crate::nuts::{BlindSignature, BlindedMessage, SecretKey};
 use crate::Amount;
 
@@ -483,18 +481,16 @@ where
     );
 }
 
-fn test_output_conflicts() -> OutputConflicts {
-    OutputConflicts::new(vec![
-        OutputConflict {
-            blinded_secret: SecretKey::generate().public_key(),
-            state: OutputConflictState::Pending,
-        },
-        OutputConflict {
-            blinded_secret: SecretKey::generate().public_key(),
-            state: OutputConflictState::Signed,
-        },
+/// Five outputs: pending, none, signed, none, signed.
+fn test_output_conflict_record() -> OutputConflictRecord {
+    OutputConflictRecord::from_states(&[
+        Some(OutputConflictState::Pending),
+        None,
+        Some(OutputConflictState::Signed),
+        None,
+        Some(OutputConflictState::Signed),
     ])
-    .expect("two conflicts")
+    .expect("three conflicts")
 }
 
 /// Test that an output conflict record reads back as the terminal outcome of its digest.
@@ -502,33 +498,32 @@ pub async fn ctf_settlement_output_conflict_round_trip<DB>(db: DB)
 where
     DB: Database<Error> + CtfSettlementReplayDatabase<Err = Error>,
 {
-    let conflicts = test_output_conflicts();
-    let with_cutoff = CanonicalHash::from_bytes([0x51; 32]);
-    let without_cutoff = CanonicalHash::from_bytes([0x52; 32]);
-    for (digest, cutoff) in [(with_cutoff, Some(1_723_456_789)), (without_cutoff, None)] {
-        let expected = CtfSettlementReplay::RejectedOutputConflict {
-            conflicts: conflicts.clone(),
-            cutoff,
-        };
-        let mut transaction = db.begin_transaction().await.unwrap();
-        transaction
-            .add_ctf_settlement_output_conflict(digest, &conflicts, cutoff)
-            .await
-            .unwrap();
-        assert_eq!(
-            transaction.get_ctf_settlement_replay(digest).await.unwrap(),
-            Some(expected.clone())
-        );
-        transaction.commit().await.unwrap();
-        assert_eq!(
-            db.get_ctf_settlement_replay(digest).await.unwrap(),
-            Some(expected)
-        );
-    }
+    let record = test_output_conflict_record();
+    assert_eq!(record.packed_states(), &[0b0010_0001, 0b0000_0010]);
+    let digest = CanonicalHash::from_bytes([0x51; 32]);
+    let cutoff = 1_723_456_789;
+    let expected = CtfSettlementReplay::RejectedOutputConflict {
+        record: record.clone(),
+        cutoff,
+    };
+    let mut transaction = db.begin_transaction().await.unwrap();
+    transaction
+        .add_ctf_settlement_output_conflict(digest, &record, cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        transaction.get_ctf_settlement_replay(digest).await.unwrap(),
+        Some(expected.clone())
+    );
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        db.get_ctf_settlement_replay(digest).await.unwrap(),
+        Some(expected)
+    );
 
     let mut duplicate = db.begin_transaction().await.unwrap();
     assert!(duplicate
-        .add_ctf_settlement_output_conflict(with_cutoff, &conflicts, None)
+        .add_ctf_settlement_output_conflict(digest, &record, cutoff)
         .await
         .is_err());
     duplicate.rollback().await.unwrap();
@@ -593,27 +588,26 @@ pub async fn ctf_settlement_output_conflict_cleanup_is_bounded<DB>(db: DB)
 where
     DB: Database<Error> + CtfSettlementReplayDatabase<Err = Error>,
 {
-    let conflicts = test_output_conflicts();
+    let record = test_output_conflict_record();
     let records = [
-        (CanonicalHash::from_bytes([0x61; 32]), Some(100)),
-        (CanonicalHash::from_bytes([0x62; 32]), Some(200)),
-        (CanonicalHash::from_bytes([0x63; 32]), Some(300)),
-        (CanonicalHash::from_bytes([0x64; 32]), None),
+        (CanonicalHash::from_bytes([0x61; 32]), 100),
+        (CanonicalHash::from_bytes([0x62; 32]), 200),
+        (CanonicalHash::from_bytes([0x63; 32]), 300),
     ];
     let mut transaction = db.begin_transaction().await.unwrap();
     for (digest, cutoff) in records {
         transaction
-            .add_ctf_settlement_output_conflict(digest, &conflicts, cutoff)
+            .add_ctf_settlement_output_conflict(digest, &record, cutoff)
             .await
             .unwrap();
     }
     transaction.commit().await.unwrap();
 
     // (expired_at, limit, deleted, digests that remain)
-    let passes: [(u64, u64, u64, [bool; 4]); 3] = [
-        (250, 1, 1, [false, true, true, true]),
-        (200, 10, 1, [false, false, true, true]),
-        (1_000_000, 10, 1, [false, false, false, true]),
+    let passes: [(u64, u64, u64, [bool; 3]); 3] = [
+        (250, 1, 1, [false, true, true]),
+        (200, 10, 1, [false, false, true]),
+        (299, 10, 0, [false, false, true]),
     ];
     for (expired_at, limit, deleted, remaining) in passes {
         let mut transaction = db.begin_transaction().await.unwrap();

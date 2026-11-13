@@ -2,11 +2,12 @@
 //!
 //! An attribution reads a refused request R with one NUT-09 restore. It
 //! relies on these mint facts: the mint refuses an already signed output in
-//! the transaction that commits, after it takes the condition row lock; the
-//! refusal lists that output as signed, and the same transaction records
-//! that R can never commit; a commit stores the signature of every output of
-//! R or of none; a stored signature is permanent; and the restore returns
-//! the stored signature of the operation that signed the output.
+//! the transaction that commits, after it takes the condition row lock; with
+//! output conflict detail on, the refusal lists that output as signed and the
+//! same transaction records that R can never commit; a commit stores the
+//! signature of every output of R or of none; a stored signature is
+//! permanent; and the restore returns the stored signature of the operation
+//! that signed the output.
 
 use cdk_common::nuts::nut_ctf::settlement::{OutputConflict, OutputConflictState};
 use cdk_common::nuts::{RestoreRequest, RestoreResponse};
@@ -61,11 +62,12 @@ async fn restore(mint: &Mint, outputs: Vec<BlindedMessage>) -> RestoreResponse {
 
 /// Request R reuses one output that request W signs first, as one seed open on two devices does.
 ///
-/// R reaches its commit transaction after W commits. In that transaction the
-/// mint refuses R, lists the reused output as signed, and records that R can
-/// never commit. It writes nothing else for R and keeps W's signature. A
-/// retry of R gets the same refusal.
-async fn assert_reused_output_is_refused_at_commit(mint: Mint) {
+/// R reaches its commit transaction after W commits, and the mint refuses R
+/// in that transaction. With output conflict detail off, the refusal is
+/// 11008 and writes nothing for R. With it on, the refusal lists the reused
+/// output as signed and records that R can never commit. Either way it keeps
+/// W's signature, and a retry of R gets the same refusal.
+async fn assert_reused_output_is_refused_at_commit(mint: Mint, settings: NutCtfSettlementSettings) {
     let now = unix_time();
     let (condition_id, keysets) =
         register_test_condition_with_collateral(&mint, &["YES", "NO"], CurrencyUnit::Sat).await;
@@ -93,7 +95,7 @@ async fn assert_reused_output_is_refused_at_commit(mint: Mint) {
     let reused_request = reused.clone();
     let reused_task = tokio::spawn(async move {
         reused_mint
-            .process_ctf_settlement(&reused_request, settlement_settings(), now)
+            .process_ctf_settlement(&reused_request, settings, now)
             .await
     });
     timeout(Duration::from_secs(5), reached)
@@ -108,19 +110,14 @@ async fn assert_reused_output_is_refused_at_commit(mint: Mint) {
         .expect("R task")
         .expect_err("R must not commit an output that W signed");
     // `shared` is one YES 8 output, the only output that W also signed.
-    let signed_conflicts = vec![OutputConflict {
-        blinded_secret: shared[0].blinded_secret,
-        state: OutputConflictState::Signed,
-    }];
     assert_eq!(shared.len(), 1);
-    assert!(
-        matches!(
-            &error,
-            CtfSettlementError::OutputConflict(conflicts)
-                if conflicts.outputs() == signed_conflicts.as_slice()
-        ),
-        "{error:?}"
-    );
+    let signed_conflicts = settings.output_conflict_detail().then(|| {
+        vec![OutputConflict {
+            blinded_secret: shared[0].blinded_secret,
+            state: OutputConflictState::Signed,
+        }]
+    });
+    assert_refusal(&error, signed_conflicts.as_deref());
 
     let shared_signature = winning.signatures[participant_with_outputs(&winner, &shared)].clone();
     let trace = ReusedRequestTrace {
@@ -138,18 +135,28 @@ async fn assert_reused_output_is_refused_at_commit(mint: Mint) {
         .await;
 
     let error = mint
-        .process_ctf_settlement(&reused, settlement_settings(), now)
+        .process_ctf_settlement(&reused, settings, now)
         .await
         .expect_err("a request with a signed output can never commit");
-    assert!(
-        matches!(
-            &error,
-            CtfSettlementError::OutputConflict(conflicts)
-                if conflicts.outputs() == trace.conflicts.as_slice()
-        ),
-        "{error:?}"
-    );
+    assert_refusal(&error, trace.conflicts.as_deref());
     trace.assert_refused(&mint, "after a retry").await;
+}
+
+/// The plain 11008 refusal, or the refusal that lists exactly `conflicts`.
+fn assert_refusal(error: &CtfSettlementError, conflicts: Option<&[OutputConflict]>) {
+    match conflicts {
+        None => assert!(
+            matches!(error, CtfSettlementError::Mint(Error::DuplicateOutputs)),
+            "{error:?}"
+        ),
+        Some(expected) => assert!(
+            matches!(
+                error,
+                CtfSettlementError::OutputConflict(conflicts) if conflicts.outputs() == expected
+            ),
+            "{error:?}"
+        ),
+    }
 }
 
 /// The stored facts of a reused-output request R that the mint refused.
@@ -162,8 +169,8 @@ struct ReusedRequestTrace<'a> {
     /// R's outputs that the winning request signed, and their signatures.
     shared_outputs: Vec<BlindedMessage>,
     shared_signatures: Vec<cdk_common::BlindSignature>,
-    /// The refusal's conflict list.
-    conflicts: Vec<OutputConflict>,
+    /// The refusal's conflict list. `None` for the plain refusal.
+    conflicts: Option<Vec<OutputConflict>>,
     /// R's earliest authorization expiry.
     cutoff: u64,
 }
@@ -199,16 +206,30 @@ impl ReusedRequestTrace<'_> {
             self.completed_after_winner,
             "{attempt}: only the winning request completed"
         );
-        match db
+        let recorded = db
             .get_ctf_settlement_replay(self.request.request_digest().unwrap())
             .await
-            .unwrap()
-        {
-            Some(CtfSettlementReplay::RejectedOutputConflict { conflicts, cutoff }) => {
-                assert_eq!(conflicts.outputs(), self.conflicts.as_slice(), "{attempt}");
-                assert_eq!(cutoff, Some(self.cutoff), "{attempt}");
+            .unwrap();
+        match (&self.conflicts, recorded) {
+            (None, None) => {}
+            (
+                Some(expected),
+                Some(CtfSettlementReplay::RejectedOutputConflict { record, cutoff }),
+            ) => {
+                let points = request_outputs(self.request)
+                    .iter()
+                    .map(|output| output.blinded_secret)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    record.conflicts(&points).unwrap().outputs(),
+                    expected.as_slice(),
+                    "{attempt}"
+                );
+                assert_eq!(cutoff, self.cutoff, "{attempt}");
             }
-            other => panic!("{attempt}: R must have its no-commit record, got {other:?}"),
+            (expected, recorded) => {
+                panic!("{attempt}: expected record for {expected:?}, got {recorded:?}")
+            }
         }
         // One NUT-09 read of all of R's outputs: the reused output is signed and the others are not.
         assert_eq!(
@@ -222,14 +243,21 @@ impl ReusedRequestTrace<'_> {
     }
 }
 
+fn both_conflict_detail_settings() -> [NutCtfSettlementSettings; 2] {
+    [false, true].map(|enabled| settlement_settings().with_output_conflict_detail(enabled))
+}
+
 #[tokio::test]
 async fn test_ctf_settlement_reused_output_is_refused_in_the_commit_transaction() {
-    assert_reused_output_is_refused_at_commit(
-        create_test_mint_with_unit(CurrencyUnit::Sat, 1)
-            .await
-            .unwrap(),
-    )
-    .await;
+    for settings in both_conflict_detail_settings() {
+        assert_reused_output_is_refused_at_commit(
+            create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+                .await
+                .unwrap(),
+            settings,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -248,7 +276,10 @@ async fn test_postgres_ctf_settlement_reused_output_is_refused_in_the_commit_tra
     let mint = build_test_mint_with_units(db, &[33; 32], &[(CurrencyUnit::Sat, 1)])
         .await
         .unwrap();
-    assert_reused_output_is_refused_at_commit(mint.clone()).await;
+    // Each run registers its own condition, so one database holds both.
+    for settings in both_conflict_detail_settings() {
+        assert_reused_output_is_refused_at_commit(mint.clone(), settings).await;
+    }
     mint.stop().await.unwrap();
 }
 

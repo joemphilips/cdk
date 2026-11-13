@@ -1443,6 +1443,11 @@ fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError)
         ),
         CtfSettlementError::CollateralUnitMismatch => into_response(cdk::Error::UnitMismatch),
         CtfSettlementError::OutputConflict(conflicts) => output_conflict_error_response(&conflicts),
+        // Not definitive: no record exists, so the submitter retries the same bytes.
+        CtfSettlementError::OutputConflictUnresolved => {
+            tracing::warn!("settlement output state changed during every commit attempt");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         CtfSettlementError::Mint(cdk::Error::NUT11(_) | cdk::Error::NUT14(_)) => {
             individual_condition_witness_error_response()
         }
@@ -1986,6 +1991,13 @@ mod ctf_convert_admission_tests {
             let error: ErrorResponse = serde_json::from_value(body).expect("error response");
             assert_eq!(error.code, expected_code);
         }
+    }
+
+    #[tokio::test]
+    async fn unresolved_output_conflict_is_not_a_definitive_refusal() {
+        let response =
+            ctf_settlement_execution_error_response(CtfSettlementError::OutputConflictUnresolved);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

@@ -103,6 +103,12 @@ tti = 60
 # max_request_bytes = 1048576
 # max_expiry_seconds = 86400
 # max_pool_entries = 128
+# List the conflicting outputs of a refused settlement and record that the
+# request can never commit (NUT-CTF-settle output conflict detail). Off by
+# default. Once the mint has started with it on, do not roll back to a version
+# without this feature: the stored mint info holds the new field, and the older
+# version ignores the no-commit records.
+# output_conflict_detail = false
 
 
 [database]

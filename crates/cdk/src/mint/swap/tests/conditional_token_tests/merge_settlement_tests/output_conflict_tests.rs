@@ -102,7 +102,7 @@ async fn refuse_with_conflicts(
     now: u64,
 ) -> OutputConflicts {
     match mint
-        .process_ctf_settlement(request, settlement_settings(), now)
+        .process_ctf_settlement(request, conflict_detail_settings(), now)
         .await
     {
         Err(CtfSettlementError::OutputConflict(conflicts)) => conflicts,
@@ -120,9 +120,38 @@ async fn recorded_outcome(
         .unwrap()
 }
 
+/// The request has a no-commit record that ends at `cutoff` and lists `conflicts`.
+///
+/// The record stores two bits for each output, so it is rebuilt from the
+/// request's own outputs.
+async fn assert_conflict_record(
+    mint: &Mint,
+    request: &CtfSettlementRequest,
+    conflicts: &OutputConflicts,
+    cutoff: u64,
+) {
+    let outputs = outputs_in_request_order(request);
+    match recorded_outcome(mint, request).await {
+        Some(CtfSettlementReplay::RejectedOutputConflict {
+            record,
+            cutoff: recorded,
+        }) => {
+            assert_eq!(recorded, cutoff);
+            assert_eq!(record.output_count(), outputs.len());
+            assert_eq!(record.packed_states().len(), outputs.len().div_ceil(4));
+            let points = outputs
+                .iter()
+                .map(|output| output.blinded_secret)
+                .collect::<Vec<_>>();
+            assert_eq!(&record.conflicts(&points).unwrap(), conflicts);
+        }
+        other => panic!("expected a no-commit record, got {other:?}"),
+    }
+}
+
 /// The refused request spent no input, kept no row for its other outputs,
-/// and completed no swap. Only its no-commit record exists.
-async fn assert_only_the_record_remains(
+/// and completed no swap.
+async fn assert_no_other_writes(
     mint: &Mint,
     request: &CtfSettlementRequest,
     conflicting: &[BlindedMessage],
@@ -167,14 +196,8 @@ async fn assert_pending_conflict_is_listed_and_recorded(mint: Mint) {
         &[conflict(&reused, OutputConflictState::Pending)]
     );
     // The locked seller's authorization expires first; the bare seller has none.
-    assert_eq!(
-        recorded_outcome(&mint, request).await,
-        Some(CtfSettlementReplay::RejectedOutputConflict {
-            conflicts: conflicts.clone(),
-            cutoff: Some(now + OFFER_LIFETIME_SECONDS),
-        })
-    );
-    assert_only_the_record_remains(
+    assert_conflict_record(&mint, request, &conflicts, now + OFFER_LIFETIME_SECONDS).await;
+    assert_no_other_writes(
         &mint,
         request,
         std::slice::from_ref(&reused),
@@ -187,7 +210,7 @@ async fn assert_pending_conflict_is_listed_and_recorded(mint: Mint) {
 
     // The record, not the removed row, refuses the copy.
     assert_eq!(refuse_with_conflicts(&mint, request, now).await, conflicts);
-    assert_only_the_record_remains(
+    assert_no_other_writes(
         &mint,
         request,
         std::slice::from_ref(&reused),
@@ -267,7 +290,7 @@ async fn test_ctf_settlement_mixed_conflicts_are_listed_in_request_order() {
         ]
     );
     assert!(conflicts.any_pending());
-    assert_only_the_record_remains(
+    assert_no_other_writes(
         &mint,
         &request,
         &[high.clone(), low.clone()],
@@ -295,7 +318,7 @@ async fn test_ctf_settlement_identical_copy_is_not_a_conflict_with_itself() {
     let first_request = request.clone();
     let first = tokio::spawn(async move {
         first_mint
-            .process_ctf_settlement(&first_request, settlement_settings(), now)
+            .process_ctf_settlement(&first_request, conflict_detail_settings(), now)
             .await
     });
     timeout(Duration::from_secs(5), reached)
@@ -306,7 +329,7 @@ async fn test_ctf_settlement_identical_copy_is_not_a_conflict_with_itself() {
     let copy_request = request.clone();
     let copy = tokio::spawn(async move {
         copy_mint
-            .process_ctf_settlement(&copy_request, settlement_settings(), now)
+            .process_ctf_settlement(&copy_request, conflict_detail_settings(), now)
             .await
     });
     release.send(()).expect("R must still wait at the pause");
@@ -323,7 +346,7 @@ async fn test_ctf_settlement_identical_copy_is_not_a_conflict_with_itself() {
         .expect("the copy replays R");
     assert_eq!(copied, committed);
     assert_eq!(
-        mint.process_ctf_settlement(&request, settlement_settings(), now)
+        mint.process_ctf_settlement(&request, conflict_detail_settings(), now)
             .await
             .expect("a retry replays R"),
         committed
@@ -342,7 +365,7 @@ async fn refuse_before_signing_without_record(
 ) -> CtfSettlementError {
     let signing_before = mint.blind_sign_attempts();
     let error = mint
-        .process_ctf_settlement(request, settlement_settings(), now)
+        .process_ctf_settlement(request, conflict_detail_settings(), now)
         .await
         .expect_err("an invalid request must be refused");
     assert_eq!(mint.blind_sign_attempts(), signing_before, "{error:?}");
@@ -412,7 +435,7 @@ async fn test_ctf_settlement_conflict_record_answers_expiry_from_the_cutoff() {
     );
     for at in [cutoff, cutoff + 1] {
         let error = mint
-            .process_ctf_settlement(request, settlement_settings(), at)
+            .process_ctf_settlement(request, conflict_detail_settings(), at)
             .await
             .expect_err("an expired request cannot commit");
         assert!(
@@ -440,18 +463,12 @@ async fn test_ctf_settlement_maintenance_deletes_a_conflict_record_after_its_ret
     let deleted_at = cutoff + OUTPUT_CONFLICT_RETENTION_SECS;
 
     mint.run_maintenance(deleted_at - 1).await;
-    assert_eq!(
-        recorded_outcome(&mint, request).await,
-        Some(CtfSettlementReplay::RejectedOutputConflict {
-            conflicts,
-            cutoff: Some(cutoff),
-        })
-    );
+    assert_conflict_record(&mint, request, &conflicts, cutoff).await;
 
     mint.run_maintenance(deleted_at).await;
     assert_eq!(recorded_outcome(&mint, request).await, None);
     let error = mint
-        .process_ctf_settlement(request, settlement_settings(), deleted_at)
+        .process_ctf_settlement(request, conflict_detail_settings(), deleted_at)
         .await
         .expect_err("an expired request cannot commit");
     assert!(
@@ -462,6 +479,95 @@ async fn test_ctf_settlement_maintenance_deletes_a_conflict_record_after_its_ret
         recorded_outcome(&mint, request).await,
         Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
     );
+}
+
+/// The capability that lists output conflicts. It is off by default.
+fn conflict_detail_settings() -> NutCtfSettlementSettings {
+    settlement_settings().with_output_conflict_detail(true)
+}
+
+/// Two bare sellers MERGE 8 YES and 8 NO into 4 + 3 collateral. No input is locked.
+async fn bare_only_merge_request(
+    mint: &Mint,
+    receive: Vec<BlindedMessage>,
+) -> CtfSettlementRequest {
+    let (condition_id, keysets) =
+        register_test_condition_with_collateral(mint, &["YES", "NO"], CurrencyUnit::Sat).await;
+    let regular = get_regular_keyset_id(mint);
+    let [yes_funding, no_funding]: [Proofs; 2] = issue_regular_premints(
+        mint,
+        &[conversion_funding(mint, 8), conversion_funding(mint, 8)],
+    )
+    .await
+    .try_into()
+    .unwrap();
+    let yes = convert_to_conditional(mint, yes_funding, keysets["YES"], Amount::from(8)).await;
+    let no = convert_to_conditional(mint, no_funding, keysets["NO"], Amount::from(8)).await;
+    let request = settlement_request(
+        &condition_id,
+        vec![
+            settlement_record(yes, receive),
+            settlement_record(no, create_premint(mint, regular, Amount::from(3)).0),
+        ],
+    );
+    assert!(request
+        .validated_authorizations(conflict_detail_settings().structural_limits().unwrap())
+        .unwrap()
+        .is_empty());
+    request
+}
+
+/// A request without a `PAY_TO_UNLOCK` input has no expiry, so a record for
+/// it could never be deleted. The mint answers it as before: 11008 without
+/// a list, and no record.
+#[tokio::test]
+async fn test_ctf_settlement_request_without_a_locked_input_gets_the_plain_refusal() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let reused = create_premint(&mint, get_regular_keyset_id(&mint), Amount::from(4)).0;
+    let request = bare_only_merge_request(&mint, reused.clone()).await;
+    let _melt = hold_melt(&mint, reused).await;
+
+    let error = mint
+        .process_ctf_settlement(&request, conflict_detail_settings(), now)
+        .await
+        .expect_err("a reused output cannot commit");
+    assert!(
+        matches!(error, CtfSettlementError::Mint(Error::DuplicateOutputs)),
+        "{error:?}"
+    );
+    assert_eq!(recorded_outcome(&mint, &request).await, None);
+}
+
+/// With output conflict detail off, the mint answers as before this feature.
+///
+/// The refusal is 11008 without a list, it writes no record, and a copy of
+/// the request commits after the other operation is removed.
+#[tokio::test]
+async fn test_ctf_settlement_without_output_conflict_detail_answers_as_before() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
+    let request = &fixture.request;
+    let melt = hold_melt(&mint, vec![bare_seller_output(&fixture)]).await;
+    let off = NutCtfSettlementSettings::new(8, 32, 64, 64 * 1024, 3600, 32).unwrap();
+
+    let error = mint
+        .process_ctf_settlement(request, off, now)
+        .await
+        .expect_err("a pending output cannot commit");
+    assert!(
+        matches!(error, CtfSettlementError::Mint(Error::DuplicateOutputs)),
+        "{error:?}"
+    );
+    assert_eq!(recorded_outcome(&mint, request).await, None);
+
+    compensate_held_melt(&mint, melt).await;
+    commit_and_check_with(&mint, request, off, now, 1).await;
 }
 
 /// Another operation can insert an output row after the conflict scan.
@@ -482,7 +588,7 @@ async fn test_ctf_settlement_conflict_inserted_after_the_scan_is_found_on_retry(
     // The first scan sees no row, as when the other insert commits after it.
     set_fail_for("MISS_OUTPUT_CONFLICT_SCAN_ONCE");
     let result = mint
-        .process_ctf_settlement(request, settlement_settings(), now)
+        .process_ctf_settlement(request, conflict_detail_settings(), now)
         .await;
     clear_fail_for("MISS_OUTPUT_CONFLICT_SCAN_ONCE");
 
@@ -497,4 +603,44 @@ async fn test_ctf_settlement_conflict_inserted_after_the_scan_is_found_on_retry(
         recorded_outcome(&mint, request).await,
         Some(CtfSettlementReplay::RejectedOutputConflict { .. })
     ));
+}
+
+/// When every attempt misses a row, the mint has no record, so it must not
+/// answer with a definitive refusal. The identical request later resolves.
+#[tokio::test]
+async fn test_ctf_settlement_conflict_missed_in_every_attempt_is_not_definitive() {
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let now = unix_time();
+    let fixture = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
+    let request = &fixture.request;
+    let reused = bare_seller_output(&fixture);
+    let _melt = hold_melt(&mint, vec![reused.clone()]).await;
+    let completed_before = completed_swap_count(&mint).await;
+
+    set_fail_for("MISS_OUTPUT_CONFLICT_SCAN");
+    let result = mint
+        .process_ctf_settlement(request, conflict_detail_settings(), now)
+        .await;
+    clear_fail_for("MISS_OUTPUT_CONFLICT_SCAN");
+
+    assert!(
+        matches!(result, Err(CtfSettlementError::OutputConflictUnresolved)),
+        "{result:?}"
+    );
+    assert_eq!(recorded_outcome(&mint, request).await, None);
+    assert_no_other_writes(
+        &mint,
+        request,
+        std::slice::from_ref(&reused),
+        completed_before,
+    )
+    .await;
+
+    let conflicts = refuse_with_conflicts(&mint, request, now).await;
+    assert_eq!(
+        conflicts.outputs(),
+        &[conflict(&reused, OutputConflictState::Pending)]
+    );
 }

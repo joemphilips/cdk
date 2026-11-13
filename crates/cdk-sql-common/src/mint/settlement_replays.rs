@@ -3,18 +3,19 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use cdk_common::database::mint::{
     CtfSettlementReplay, CtfSettlementReplayDatabase, CtfSettlementReplayTransaction,
+    OutputConflictRecord,
 };
 use cdk_common::database::Error;
 use cdk_common::nuts::nut_ctf::settlement::{
-    CanonicalHash, CtfSettlementResponse, OutputConflictState, OutputConflicts,
+    CanonicalHash, CtfSettlementResponse, OutputConflictState,
 };
 use cdk_common::nuts::PublicKey;
 use cdk_common::util::unix_time;
 
 use super::{SQLMintDatabase, SQLTransaction};
-use crate::column_as_string;
 use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
+use crate::{column_as_binary, column_as_string};
 
 fn decode_replay(row: Vec<Column>) -> Result<CtfSettlementReplay, Error> {
     match row.as_slice() {
@@ -40,20 +41,20 @@ fn decode_replay(row: Vec<Column>) -> Result<CtfSettlementReplay, Error> {
 
 fn decode_output_conflict(row: Vec<Column>) -> Result<CtfSettlementReplay, Error> {
     match row.as_slice() {
-        [conflicts_json, cutoff] => {
-            let conflicts = serde_json::from_str(&column_as_string!(conflicts_json))?;
-            let cutoff = match cutoff {
-                Column::Null => None,
-                Column::Integer(cutoff) => Some(u64::try_from(*cutoff).map_err(|_| {
-                    Error::Internal("invalid negative output conflict cutoff".to_string())
-                })?),
-                _ => {
-                    return Err(Error::Internal(
-                        "invalid persisted output conflict cutoff".to_string(),
-                    ))
-                }
+        [Column::Integer(output_count), conflict_states, Column::Integer(cutoff)] => {
+            let non_negative = |value: i64, field: &str| {
+                u64::try_from(value).map_err(|_| {
+                    Error::Internal(format!("invalid negative output conflict {field}"))
+                })
             };
-            Ok(CtfSettlementReplay::RejectedOutputConflict { conflicts, cutoff })
+            let record = OutputConflictRecord::from_stored(
+                non_negative(*output_count, "output count")?,
+                column_as_binary!(conflict_states),
+            )?;
+            Ok(CtfSettlementReplay::RejectedOutputConflict {
+                record,
+                cutoff: non_negative(*cutoff, "cutoff")?,
+            })
         }
         _ => Err(Error::Internal(
             "invalid persisted output conflict record".to_string(),
@@ -90,7 +91,7 @@ where
 
     query(
         r#"
-        SELECT CAST(conflicts_json AS TEXT), cutoff
+        SELECT output_count, conflict_states, cutoff
         FROM ctf_settlement_output_conflicts
         WHERE request_digest = :request_digest
         "#,
@@ -102,10 +103,9 @@ where
     .transpose()
 }
 
-fn optional_i64(value: Option<u64>, field: &str) -> Result<Option<i64>, Error> {
+fn to_i64<T: TryInto<i64>>(value: T, field: &str) -> Result<i64, Error> {
     value
-        .map(i64::try_from)
-        .transpose()
+        .try_into()
         .map_err(|_| Error::Internal(format!("{field} exceeds i64")))
 }
 
@@ -216,20 +216,24 @@ where
     async fn add_ctf_settlement_output_conflict(
         &mut self,
         request_digest: CanonicalHash,
-        conflicts: &OutputConflicts,
-        cutoff: Option<u64>,
+        record: &OutputConflictRecord,
+        cutoff: u64,
     ) -> Result<(), Self::Err> {
         query(
             r#"
             INSERT INTO ctf_settlement_output_conflicts
-                (request_digest, conflicts_json, cutoff, created_at)
+                (request_digest, output_count, conflict_states, cutoff, created_at)
             VALUES
-                (:request_digest, :conflicts_json, :cutoff, :created_at)
+                (:request_digest, :output_count, :conflict_states, :cutoff, :created_at)
             "#,
         )?
         .bind("request_digest", request_digest.to_bytes().to_vec())
-        .bind("conflicts_json", serde_json::to_string(conflicts)?)
-        .bind("cutoff", optional_i64(cutoff, "output conflict cutoff")?)
+        .bind(
+            "output_count",
+            to_i64(record.output_count(), "output conflict count")?,
+        )
+        .bind("conflict_states", record.packed_states().to_vec())
+        .bind("cutoff", to_i64(cutoff, "output conflict cutoff")?)
         .bind("created_at", unix_time() as i64)
         .execute(&self.inner)
         .await?;
@@ -241,17 +245,15 @@ where
         expired_at: u64,
         limit: u64,
     ) -> Result<u64, Self::Err> {
-        let expired_at = i64::try_from(expired_at)
-            .map_err(|_| Error::Internal("output conflict expiry exceeds i64".to_string()))?;
-        let limit = i64::try_from(limit)
-            .map_err(|_| Error::Internal("output conflict delete limit exceeds i64".to_string()))?;
+        let expired_at = to_i64(expired_at, "output conflict expiry")?;
+        let limit = to_i64(limit, "output conflict delete limit")?;
         let deleted = query(
             r#"
             DELETE FROM ctf_settlement_output_conflicts
             WHERE request_digest IN (
                 SELECT request_digest
                 FROM ctf_settlement_output_conflicts
-                WHERE cutoff IS NOT NULL AND cutoff <= :expired_at
+                WHERE cutoff <= :expired_at
                 ORDER BY cutoff, request_digest
                 LIMIT :limit
             )

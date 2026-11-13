@@ -15,7 +15,10 @@ pub struct NutCtfSettlementSettings {
     max_pool_entries: u64,
     /// A refusal for a signed or pending output lists each such output.
     ///
-    /// The detail needs `request_digest`, which `idempotent_retries` already requires.
+    /// The detail needs `request_digest`, which `idempotent_retries` already
+    /// requires. It is off by default and is not serialized when off, so a
+    /// client that rejects unknown info fields still reads the setting.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     output_conflict_detail: bool,
 }
 
@@ -53,8 +56,14 @@ impl NutCtfSettlementSettings {
             max_expiry_seconds,
             partial_fill: true,
             max_pool_entries,
-            output_conflict_detail: true,
+            output_conflict_detail: false,
         })
+    }
+
+    /// Enable or disable output conflict detail.
+    pub const fn with_output_conflict_detail(mut self, enabled: bool) -> Self {
+        self.output_conflict_detail = enabled;
+        self
     }
 
     /// Whether a refusal for a signed or pending output lists each such output.
@@ -134,16 +143,6 @@ impl NutCtfSplitMergeSettings {
     /// Return the advertised multi-party capability, if enabled.
     pub const fn multi_party(&self) -> Option<NutCtfSettlementSettings> {
         self.multi_party
-    }
-
-    /// Advertise output conflict detail on an enabled multi-party capability.
-    ///
-    /// A mint that reports output conflicts calls this on every info read, so
-    /// that mint info stored before the field existed still advertises it.
-    pub fn advertise_output_conflict_detail(&mut self) {
-        if let Some(multi_party) = self.multi_party.as_mut() {
-            multi_party.output_conflict_detail = true;
-        }
     }
 }
 
