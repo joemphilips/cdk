@@ -1087,6 +1087,123 @@ fn nut06_multi_party_is_complete_and_round_trips() {
 }
 
 #[test]
+fn nut06_multi_party_advertises_output_conflict_detail() {
+    let settings = NutCtfSplitMergeSettings::default()
+        .with_multi_party(
+            NutCtfSettlementSettings::new(64, 4096, 8192, 1_048_576, 3600, 256)
+                .expect("valid multi-party settings"),
+        )
+        .expect("legacy convert is enabled");
+    let value = serde_json::to_value(&settings).expect("serialize settings");
+
+    assert_eq!(value["output_conflict_detail"], true);
+    assert_eq!(value["idempotent_retries"], true);
+    let decoded: NutCtfSplitMergeSettings =
+        serde_json::from_value(value).expect("deserialize settings");
+    assert!(decoded
+        .multi_party()
+        .expect("multi-party advertised")
+        .output_conflict_detail());
+}
+
+fn multi_party_settings_without_output_conflict_detail() -> Value {
+    json!({
+        "supported": true,
+        "max_participants": 64,
+        "max_inputs": 4096,
+        "max_outputs": 8192,
+        "max_request_bytes": 1048576,
+        "idempotent_retries": true,
+        "max_expiry_seconds": 3600,
+        "partial_fill": true,
+        "max_pool_entries": 256
+    })
+}
+
+#[test]
+fn nut06_mint_without_output_conflict_detail_does_not_report_conflicts() {
+    let mut value = multi_party_settings_without_output_conflict_detail();
+    let older: NutCtfSplitMergeSettings =
+        serde_json::from_value(value.clone()).expect("a mint without the field decodes");
+    assert!(!older
+        .multi_party()
+        .expect("multi-party advertised")
+        .output_conflict_detail());
+
+    value["output_conflict_detail"] = json!(false);
+    let disabled: NutCtfSplitMergeSettings =
+        serde_json::from_value(value).expect("an explicit false decodes");
+    assert_eq!(disabled, older);
+}
+
+#[test]
+fn nut06_output_conflict_detail_requires_the_multi_party_capability() {
+    assert!(serde_json::from_value::<NutCtfSplitMergeSettings>(json!({
+        "supported": true,
+        "output_conflict_detail": true
+    }))
+    .is_err());
+}
+
+#[test]
+fn nut06_stored_settings_advertise_output_conflict_detail_after_upgrade() {
+    let mut stored: NutCtfSplitMergeSettings =
+        serde_json::from_value(multi_party_settings_without_output_conflict_detail())
+            .expect("stored settings decode");
+    stored.advertise_output_conflict_detail();
+    assert!(stored
+        .multi_party()
+        .expect("multi-party advertised")
+        .output_conflict_detail());
+
+    let mut single_party = NutCtfSplitMergeSettings::default();
+    single_party.advertise_output_conflict_detail();
+    assert_eq!(
+        serde_json::to_value(&single_party).expect("serialize settings"),
+        json!({"supported": true})
+    );
+}
+
+#[test]
+fn output_conflicts_use_the_specified_wire_shape() {
+    let conflicts = OutputConflicts::new(vec![
+        OutputConflict {
+            blinded_secret: PublicKey::from_hex(POINT_B).unwrap(),
+            state: OutputConflictState::Pending,
+        },
+        OutputConflict {
+            blinded_secret: PublicKey::from_hex(POINT_A).unwrap(),
+            state: OutputConflictState::Signed,
+        },
+    ])
+    .expect("two conflicts");
+    let value = serde_json::to_value(&conflicts).expect("serialize conflicts");
+
+    assert_eq!(
+        value,
+        json!([
+            {"B_": POINT_B, "state": "PENDING"},
+            {"B_": POINT_A, "state": "SIGNED"}
+        ])
+    );
+    assert_eq!(
+        serde_json::from_value::<OutputConflicts>(value).expect("decode conflicts"),
+        conflicts
+    );
+    assert!(conflicts.any_pending());
+}
+
+#[test]
+fn output_conflicts_are_never_empty() {
+    assert!(OutputConflicts::new(Vec::new()).is_none());
+    assert!(serde_json::from_value::<OutputConflicts>(json!([])).is_err());
+    assert!(serde_json::from_value::<OutputConflicts>(json!([
+        {"B_": POINT_A, "state": "SPENT"}
+    ]))
+    .is_err());
+}
+
+#[test]
 fn nut06_rejects_limits_that_cannot_hold_one_valid_multi_request() {
     for limits in [(2, 1, 2, 2), (2, 2, 1, 2), (2, 2, 2, 1)] {
         assert!(

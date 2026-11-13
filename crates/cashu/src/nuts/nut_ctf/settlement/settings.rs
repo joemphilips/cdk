@@ -13,6 +13,10 @@ pub struct NutCtfSettlementSettings {
     max_expiry_seconds: u64,
     partial_fill: bool,
     max_pool_entries: u64,
+    /// A refusal for a signed or pending output lists each such output.
+    ///
+    /// The detail needs `request_digest`, which `idempotent_retries` already requires.
+    output_conflict_detail: bool,
 }
 
 impl NutCtfSettlementSettings {
@@ -49,7 +53,13 @@ impl NutCtfSettlementSettings {
             max_expiry_seconds,
             partial_fill: true,
             max_pool_entries,
+            output_conflict_detail: true,
         })
+    }
+
+    /// Whether a refusal for a signed or pending output lists each such output.
+    pub const fn output_conflict_detail(self) -> bool {
+        self.output_conflict_detail
     }
 
     /// Maximum authorization lifetime.
@@ -125,6 +135,16 @@ impl NutCtfSplitMergeSettings {
     pub const fn multi_party(&self) -> Option<NutCtfSettlementSettings> {
         self.multi_party
     }
+
+    /// Advertise output conflict detail on an enabled multi-party capability.
+    ///
+    /// A mint that reports output conflicts calls this on every info read, so
+    /// that mint info stored before the field existed still advertises it.
+    pub fn advertise_output_conflict_detail(&mut self) {
+        if let Some(multi_party) = self.multi_party.as_mut() {
+            multi_party.output_conflict_detail = true;
+        }
+    }
 }
 
 impl Default for NutCtfSplitMergeSettings {
@@ -164,9 +184,25 @@ struct NutCtfSplitMergeSettingsWire {
     max_expiry_seconds: Option<u64>,
     partial_fill: Option<bool>,
     max_pool_entries: Option<u64>,
+    output_conflict_detail: Option<bool>,
 }
 
 fn decode_multi_party(
+    raw: &NutCtfSplitMergeSettingsWire,
+) -> Result<Option<NutCtfSettlementSettings>, NutCtfSettlementSettingsError> {
+    let settings = decode_multi_party_limits(raw)?;
+    match (settings, raw.output_conflict_detail) {
+        (None, Some(_)) => Err(NutCtfSettlementSettingsError::PartialSettings),
+        (None, None) => Ok(None),
+        // A mint that predates the field does not report output conflicts.
+        (Some(mut settings), detail) => {
+            settings.output_conflict_detail = detail.unwrap_or(false);
+            Ok(Some(settings))
+        }
+    }
+}
+
+fn decode_multi_party_limits(
     raw: &NutCtfSplitMergeSettingsWire,
 ) -> Result<Option<NutCtfSettlementSettings>, NutCtfSettlementSettingsError> {
     match (

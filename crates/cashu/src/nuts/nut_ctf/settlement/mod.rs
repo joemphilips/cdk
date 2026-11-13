@@ -5,6 +5,7 @@
 
 mod canonical;
 mod condition;
+mod conflict;
 mod manifest;
 mod refund;
 mod request;
@@ -12,6 +13,7 @@ mod settings;
 
 pub use canonical::{ctf_receive_commitment, CanonicalHash};
 pub use condition::{PayToUnlockAuthorization, PayToUnlockCondition, PayToUnlockMode, PoolPolicy};
+pub use conflict::{OutputConflict, OutputConflictState, OutputConflicts};
 pub use manifest::{PoolEntry, PoolEntryRole, PoolManifest, SelectionBitmap};
 pub use refund::{
     pay_to_unlock_refund_digest, reject_pay_to_unlock_inputs, sign_pay_to_unlock_refund,

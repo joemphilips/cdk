@@ -10,14 +10,16 @@ use cdk_common::nuts::nut02::Id;
 use cdk_common::nuts::nut_ctf::settlement::{
     validate_ctf_range_authorization as validate_range_protocol, CanonicalHash,
     CtfSettlementRequest, CtfSettlementResponse, Error as SettlementError,
-    NutCtfSettlementSettings, NutCtfSettlementSettingsError, ParticipantMode,
+    NutCtfSettlementSettings, NutCtfSettlementSettingsError, OutputConflicts, ParticipantMode,
     PayToUnlockAuthorization, PoolManifest,
 };
 use cdk_common::State;
 
 use super::conditions::STATUS_PENDING;
 use super::ctf_conservation::{CtfCoverageResolver, OutcomeConservation, ResolvedCoverage};
-use super::swap::atomic::{execute_atomic_ctf_settlement, reject_atomic_ctf_settlement};
+use super::swap::atomic::{
+    execute_atomic_ctf_settlement, reject_atomic_ctf_settlement, CtfSettlementOutcome,
+};
 use super::{Mint, Verification};
 use crate::fees::ProofsFeeBreakdown;
 use crate::Error;
@@ -31,6 +33,9 @@ pub(super) struct PreparedCtfSettlement {
     pub(super) input_verification: Verification,
     pub(super) output_verification: Verification,
     pub(super) fee: ProofsFeeBreakdown,
+    /// The earliest authorization expiry. A request without a
+    /// `PAY_TO_UNLOCK` input has none.
+    pub(super) cutoff: Option<u64>,
 }
 
 /// The result of preparation before the settlement commit transaction starts.
@@ -73,6 +78,11 @@ pub enum CtfSettlementError {
     /// Computing the bounded authorization horizon overflowed.
     #[error("settlement expiry arithmetic overflow")]
     ExpiryOverflow,
+    /// Outputs of the request are signed or pending in another operation.
+    ///
+    /// The mint recorded that the request can never commit.
+    #[error("settlement outputs are signed or pending in another operation")]
+    OutputConflict(OutputConflicts),
 }
 
 impl Mint {
@@ -129,7 +139,7 @@ impl Mint {
             .await
             .map_err(Error::from)?
         {
-            return replay_ctf_settlement_result(replay);
+            return replay_ctf_settlement_result(replay, now);
         }
 
         let flight = self.ctf_settlement_flight(request_digest);
@@ -140,7 +150,7 @@ impl Mint {
             .await
             .map_err(Error::from)?
         {
-            return replay_ctf_settlement_result(replay);
+            return replay_ctf_settlement_result(replay, now);
         }
 
         let _keyset_snapshot = self.ctf_keyset_lifecycle.read().await;
@@ -149,9 +159,15 @@ impl Mint {
             .await?
         {
             CtfSettlementPreparation::Ready(prepared) => {
-                execute_atomic_ctf_settlement(self, request_digest, prepared)
+                match execute_atomic_ctf_settlement(self, request_digest, prepared)
                     .await
-                    .map_err(CtfSettlementError::Mint)
+                    .map_err(CtfSettlementError::Mint)?
+                {
+                    CtfSettlementOutcome::Committed(response) => Ok(response),
+                    CtfSettlementOutcome::OutputConflict(conflicts) => {
+                        Err(CtfSettlementError::OutputConflict(conflicts))
+                    }
+                }
             }
             CtfSettlementPreparation::Expired {
                 condition_id,
@@ -161,7 +177,7 @@ impl Mint {
                     reject_atomic_ctf_settlement(self, &condition_id, request_digest, cutoff)
                         .await
                         .map_err(CtfSettlementError::Mint)?;
-                replay_ctf_settlement_result(replay)
+                replay_ctf_settlement_result(replay, now)
             }
         }
     }
@@ -268,6 +284,7 @@ impl Mint {
             input_verification,
             output_verification,
             fee,
+            cutoff,
         }))
     }
 
@@ -419,13 +436,27 @@ impl Mint {
     }
 }
 
+/// Answer a request from its terminal outcome at time `now`.
+///
+/// A conflict record refuses every copy of its request. From the request's
+/// cutoff, the request cannot commit for its expiry, so the copy gets the
+/// expiry refusal that it gets after the record is deleted.
 fn replay_ctf_settlement_result(
     replay: CtfSettlementReplay,
+    now: u64,
 ) -> Result<CtfSettlementResponse, CtfSettlementError> {
     match replay {
         CtfSettlementReplay::Committed(response) => Ok(response),
         CtfSettlementReplay::RejectedAfterCutoff { .. } => {
             Err(CtfSettlementError::AuthorizationExpired)
+        }
+        CtfSettlementReplay::RejectedOutputConflict { cutoff, .. }
+            if cutoff.is_some_and(|cutoff| cutoff <= now) =>
+        {
+            Err(CtfSettlementError::AuthorizationExpired)
+        }
+        CtfSettlementReplay::RejectedOutputConflict { conflicts, .. } => {
+            Err(CtfSettlementError::OutputConflict(conflicts))
         }
     }
 }

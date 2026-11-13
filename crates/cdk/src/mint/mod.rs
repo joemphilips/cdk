@@ -923,6 +923,13 @@ impl Mint {
         // the endpoints actually enforce. One figure for both, so a wallet respecting it trips
         // neither cap.
         mint_info.max_array_length = Some(self.max_inputs.min(self.max_outputs) as u64);
+        // Also derived from the running code: this mint lists the output
+        // conflicts of every refused settlement, and mint info stored before
+        // the field existed does not say so.
+        #[cfg(feature = "conditional-tokens")]
+        if let Some(settings) = mint_info.nuts.nut_ctf_split_merge.as_mut() {
+            settings.advertise_output_conflict_detail();
+        }
 
         Ok(mint_info)
     }

@@ -16,6 +16,7 @@ use cdk::nuts::nut21::{Method, ProtectedEndpoint, RoutePath};
 #[cfg(feature = "conditional-tokens")]
 use cdk::nuts::nut_ctf::settlement::{
     CtfConvertAdmission, CtfConvertMode, CtfSettlementLimits, Error as SettlementError,
+    OutputConflict, OutputConflicts,
 };
 use cdk::nuts::{
     CheckStateRequest, CheckStateResponse, Id, KeysResponse, KeysetResponse, MintInfo,
@@ -1441,6 +1442,7 @@ fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError)
             SettlementError::InvalidCondition("authorization exceeds refundable keyset lifetime"),
         ),
         CtfSettlementError::CollateralUnitMismatch => into_response(cdk::Error::UnitMismatch),
+        CtfSettlementError::OutputConflict(conflicts) => output_conflict_error_response(&conflicts),
         CtfSettlementError::Mint(cdk::Error::NUT11(_) | cdk::Error::NUT14(_)) => {
             individual_condition_witness_error_response()
         }
@@ -1455,6 +1457,43 @@ fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError)
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// NUT-CTF-settle output conflict detail: the NUT-00 error with an `outputs` list.
+///
+/// A client that does not know `outputs` ignores it and reads the error.
+#[cfg(feature = "conditional-tokens")]
+#[derive(serde::Serialize)]
+struct OutputConflictErrorResponse<'a> {
+    code: ErrorCode,
+    detail: &'static str,
+    outputs: &'a [OutputConflict],
+}
+
+#[cfg(feature = "conditional-tokens")]
+fn output_conflict_error_response(conflicts: &OutputConflicts) -> Response {
+    let (code, detail) = if conflicts.any_pending() {
+        (ErrorCode::OutputsPending, "outputs are pending")
+    } else {
+        (
+            ErrorCode::BlindedMessageAlreadySigned,
+            "outputs already signed",
+        )
+    };
+    tracing::debug!(
+        ?code,
+        outputs = conflicts.outputs().len(),
+        "mint refusing settlement outputs"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(OutputConflictErrorResponse {
+            code,
+            detail,
+            outputs: conflicts.outputs(),
+        }),
+    )
+        .into_response()
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -1884,6 +1923,68 @@ mod ctf_convert_admission_tests {
                 decode_error(response).await.code,
                 ErrorCode::SettlementAfterExpiry
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn output_conflict_refusal_lists_each_output_with_its_state() {
+        use cdk::nuts::nut_ctf::settlement::{
+            OutputConflict, OutputConflictState, OutputConflicts,
+        };
+        use cdk::nuts::SecretKey;
+
+        let pending = SecretKey::generate().public_key();
+        let signed = SecretKey::generate().public_key();
+        let cases = [
+            (
+                vec![
+                    (pending, OutputConflictState::Pending),
+                    (signed, OutputConflictState::Signed),
+                ],
+                serde_json::json!({
+                    "code": 11004,
+                    "detail": "outputs are pending",
+                    "outputs": [
+                        {"B_": pending.to_hex(), "state": "PENDING"},
+                        {"B_": signed.to_hex(), "state": "SIGNED"}
+                    ]
+                }),
+                ErrorCode::OutputsPending,
+            ),
+            (
+                vec![(signed, OutputConflictState::Signed)],
+                serde_json::json!({
+                    "code": 11003,
+                    "detail": "outputs already signed",
+                    "outputs": [{"B_": signed.to_hex(), "state": "SIGNED"}]
+                }),
+                ErrorCode::BlindedMessageAlreadySigned,
+            ),
+        ];
+
+        for (conflicts, expected_body, expected_code) in cases {
+            let conflicts = OutputConflicts::new(
+                conflicts
+                    .into_iter()
+                    .map(|(blinded_secret, state)| OutputConflict {
+                        blinded_secret,
+                        state,
+                    })
+                    .collect(),
+            )
+            .expect("conflicts");
+            let response = ctf_settlement_execution_error_response(
+                CtfSettlementError::OutputConflict(conflicts),
+            );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+            assert_eq!(body, expected_body);
+            // A client that does not know the field still reads the error.
+            let error: ErrorResponse = serde_json::from_value(body).expect("error response");
+            assert_eq!(error.code, expected_code);
         }
     }
 

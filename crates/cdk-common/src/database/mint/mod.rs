@@ -14,7 +14,9 @@ use crate::mint::{
     self, MeltQuote, MintKeySetInfo, MintQuote as MintMintQuote, Operation, ProofsWithState,
 };
 #[cfg(feature = "conditional-tokens")]
-use crate::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse};
+use crate::nuts::nut_ctf::settlement::{
+    CanonicalHash, CtfSettlementResponse, OutputConflictState, OutputConflicts,
+};
 use crate::nuts::{
     BlindSignature, BlindedMessage, CurrencyUnit, Id, MeltQuoteState, Proof, Proofs, PublicKey,
     State,
@@ -885,6 +887,15 @@ pub enum CtfSettlementReplay {
         /// The earliest authorization expiry in the request.
         cutoff: u64,
     },
+    /// The mint refused the request because outputs are signed or pending in
+    /// another operation. The request can never commit.
+    RejectedOutputConflict {
+        /// The conflicting outputs in request order.
+        conflicts: OutputConflicts,
+        /// The earliest authorization expiry in the request. A request
+        /// without a `PAY_TO_UNLOCK` input has none.
+        cutoff: Option<u64>,
+    },
 }
 
 /// Atomic idempotency records for multi-party CTF settlement.
@@ -914,6 +925,31 @@ pub trait CtfSettlementReplayTransaction {
         request_digest: CanonicalHash,
         cutoff: u64,
     ) -> Result<(), Self::Err>;
+
+    /// Read whether each output is signed, pending, or unknown to the mint.
+    ///
+    /// The result has one entry for each blinded secret, in the same order.
+    async fn get_ctf_output_states(
+        &mut self,
+        blinded_secrets: &[PublicKey],
+    ) -> Result<Vec<Option<OutputConflictState>>, Self::Err>;
+
+    /// Persist that a request can never commit because of output conflicts.
+    async fn add_ctf_settlement_output_conflict(
+        &mut self,
+        request_digest: CanonicalHash,
+        conflicts: &OutputConflicts,
+        cutoff: Option<u64>,
+    ) -> Result<(), Self::Err>;
+
+    /// Delete at most `limit` output conflict records whose cutoff is at or
+    /// before `expired_at`, and return the number deleted. A record without a
+    /// cutoff is kept.
+    async fn delete_expired_ctf_settlement_output_conflicts(
+        &mut self,
+        expired_at: u64,
+        limit: u64,
+    ) -> Result<u64, Self::Err>;
 }
 
 /// Read-only idempotency lookup for multi-party CTF settlement.

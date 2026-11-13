@@ -10,7 +10,10 @@ use crate::database::mint::{
     KeysDatabase,
 };
 use crate::mint::{MintKeySetInfo, Operation, StoredCondition};
-use crate::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse};
+use crate::nuts::nut_ctf::settlement::{
+    CanonicalHash, CtfSettlementResponse, OutputConflict, OutputConflictState, OutputConflicts,
+};
+use crate::nuts::{BlindSignature, BlindedMessage, SecretKey};
 use crate::Amount;
 
 /// Build a minimal conditional keyset info for tests. The amounts/derivation_path
@@ -478,6 +481,162 @@ where
         db.get_ctf_settlement_replay(digest).await.unwrap(),
         Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
     );
+}
+
+fn test_output_conflicts() -> OutputConflicts {
+    OutputConflicts::new(vec![
+        OutputConflict {
+            blinded_secret: SecretKey::generate().public_key(),
+            state: OutputConflictState::Pending,
+        },
+        OutputConflict {
+            blinded_secret: SecretKey::generate().public_key(),
+            state: OutputConflictState::Signed,
+        },
+    ])
+    .expect("two conflicts")
+}
+
+/// Test that an output conflict record reads back as the terminal outcome of its digest.
+pub async fn ctf_settlement_output_conflict_round_trip<DB>(db: DB)
+where
+    DB: Database<Error> + CtfSettlementReplayDatabase<Err = Error>,
+{
+    let conflicts = test_output_conflicts();
+    let with_cutoff = CanonicalHash::from_bytes([0x51; 32]);
+    let without_cutoff = CanonicalHash::from_bytes([0x52; 32]);
+    for (digest, cutoff) in [(with_cutoff, Some(1_723_456_789)), (without_cutoff, None)] {
+        let expected = CtfSettlementReplay::RejectedOutputConflict {
+            conflicts: conflicts.clone(),
+            cutoff,
+        };
+        let mut transaction = db.begin_transaction().await.unwrap();
+        transaction
+            .add_ctf_settlement_output_conflict(digest, &conflicts, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(
+            transaction.get_ctf_settlement_replay(digest).await.unwrap(),
+            Some(expected.clone())
+        );
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            db.get_ctf_settlement_replay(digest).await.unwrap(),
+            Some(expected)
+        );
+    }
+
+    let mut duplicate = db.begin_transaction().await.unwrap();
+    assert!(duplicate
+        .add_ctf_settlement_output_conflict(with_cutoff, &conflicts, None)
+        .await
+        .is_err());
+    duplicate.rollback().await.unwrap();
+}
+
+/// Test that the output state read tells a signed output from a pending one.
+pub async fn ctf_output_states_distinguish_signed_and_pending<DB>(db: DB)
+where
+    DB: Database<Error>,
+{
+    let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
+    let pending = BlindedMessage::new(
+        Amount::from(1u64),
+        keyset_id,
+        SecretKey::generate().public_key(),
+    );
+    let signed = SecretKey::generate().public_key();
+    let unknown = SecretKey::generate().public_key();
+    let operation = Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO);
+    let mut transaction = db.begin_transaction().await.unwrap();
+    transaction
+        .add_blinded_messages(None, std::slice::from_ref(&pending), &operation)
+        .await
+        .unwrap();
+    transaction
+        .add_blind_signatures(
+            &[signed],
+            &[BlindSignature {
+                amount: Amount::from(2u64),
+                keyset_id,
+                c: SecretKey::generate().public_key(),
+                dleq: None,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let mut transaction = db.begin_transaction().await.unwrap();
+    assert_eq!(
+        transaction
+            .get_ctf_output_states(&[unknown, signed, pending.blinded_secret])
+            .await
+            .unwrap(),
+        vec![
+            None,
+            Some(OutputConflictState::Signed),
+            Some(OutputConflictState::Pending)
+        ]
+    );
+    assert!(transaction
+        .get_ctf_output_states(&[])
+        .await
+        .unwrap()
+        .is_empty());
+    transaction.rollback().await.unwrap();
+}
+
+/// Test that cleanup deletes only expired output conflict records, oldest first, up to its limit.
+pub async fn ctf_settlement_output_conflict_cleanup_is_bounded<DB>(db: DB)
+where
+    DB: Database<Error> + CtfSettlementReplayDatabase<Err = Error>,
+{
+    let conflicts = test_output_conflicts();
+    let records = [
+        (CanonicalHash::from_bytes([0x61; 32]), Some(100)),
+        (CanonicalHash::from_bytes([0x62; 32]), Some(200)),
+        (CanonicalHash::from_bytes([0x63; 32]), Some(300)),
+        (CanonicalHash::from_bytes([0x64; 32]), None),
+    ];
+    let mut transaction = db.begin_transaction().await.unwrap();
+    for (digest, cutoff) in records {
+        transaction
+            .add_ctf_settlement_output_conflict(digest, &conflicts, cutoff)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+
+    // (expired_at, limit, deleted, digests that remain)
+    let passes: [(u64, u64, u64, [bool; 4]); 3] = [
+        (250, 1, 1, [false, true, true, true]),
+        (200, 10, 1, [false, false, true, true]),
+        (1_000_000, 10, 1, [false, false, false, true]),
+    ];
+    for (expired_at, limit, deleted, remaining) in passes {
+        let mut transaction = db.begin_transaction().await.unwrap();
+        assert_eq!(
+            transaction
+                .delete_expired_ctf_settlement_output_conflicts(expired_at, limit)
+                .await
+                .unwrap(),
+            deleted,
+            "expired_at={expired_at} limit={limit}"
+        );
+        transaction.commit().await.unwrap();
+        for ((digest, _), remains) in records.iter().zip(remaining) {
+            assert_eq!(
+                db.get_ctf_settlement_replay(*digest)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                remains,
+                "expired_at={expired_at}: record {digest}"
+            );
+        }
+    }
 }
 
 /// Test get_condition_for_keyset lookup by keyset_id

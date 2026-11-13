@@ -15,6 +15,7 @@ use super::*;
 use crate::mint::settlement::PreparedCtfSettlement;
 
 mod bundle_shape_tests;
+mod output_conflict_tests;
 mod production_limit_tests;
 mod reused_output_tests;
 

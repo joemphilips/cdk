@@ -5,6 +5,8 @@
 //!   keeps every quote row, so a client still reads an expired quote as UNPAID.
 //! - Melt outflow: a rolling budget per hour and per day for each unit.
 //! - Liabilities: the outstanding ecash of each unit, for a solvency signal.
+//! - Settlement output conflict records: deleted after the request's
+//!   earliest authorization expiry plus a retention time.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -30,6 +32,18 @@ use crate::nuts::{CurrencyUnit, Id};
 /// arrives after the release cannot be credited, so the delay must be well
 /// above that window.
 pub const UNPAID_QUOTE_RETENTION_SECS: u64 = 6 * 60 * 60;
+/// Time after the earliest authorization expiry of a refused settlement
+/// request before maintenance deletes its output conflict record.
+///
+/// The mint checks the expiry of a request before its commit transaction. A
+/// copy of the request that passes that check just before the cutoff can
+/// reach the transaction after it, and only the record refuses it there. So
+/// the record must outlive the cutoff by more than that window.
+#[cfg(feature = "conditional-tokens")]
+pub const OUTPUT_CONFLICT_RETENTION_SECS: u64 = 60 * 60;
+/// The number of output conflict records that one delete transaction removes.
+#[cfg(feature = "conditional-tokens")]
+const OUTPUT_CONFLICT_DELETE_BATCH: u64 = 500;
 /// The number of quotes that one read of the release pass returns.
 const RELEASE_BATCH: u64 = 500;
 /// The position of the release pass: the last finished (expiry, quote id).
@@ -380,10 +394,55 @@ impl Mint {
         })
     }
 
+    /// Delete the output conflict records of refused settlement requests
+    /// whose cutoff is at least [`OUTPUT_CONFLICT_RETENTION_SECS`] before `now`.
+    ///
+    /// Each transaction deletes one bounded batch. The pass ends: a new record
+    /// is written only for a request whose cutoff is after its write time.
+    /// A record without a cutoff is kept, because its request has no expiry.
+    #[cfg(feature = "conditional-tokens")]
+    pub async fn delete_expired_output_conflicts(&self, now: u64) -> Result<u64, Error> {
+        let expired_at = now.saturating_sub(OUTPUT_CONFLICT_RETENTION_SECS);
+        let mut deleted = 0;
+        loop {
+            let mut tx = self.localstore.begin_transaction().await?;
+            let batch = match tx
+                .delete_expired_ctf_settlement_output_conflicts(
+                    expired_at,
+                    OUTPUT_CONFLICT_DELETE_BATCH,
+                )
+                .await
+            {
+                Ok(batch) => batch,
+                Err(err) => {
+                    tx.rollback().await?;
+                    return Err(err.into());
+                }
+            };
+            tx.commit().await?;
+            deleted += batch;
+            if batch < OUTPUT_CONFLICT_DELETE_BATCH {
+                return Ok(deleted);
+            }
+        }
+    }
+
     /// One cleanup and liability pass. Errors are logged, not returned.
     pub(super) async fn run_maintenance(&self, now: u64) {
         if let Err(err) = self.release_expired_unpaid_quotes(now).await {
             tracing::warn!("Could not release expired unpaid mint quotes: {}", err);
+        }
+        #[cfg(feature = "conditional-tokens")]
+        match self.delete_expired_output_conflicts(now).await {
+            Ok(0) => {}
+            Ok(deleted) => tracing::info!(
+                deleted,
+                "deleted expired settlement output conflict records"
+            ),
+            Err(err) => tracing::warn!(
+                "Could not delete expired settlement output conflict records: {}",
+                err
+            ),
         }
         match self.liabilities().await {
             Ok(liabilities) => {
