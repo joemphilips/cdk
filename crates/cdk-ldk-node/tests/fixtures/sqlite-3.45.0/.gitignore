@@ -1,0 +1,2 @@
+# Public synthetic compatibility fixture, not a runtime database.
+!ldk_node_data.sqlite

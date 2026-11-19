@@ -231,6 +231,7 @@
               ./README.md
               ./.cargo
               ./crates
+              ./vendor
               fuzzSrc
               ./bindings
             ]
@@ -252,6 +253,7 @@
               ./README.md
               ./.cargo
               ./crates
+              ./vendor
               fuzzSrc
               ./bindings
             ]

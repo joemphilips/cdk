@@ -1042,7 +1042,10 @@ mod tests {
         assert_eq!(serde_json::to_vec(&request.tags).unwrap().len(), 16_384);
         let expected_tags = request.tags.clone();
 
-        let result = mint.register_condition(request).await.expect("metadata fits");
+        let result = mint
+            .register_condition(request)
+            .await
+            .expect("metadata fits");
         let stored = mint.get_condition(&result.condition_id).await.unwrap();
         assert_eq!(stored.tags, expected_tags);
     }

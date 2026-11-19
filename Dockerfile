@@ -11,6 +11,7 @@ COPY Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates
 COPY bindings ./bindings
+COPY vendor ./vendor
 
 # Start the Nix daemon and develop the environment
 RUN nix develop --extra-experimental-features nix-command --extra-experimental-features flakes --command cargo build --release --bin cdk-mintd --features postgres --features prometheus --features conditional-tokens --locked
