@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cdk_common::common::PaymentProcessorKey;
+use cdk_common::database::mint::KeysetTotals;
 use cdk_common::mint::MintQuote;
 use cdk_common::quote_id::QuoteId;
 use cdk_common::util::unix_time;
@@ -382,20 +383,24 @@ impl Mint {
     /// negative value would hide the liability of other keysets. It is
     /// reported as an anomaly: it can be forged proofs or a faulty count.
     pub async fn liabilities(&self) -> Result<Liabilities, Error> {
-        let issued = self.localstore.get_total_issued().await?;
-        let redeemed = self.localstore.get_total_redeemed().await?;
+        let totals: HashMap<Id, KeysetTotals> = self
+            .localstore
+            .get_keyset_totals()
+            .await?
+            .into_iter()
+            .map(|totals| (totals.keyset_id, totals))
+            .collect();
         let mut anomalies = Vec::new();
-
         let mut regular: Vec<(CurrencyUnit, u64)> = Vec::new();
-        #[cfg(feature = "conditional-tokens")]
+        #[cfg_attr(not(feature = "conditional-tokens"), allow(unused_mut))]
         let mut conditional: Vec<ConditionalOutstanding> = Vec::new();
+        #[cfg_attr(not(feature = "conditional-tokens"), allow(unused_mut))]
+        let mut winners: HashMap<String, String> = HashMap::new();
         for keyset in self.keysets.load().iter() {
-            let issued = issued.get(&keyset.id).copied().map(u64::from).unwrap_or(0);
-            let redeemed = redeemed
-                .get(&keyset.id)
-                .copied()
-                .map(u64::from)
-                .unwrap_or(0);
+            let totals = totals.get(&keyset.id);
+            let (issued, redeemed) = totals.map_or((0, 0), |totals| {
+                (totals.issued.to_u64(), totals.redeemed.to_u64())
+            });
             if redeemed > issued {
                 anomalies.push(LiabilityAnomaly {
                     keyset: keyset.id,
@@ -409,42 +414,25 @@ impl Mint {
                 if amount == 0 {
                     continue;
                 }
-                let Some((condition_id, collection, _)) =
-                    self.localstore.get_condition_for_keyset(&keyset.id).await?
-                else {
-                    // A conditional keyset without a binding cannot be valued.
-                    // Count it in full, so that the signal errs on the safe side.
-                    regular.push((keyset.unit.clone(), amount));
+                if let Some(condition) = totals.and_then(|totals| totals.condition.as_ref()) {
+                    if let Some(winner) = &condition.winning_outcome {
+                        winners.insert(condition.condition_id.clone(), winner.clone());
+                    }
+                    conditional.push(ConditionalOutstanding {
+                        unit: keyset.unit.clone(),
+                        condition_id: condition.condition_id.clone(),
+                        outcomes: cdk_common::nuts::nut_ctf::parse_outcome_collection(
+                            &condition.outcome_collection,
+                        ),
+                        amount,
+                    });
                     continue;
-                };
-                conditional.push(ConditionalOutstanding {
-                    unit: keyset.unit.clone(),
-                    condition_id,
-                    outcomes: cdk_common::nuts::nut_ctf::parse_outcome_collection(&collection),
-                    amount,
-                });
-                continue;
+                }
+                // A conditional keyset without a binding cannot be valued. Count
+                // it in full, so that the signal errs on the safe side.
             }
             regular.push((keyset.unit.clone(), amount));
         }
-
-        #[cfg(feature = "conditional-tokens")]
-        let winners: HashMap<String, String> = self
-            .localstore
-            .get_conditions(
-                None,
-                None,
-                &[super::conditions::STATUS_ATTESTED.to_string()],
-            )
-            .await?
-            .into_iter()
-            .filter(|condition| condition.condition_type == "enum")
-            .filter_map(|condition| Some((condition.condition_id, condition.winning_outcome?)))
-            .collect();
-        #[cfg(not(feature = "conditional-tokens"))]
-        let conditional: Vec<ConditionalOutstanding> = Vec::new();
-        #[cfg(not(feature = "conditional-tokens"))]
-        let winners: HashMap<String, String> = HashMap::new();
 
         Ok(Liabilities {
             totals: sum_liabilities(regular, conditional, &winners),

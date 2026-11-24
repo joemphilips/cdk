@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use async_trait::async_trait;
+use cdk_common::database::mint::{KeysetCondition, KeysetTotals};
 use cdk_common::database::{self, Error, MintSignatureTransaction, MintSignaturesDatabase};
 use cdk_common::quote_id::QuoteId;
 use cdk_common::util::unix_time;
@@ -14,6 +15,30 @@ use super::{SQLMintDatabase, SQLTransaction};
 use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
 use crate::{column_as_nullable_string, column_as_number, column_as_string, unpack_into};
+
+fn sql_row_to_keyset_totals(row: Vec<Column>) -> Result<KeysetTotals, Error> {
+    unpack_into!(
+        let (
+            keyset_id, issued, redeemed, condition_id, outcome_collection, winning_outcome
+        ) = row
+    );
+    let issued: u64 = column_as_number!(issued);
+    let redeemed: u64 = column_as_number!(redeemed);
+    let condition = match column_as_nullable_string!(condition_id) {
+        Some(condition_id) => Some(KeysetCondition {
+            condition_id,
+            outcome_collection: column_as_string!(outcome_collection),
+            winning_outcome: column_as_nullable_string!(winning_outcome),
+        }),
+        None => None,
+    };
+    Ok(KeysetTotals {
+        keyset_id: column_as_string!(keyset_id, Id::from_str, Id::from_bytes),
+        issued: Amount::from(issued),
+        redeemed: Amount::from(redeemed),
+        condition,
+    })
+}
 
 pub(crate) fn sql_row_to_blind_signature(row: Vec<Column>) -> Result<BlindSignature, Error> {
     unpack_into!(
@@ -401,6 +426,38 @@ where
         .await?
         .into_iter()
         .map(sql_row_to_hashmap_amount)
+        .collect()
+    }
+
+    async fn get_keyset_totals(&self) -> Result<Vec<KeysetTotals>, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        query(
+            r#"
+            SELECT
+                keyset_amounts.keyset_id,
+                keyset_amounts.total_issued,
+                keyset_amounts.total_redeemed,
+                conditional_keyset.condition_id,
+                conditional_keyset.outcome_collection,
+                conditions.winning_outcome
+            FROM
+                keyset_amounts
+            LEFT JOIN
+                conditional_keyset ON conditional_keyset.id = keyset_amounts.keyset_id
+            LEFT JOIN
+                conditions ON conditions.condition_id = conditional_keyset.condition_id
+                AND conditions.attestation_status = 'attested'
+                AND conditions.condition_type = 'enum'
+        "#,
+        )?
+        .fetch_all(&*conn)
+        .await?
+        .into_iter()
+        .map(sql_row_to_keyset_totals)
         .collect()
     }
 

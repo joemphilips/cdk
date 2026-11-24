@@ -593,6 +593,32 @@ pub trait SignaturesTransaction {
     ) -> Result<Vec<Option<BlindSignature>>, Self::Err>;
 }
 
+/// The issued and redeemed totals of one keyset, with the condition that it
+/// pays out on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysetTotals {
+    /// Keyset [`Id`]
+    pub keyset_id: Id,
+    /// Total amount issued
+    pub issued: Amount,
+    /// Total amount redeemed
+    pub redeemed: Amount,
+    /// The condition of a conditional keyset
+    pub condition: Option<KeysetCondition>,
+}
+
+/// The condition that a conditional keyset pays out on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysetCondition {
+    /// Condition identifier
+    pub condition_id: String,
+    /// The outcomes that the keyset covers
+    pub outcome_collection: String,
+    /// The winning outcome of an attested enum condition. A numeric condition
+    /// has none: its result is a value.
+    pub winning_outcome: Option<String>,
+}
+
 #[async_trait]
 /// Mint Signatures Database trait
 pub trait SignaturesDatabase {
@@ -619,6 +645,9 @@ pub trait SignaturesDatabase {
 
     /// Get total amount issued by keyset id
     async fn get_total_issued(&self) -> Result<HashMap<Id, Amount>, Self::Err>;
+
+    /// Get the totals of every keyset with tokens, in one read.
+    async fn get_keyset_totals(&self) -> Result<Vec<KeysetTotals>, Self::Err>;
 
     /// Get blinded secrets (B values) by operation id
     async fn get_blinded_secrets_by_operation_id(

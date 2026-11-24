@@ -2,6 +2,7 @@
 
 mod cutoff_rejection_tests;
 mod fixed_anchor_tests;
+mod liabilities_tests;
 mod merge_settlement_tests;
 
 use std::collections::{HashMap, HashSet};

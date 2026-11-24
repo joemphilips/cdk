@@ -7,11 +7,15 @@ use cashu::{CurrencyUnit, Id};
 
 use crate::database::mint::{
     ConditionsDatabase, CtfSettlementReplay, CtfSettlementReplayDatabase, Database, Error,
-    KeysDatabase, OutputConflictRecord,
+    KeysDatabase, KeysetCondition, KeysetTotals, OutputConflictRecord,
 };
 use crate::mint::{MintKeySetInfo, Operation, StoredCondition};
 use crate::nuts::nut_ctf::settlement::{CanonicalHash, CtfSettlementResponse, OutputConflictState};
-use crate::nuts::{BlindSignature, BlindedMessage, SecretKey};
+use crate::nuts::nut_ctf::test_helpers::{
+    create_numeric_oracle_witness, create_oracle_witness, create_test_oracle,
+};
+use crate::nuts::{BlindSignature, BlindedMessage, Proof, SecretKey, State};
+use crate::secret::Secret;
 use crate::Amount;
 
 /// Build a minimal conditional keyset info for tests. The amounts/derivation_path
@@ -837,6 +841,144 @@ where
     let keyset_id = Id::from_str("009a1f293253e41e").unwrap();
     let result = db.get_condition_for_keyset(&keyset_id).await.unwrap();
     assert!(result.is_none());
+}
+
+/// Test that the keyset totals join each keyset with its own condition.
+pub async fn get_keyset_totals_joins_conditions<DB>(db: DB)
+where
+    DB: Database<Error> + ConditionsDatabase<Err = Error> + KeysDatabase<Err = Error> + Sync,
+{
+    assert!(db.get_keyset_totals().await.unwrap().is_empty());
+
+    let pending = test_condition(&"a1".repeat(32));
+    let resolved = test_condition(&"a2".repeat(32));
+    let mut numeric = test_condition(&"a3".repeat(32));
+    numeric.condition_type = "numeric".to_string();
+    numeric.lo_bound = Some(0);
+    numeric.hi_bound = Some(100);
+    numeric.precision = Some(0);
+    for condition in [&pending, &resolved, &numeric] {
+        db.add_condition(condition.clone()).await.unwrap();
+    }
+    let oracle = create_test_oracle();
+    for (condition, winner, witness) in [
+        (&resolved, "YES", create_oracle_witness(&oracle, "YES")),
+        (
+            &numeric,
+            "50",
+            create_numeric_oracle_witness(&oracle, 50, 10, false, 2),
+        ),
+    ] {
+        assert!(db
+            .update_condition_attestation(
+                &condition.condition_id,
+                "attested",
+                Some(winner),
+                Some(2_000_000),
+                &witness.oracle_sigs,
+            )
+            .await
+            .unwrap());
+    }
+
+    let regular = Id::from_str("001711afb1de20c1").unwrap();
+    let pending_yes = Id::from_str("001711afb1de20c2").unwrap();
+    let pending_rest = Id::from_str("001711afb1de20c3").unwrap();
+    let resolved_yes = Id::from_str("001711afb1de20c4").unwrap();
+    let numeric_hi = Id::from_str("001711afb1de20c5").unwrap();
+    let without_tokens = Id::from_str("001711afb1de20c6").unwrap();
+    for (byte, (id, condition, collection)) in [
+        (pending_yes, &pending, "A"),
+        (pending_rest, &pending, "B|C"),
+        (resolved_yes, &resolved, "YES"),
+        (numeric_hi, &numeric, "HI"),
+        (without_tokens, &resolved, "NO"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let info = test_conditional_keyset_info(
+            id,
+            &condition.condition_id,
+            collection,
+            &format!("b{byte}").repeat(32),
+        );
+        <DB as KeysDatabase>::add_conditional_keyset(&db, info, 1_000_000)
+            .await
+            .unwrap();
+    }
+
+    let mut transaction = Database::begin_transaction(&db).await.unwrap();
+    for (keyset_id, amount) in [
+        (regular, 100),
+        (pending_yes, 10),
+        (pending_yes, 1),
+        (pending_rest, 20),
+        (resolved_yes, 30),
+        (numeric_hi, 40),
+    ] {
+        transaction
+            .add_blind_signatures(
+                &[SecretKey::generate().public_key()],
+                &[BlindSignature {
+                    amount: Amount::from(amount),
+                    keyset_id,
+                    c: SecretKey::generate().public_key(),
+                    dleq: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let spent = vec![Proof::new(
+        Amount::from(12),
+        resolved_yes,
+        Secret::generate(),
+        SecretKey::generate().public_key(),
+    )];
+    let mut spent = transaction
+        .add_proofs(
+            spent,
+            None,
+            &Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO),
+        )
+        .await
+        .unwrap();
+    for state in [State::Pending, State::Spent] {
+        transaction
+            .update_proofs_state(&mut spent, state)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+
+    let bound = |condition: &StoredCondition, collection: &str, winning_outcome: Option<&str>| {
+        Some(KeysetCondition {
+            condition_id: condition.condition_id.clone(),
+            outcome_collection: collection.to_string(),
+            winning_outcome: winning_outcome.map(ToString::to_string),
+        })
+    };
+    let mut totals = db.get_keyset_totals().await.unwrap();
+    totals.sort_by_key(|totals| totals.keyset_id);
+    assert_eq!(
+        totals,
+        [
+            (regular, 100, 0, None),
+            (pending_yes, 11, 0, bound(&pending, "A", None)),
+            (pending_rest, 20, 0, bound(&pending, "B|C", None)),
+            (resolved_yes, 30, 12, bound(&resolved, "YES", Some("YES"))),
+            // The result of a numeric condition is not an outcome.
+            (numeric_hi, 40, 0, bound(&numeric, "HI", None)),
+        ]
+        .map(|(keyset_id, issued, redeemed, condition)| KeysetTotals {
+            keyset_id,
+            issued: Amount::from(issued),
+            redeemed: Amount::from(redeemed),
+            condition,
+        })
+    );
 }
 
 /// Test get_conditions with limit parameter

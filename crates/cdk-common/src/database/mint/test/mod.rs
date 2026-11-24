@@ -490,6 +490,7 @@ macro_rules! mint_db_conditional_test {
             ctf_settlement_rejection_cleanup_is_bounded_and_keeps_commits,
             get_condition_for_keyset,
             get_condition_for_keyset_nonexistent,
+            get_keyset_totals_joins_conditions,
             get_conditions_limit,
             get_conditions_status_filter,
             get_conditions_ascending_order,
