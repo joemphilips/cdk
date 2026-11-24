@@ -85,6 +85,13 @@ pub enum CtfSettlementError {
     /// The mint recorded that the request can never commit.
     #[error("settlement outputs are signed or pending in another operation")]
     OutputConflict(OutputConflicts),
+    /// Outputs of the request are signed or pending in another operation,
+    /// and the mint holds its maximum of conflict records.
+    ///
+    /// The request has no record, so an identical request can commit later.
+    /// The refusal must not list the outputs.
+    #[error("settlement outputs are signed or pending, and the conflict records are full")]
+    OutputConflictUnrecorded(OutputConflicts),
     /// Another operation wrote an output row after each conflict scan.
     ///
     /// The request did not commit and has no record. The outcome is not
@@ -174,6 +181,9 @@ impl Mint {
                     CtfSettlementOutcome::Committed(response) => Ok(response),
                     CtfSettlementOutcome::OutputConflict(conflicts) => {
                         Err(CtfSettlementError::OutputConflict(conflicts))
+                    }
+                    CtfSettlementOutcome::OutputConflictUnrecorded(conflicts) => {
+                        Err(CtfSettlementError::OutputConflictUnrecorded(conflicts))
                     }
                     CtfSettlementOutcome::OutputConflictUnresolved => {
                         Err(CtfSettlementError::OutputConflictUnresolved)

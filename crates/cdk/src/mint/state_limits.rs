@@ -5,8 +5,8 @@
 //!   keeps every quote row, so a client still reads an expired quote as UNPAID.
 //! - Melt outflow: a rolling budget per hour and per day for each unit.
 //! - Liabilities: the outstanding ecash of each unit, for a solvency signal.
-//! - Settlement output conflict records: deleted after the request's
-//!   earliest authorization expiry plus a retention time.
+//! - Settlement output conflict records: a global cap, and their deletion after
+//!   the request's earliest authorization expiry plus a retention time.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -41,6 +41,12 @@ pub const UNPAID_QUOTE_RETENTION_SECS: u64 = 6 * 60 * 60;
 /// the record must outlive the cutoff by more than that window.
 #[cfg(feature = "conditional-tokens")]
 pub const OUTPUT_CONFLICT_RETENTION_SECS: u64 = 60 * 60;
+/// The default of [`StateLimits::max_output_conflict_records`].
+///
+/// A refusal is free and leaves the inputs unspent, so one client can cause a
+/// record again and again with other outputs. A record holds
+/// `outputs.div_ceil(4)` bytes of state: 2 KiB for 8192 outputs.
+pub const MAX_OUTPUT_CONFLICT_RECORDS: u64 = 100_000;
 /// The number of output conflict records that one delete transaction removes.
 #[cfg(feature = "conditional-tokens")]
 const OUTPUT_CONFLICT_DELETE_BATCH: u64 = 500;
@@ -105,14 +111,29 @@ pub struct MeltBudget {
     pub per_day: u64,
 }
 
-/// Limits on request-created state and on outflow. The default has no limit.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Limits on request-created state and on outflow. The default has no limit
+/// except the cap of output conflict records.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateLimits {
     /// The largest number of unexpired unpaid mint quotes
     pub max_unpaid_mint_quotes: Option<u64>,
     /// The melt outflow budget of each unit. When it is not empty, a melt in
     /// a unit without a budget is refused.
     pub melt_budgets: HashMap<CurrencyUnit, MeltBudget>,
+    /// The largest number of settlement output conflict records that are not
+    /// past their retention. At it, a refusal has no conflict list and writes
+    /// no record. Concurrent refusals can exceed it by their number.
+    pub max_output_conflict_records: u64,
+}
+
+impl Default for StateLimits {
+    fn default() -> Self {
+        Self {
+            max_unpaid_mint_quotes: None,
+            melt_budgets: HashMap::new(),
+            max_output_conflict_records: MAX_OUTPUT_CONFLICT_RECORDS,
+        }
+    }
 }
 
 impl Mint {

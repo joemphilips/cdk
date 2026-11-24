@@ -944,6 +944,15 @@ pub trait CtfSettlementReplayTransaction {
         cutoff: u64,
     ) -> Result<(), Self::Err>;
 
+    /// Count the output conflict records whose cutoff is after `expired_at`.
+    ///
+    /// The count takes no lock, so it does not see a record that another
+    /// open transaction adds.
+    async fn count_ctf_settlement_output_conflicts(
+        &mut self,
+        expired_at: u64,
+    ) -> Result<u64, Self::Err>;
+
     /// Delete at most `limit` output conflict records whose cutoff is at or
     /// before `expired_at`, oldest first, and return the number deleted.
     async fn delete_expired_ctf_settlement_output_conflicts(

@@ -1442,7 +1442,13 @@ fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError)
             SettlementError::InvalidCondition("authorization exceeds refundable keyset lifetime"),
         ),
         CtfSettlementError::CollateralUnitMismatch => into_response(cdk::Error::UnitMismatch),
-        CtfSettlementError::OutputConflict(conflicts) => output_conflict_error_response(&conflicts),
+        CtfSettlementError::OutputConflict(conflicts) => {
+            output_conflict_error_response(&conflicts, true)
+        }
+        // Not definitive: no record exists, so the answer must not list the outputs.
+        CtfSettlementError::OutputConflictUnrecorded(conflicts) => {
+            output_conflict_error_response(&conflicts, false)
+        }
         // Not definitive: no record exists, so the submitter retries the same bytes.
         CtfSettlementError::OutputConflictUnresolved => {
             tracing::warn!("settlement output state changed during every commit attempt");
@@ -1466,17 +1472,19 @@ fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError)
 
 /// NUT-CTF-settle output conflict detail: the NUT-00 error with an `outputs` list.
 ///
-/// A client that does not know `outputs` ignores it and reads the error.
+/// A client that does not know `outputs` ignores it and reads the error. A
+/// refusal without a no-commit record has no list.
 #[cfg(feature = "conditional-tokens")]
 #[derive(serde::Serialize)]
 struct OutputConflictErrorResponse<'a> {
     code: ErrorCode,
     detail: &'static str,
-    outputs: &'a [OutputConflict],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outputs: Option<&'a [OutputConflict]>,
 }
 
 #[cfg(feature = "conditional-tokens")]
-fn output_conflict_error_response(conflicts: &OutputConflicts) -> Response {
+fn output_conflict_error_response(conflicts: &OutputConflicts, recorded: bool) -> Response {
     let (code, detail) = if conflicts.any_pending() {
         (ErrorCode::OutputsPending, "outputs are pending")
     } else {
@@ -1488,6 +1496,7 @@ fn output_conflict_error_response(conflicts: &OutputConflicts) -> Response {
     tracing::debug!(
         ?code,
         outputs = conflicts.outputs().len(),
+        recorded,
         "mint refusing settlement outputs"
     );
     (
@@ -1495,7 +1504,7 @@ fn output_conflict_error_response(conflicts: &OutputConflicts) -> Response {
         Json(OutputConflictErrorResponse {
             code,
             detail,
-            outputs: conflicts.outputs(),
+            outputs: recorded.then(|| conflicts.outputs()),
         }),
     )
         .into_response()
@@ -1990,6 +1999,41 @@ mod ctf_convert_admission_tests {
             // A client that does not know the field still reads the error.
             let error: ErrorResponse = serde_json::from_value(body).expect("error response");
             assert_eq!(error.code, expected_code);
+        }
+    }
+
+    /// The code tells the conflict. Without the list, it is not definitive.
+    #[tokio::test]
+    async fn output_conflict_refusal_without_a_record_has_no_list() {
+        use cdk::nuts::nut_ctf::settlement::{
+            OutputConflict, OutputConflictState, OutputConflicts,
+        };
+        use cdk::nuts::SecretKey;
+
+        for (state, expected_body) in [
+            (
+                OutputConflictState::Pending,
+                serde_json::json!({"code": 11004, "detail": "outputs are pending"}),
+            ),
+            (
+                OutputConflictState::Signed,
+                serde_json::json!({"code": 11003, "detail": "outputs already signed"}),
+            ),
+        ] {
+            let conflicts = OutputConflicts::new(vec![OutputConflict {
+                blinded_secret: SecretKey::generate().public_key(),
+                state,
+            }])
+            .expect("conflicts");
+            let response = ctf_settlement_execution_error_response(
+                CtfSettlementError::OutputConflictUnrecorded(conflicts),
+            );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+            assert_eq!(body, expected_body);
         }
     }
 

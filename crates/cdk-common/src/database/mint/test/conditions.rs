@@ -633,6 +633,62 @@ where
     }
 }
 
+/// Test that the record count excludes exactly the records that cleanup can delete.
+pub async fn ctf_settlement_output_conflict_count_excludes_expired_records<DB>(db: DB)
+where
+    DB: Database<Error> + CtfSettlementReplayDatabase<Err = Error>,
+{
+    let record = test_output_conflict_record();
+    let mut transaction = db.begin_transaction().await.unwrap();
+    assert_eq!(
+        transaction
+            .count_ctf_settlement_output_conflicts(0)
+            .await
+            .unwrap(),
+        0
+    );
+    for (byte, cutoff) in [(0x71, 100), (0x72, 200), (0x73, 200), (0x74, 300)] {
+        transaction
+            .add_ctf_settlement_output_conflict(
+                CanonicalHash::from_bytes([byte; 32]),
+                &record,
+                cutoff,
+            )
+            .await
+            .unwrap();
+    }
+    // A transaction counts its own records.
+    assert_eq!(
+        transaction
+            .count_ctf_settlement_output_conflicts(0)
+            .await
+            .unwrap(),
+        4
+    );
+    transaction.commit().await.unwrap();
+
+    for (expired_at, live) in [(99, 4), (100, 3), (199, 3), (200, 1), (299, 1), (300, 0)] {
+        let mut transaction = db.begin_transaction().await.unwrap();
+        assert_eq!(
+            transaction
+                .count_ctf_settlement_output_conflicts(expired_at)
+                .await
+                .unwrap(),
+            live,
+            "expired_at={expired_at}"
+        );
+        assert_eq!(
+            transaction
+                .delete_expired_ctf_settlement_output_conflicts(expired_at, 10)
+                .await
+                .unwrap(),
+            4 - live,
+            "expired_at={expired_at}"
+        );
+        transaction.rollback().await.unwrap();
+    }
+}
+
 /// Test get_condition_for_keyset lookup by keyset_id
 pub async fn get_condition_for_keyset<DB>(db: DB)
 where

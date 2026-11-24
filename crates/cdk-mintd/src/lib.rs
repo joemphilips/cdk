@@ -656,6 +656,7 @@ fn state_limits(settings: &config::Settings) -> Result<cdk::mint::StateLimits> {
     Ok(cdk::mint::StateLimits {
         max_unpaid_mint_quotes: limits.max_unpaid_mint_quotes,
         melt_budgets,
+        ..Default::default()
     })
 }
 

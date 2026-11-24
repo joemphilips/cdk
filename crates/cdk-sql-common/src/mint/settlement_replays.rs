@@ -15,7 +15,7 @@ use cdk_common::util::unix_time;
 use super::{SQLMintDatabase, SQLTransaction};
 use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
-use crate::{column_as_binary, column_as_string};
+use crate::{column_as_binary, column_as_number, column_as_string};
 
 fn decode_replay(row: Vec<Column>) -> Result<CtfSettlementReplay, Error> {
     match row.as_slice() {
@@ -238,6 +238,26 @@ where
         .execute(&self.inner)
         .await?;
         Ok(())
+    }
+
+    async fn count_ctf_settlement_output_conflicts(
+        &mut self,
+        expired_at: u64,
+    ) -> Result<u64, Self::Err> {
+        let count = query(
+            r#"
+            SELECT CAST(COUNT(*) AS BIGINT)
+            FROM ctf_settlement_output_conflicts
+            WHERE cutoff > :expired_at
+            "#,
+        )?
+        .bind("expired_at", to_i64(expired_at, "output conflict expiry")?)
+        .pluck(&self.inner)
+        .await?
+        .map(|value| Ok::<u64, Error>(column_as_number!(value)))
+        .transpose()?
+        .unwrap_or(0);
+        Ok(count)
     }
 
     async fn delete_expired_ctf_settlement_output_conflicts(

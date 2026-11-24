@@ -486,6 +486,7 @@ macro_rules! mint_db_conditional_test {
             ctf_settlement_output_conflict_round_trip,
             ctf_output_states_distinguish_signed_and_pending,
             ctf_settlement_output_conflict_cleanup_is_bounded,
+            ctf_settlement_output_conflict_count_excludes_expired_records,
             get_condition_for_keyset,
             get_condition_for_keyset_nonexistent,
             get_conditions_limit,

@@ -5090,7 +5090,6 @@ async fn test_melt_budget_refuses_external_payment_and_releases_inputs() {
     // The budget counts the amount and the fee reserve of each melt.
     let outflow = probe.amount().value() + probe.fee_reserve().value();
     let limits = |per_hour| crate::mint::StateLimits {
-        max_unpaid_mint_quotes: None,
         melt_budgets: std::collections::HashMap::from([(
             CurrencyUnit::Sat,
             crate::mint::MeltBudget {
@@ -5098,6 +5097,7 @@ async fn test_melt_budget_refuses_external_payment_and_releases_inputs() {
                 per_day: 10 * outflow,
             },
         )]),
+        ..Default::default()
     };
 
     let mint = started.clone().with_state_limits(limits(outflow - 1));

@@ -14,6 +14,8 @@ use cdk_common::database::DynMintTransaction;
 use cdk_common::mint::{Operation, OperationKind, ProofsWithState};
 use cdk_common::nuts::{BlindSignature, BlindedMessage};
 #[cfg(feature = "conditional-tokens")]
+use cdk_common::util::unix_time;
+#[cfg(feature = "conditional-tokens")]
 use cdk_common::ProofsMethods;
 use cdk_common::{Error, Proofs, PublicKey, State};
 use uuid::Uuid;
@@ -22,6 +24,8 @@ use uuid::Uuid;
 use super::super::conditions::STATUS_PENDING;
 #[cfg(feature = "conditional-tokens")]
 use super::super::settlement::PreparedCtfSettlement;
+#[cfg(feature = "conditional-tokens")]
+use super::super::state_limits::OUTPUT_CONFLICT_RETENTION_SECS;
 use super::super::{Mint, Verification};
 use crate::fees::ProofsFeeBreakdown;
 #[cfg(feature = "conditional-tokens")]
@@ -43,6 +47,9 @@ pub(in crate::mint) enum CtfSettlementOutcome {
     /// Outputs of the request are signed or pending in another operation.
     /// The mint recorded that the request can never commit.
     OutputConflict(OutputConflicts),
+    /// Outputs of the request are signed or pending in another operation. The
+    /// mint holds its maximum of conflict records and wrote no record.
+    OutputConflictUnrecorded(OutputConflicts),
     /// Another operation wrote an output row after each conflict scan. The
     /// request did not commit and has no record.
     OutputConflictUnresolved,
@@ -406,6 +413,7 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
         AtomicSettlementRecord {
             request_digest,
             conflict_record_cutoff,
+            max_conflict_records: mint.state_limits.max_output_conflict_records,
         },
         &canonical_inputs,
         &outputs,
@@ -455,6 +463,8 @@ struct AtomicSettlementRecord {
     /// `None` when the mint gives this request the plain refusal: it scans
     /// nothing and writes no conflict record.
     conflict_record_cutoff: Option<u64>,
+    /// At this number of records, the mint writes no more.
+    max_conflict_records: u64,
 }
 
 #[cfg(feature = "conditional-tokens")]
@@ -501,6 +511,10 @@ async fn finish_atomic_ctf_settlement(
                 }
                 attempt += 1;
             }
+            Ok(AtomicSettlementOutcome::RecordsFull(conflicts)) => {
+                tx.rollback().await?;
+                return Ok(CtfSettlementOutcome::OutputConflictUnrecorded(conflicts));
+            }
             Ok(outcome) => {
                 tx.commit().await?;
                 break outcome;
@@ -524,7 +538,9 @@ async fn finish_atomic_ctf_settlement(
         AtomicSettlementOutcome::Refused(conflicts) => {
             CtfSettlementOutcome::OutputConflict(conflicts)
         }
-        AtomicSettlementOutcome::ScanMissed => return Err(Error::Internal),
+        AtomicSettlementOutcome::RecordsFull(_) | AtomicSettlementOutcome::ScanMissed => {
+            return Err(Error::Internal)
+        }
     })
 }
 
@@ -591,6 +607,9 @@ enum AtomicSettlementOutcome {
     Replayed(CtfSettlementResponse),
     /// The request has a no-commit record: written now or before.
     Refused(OutputConflicts),
+    /// The request has output conflicts, but the mint holds its maximum of
+    /// conflict records. The transaction must roll back.
+    RecordsFull(OutputConflicts),
     /// An output insert found a row that the conflict scan did not see. The
     /// transaction must roll back.
     ScanMissed,
@@ -626,6 +645,9 @@ async fn persist_atomic_ctf_settlement_transaction(
             if let Some((stored, conflicts)) =
                 scan_output_conflicts(tx, commit.blinded_secrets).await?
             {
+                if conflict_records_are_full(tx, record.max_conflict_records).await? {
+                    return Ok(AtomicSettlementOutcome::RecordsFull(conflicts));
+                }
                 tx.add_ctf_settlement_output_conflict(request_digest, &stored, cutoff)
                     .await?;
                 return Ok(AtomicSettlementOutcome::Refused(conflicts));
@@ -667,6 +689,22 @@ async fn persist_ctf_settlement_rejection_transaction(
     tx.add_ctf_settlement_rejection(request_digest, cutoff)
         .await?;
     Ok(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+}
+
+/// Whether the mint holds its maximum of output conflict records.
+///
+/// A record that cleanup can delete does not count. Concurrent refusals can
+/// pass the count together, so the cap can be exceeded by their number. The
+/// count takes no lock, so it does not serialize other settlements.
+#[cfg(feature = "conditional-tokens")]
+async fn conflict_records_are_full(tx: &mut DynMintTransaction, cap: u64) -> Result<bool, Error> {
+    let expired_at = unix_time().saturating_sub(OUTPUT_CONFLICT_RETENTION_SECS);
+    let records = tx.count_ctf_settlement_output_conflicts(expired_at).await?;
+    if records < cap {
+        return Ok(false);
+    }
+    tracing::warn!(records, cap, "settlement output conflict records are full");
+    Ok(true)
 }
 
 /// Find each output that is signed or pending in another operation.

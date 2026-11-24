@@ -6,6 +6,7 @@
 //! earliest authorization expiry, a later copy of R gets the same refusal,
 //! also after the other operation is removed.
 
+use cdk_common::database::mint::OutputConflictRecord;
 use cdk_common::melt::MeltQuoteRequest;
 use cdk_common::nuts::nut_ctf::settlement::{
     NutCtfSplitMergeSettings, OutputConflict, OutputConflictState, OutputConflicts,
@@ -15,7 +16,9 @@ use cdk_fake_wallet::{create_fake_invoice, FakeInvoiceDescription};
 
 use super::*;
 use crate::mint::melt::melt_saga::MeltSaga;
-use crate::mint::state_limits::OUTPUT_CONFLICT_RETENTION_SECS;
+use crate::mint::state_limits::{
+    StateLimits, MAX_OUTPUT_CONFLICT_RECORDS, OUTPUT_CONFLICT_RETENTION_SECS,
+};
 
 fn conflict(output: &BlindedMessage, state: OutputConflictState) -> OutputConflict {
     OutputConflict {
@@ -706,4 +709,151 @@ async fn test_ctf_settlement_conflict_missed_in_every_attempt_is_not_definitive(
         conflicts.outputs(),
         &[conflict(&reused, OutputConflictState::Pending)]
     );
+}
+
+/// Store a record of another request, with a chosen cutoff.
+async fn store_foreign_record(mint: &Mint, digest: u8, cutoff: u64) {
+    let record = OutputConflictRecord::from_states(&[Some(OutputConflictState::Signed)]).unwrap();
+    let mut tx = mint.localstore().begin_transaction().await.unwrap();
+    tx.add_ctf_settlement_output_conflict(CanonicalHash::from_bytes([digest; 32]), &record, cutoff)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// The mint refuses the request with its conflicts, but writes no record.
+async fn refuse_without_record(
+    mint: &Mint,
+    request: &CtfSettlementRequest,
+    now: u64,
+) -> OutputConflicts {
+    let completed_before = completed_swap_count(mint).await;
+    let conflicts = match mint
+        .process_ctf_settlement(request, settlement_settings(), now)
+        .await
+    {
+        Err(CtfSettlementError::OutputConflictUnrecorded(conflicts)) => conflicts,
+        other => panic!("expected a refusal without a record, got {other:?}"),
+    };
+    assert_eq!(recorded_outcome(mint, request).await, None);
+    let conflicting = outputs_in_request_order(request)
+        .into_iter()
+        .filter(|output| {
+            conflicts
+                .outputs()
+                .iter()
+                .any(|conflict| conflict.blinded_secret == output.blinded_secret)
+        })
+        .collect::<Vec<_>>();
+    assert_no_other_writes(mint, request, &conflicting, completed_before).await;
+    conflicts
+}
+
+/// The mint keeps at most its cap of live conflict records.
+async fn assert_record_cap(mint: Mint) {
+    let now = unix_time();
+    // Two records count: the fixture request's own, and one that is past its
+    // cutoff but not past its retention. One record that cleanup can delete
+    // does not count.
+    let mint = mint.with_state_limits(StateLimits {
+        max_output_conflict_records: 2,
+        ..StateLimits::default()
+    });
+    store_foreign_record(&mint, 0x01, now - OUTPUT_CONFLICT_RETENTION_SECS - 1).await;
+
+    let recorded = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
+    let _recorded_melt = hold_melt(&mint, vec![bare_seller_output(&recorded)]).await;
+    store_foreign_record(&mint, 0x02, now - 1).await;
+    // One record below the cap: the refusal has its list and its record.
+    let recorded_conflicts = refuse_with_conflicts(&mint, &recorded.request, now).await;
+    let cutoff = now + OFFER_LIFETIME_SECONDS;
+    assert_conflict_record(&mint, &recorded.request, &recorded_conflicts, cutoff).await;
+
+    // At the cap: the same refusal has no record.
+    let refused = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
+    let reused = bare_seller_output(&refused);
+    let melt = hold_melt(&mint, vec![reused.clone()]).await;
+    let signing_before = mint.blind_sign_attempts();
+    let conflicts = refuse_without_record(&mint, &refused.request, now).await;
+    assert_eq!(
+        conflicts.outputs(),
+        &[conflict(&reused, OutputConflictState::Pending)]
+    );
+    assert_eq!(mint.blind_sign_attempts(), signing_before + 1);
+    assert_eq!(
+        refuse_without_record(&mint, &refused.request, now).await,
+        conflicts
+    );
+    // A stored record still answers with its list.
+    assert_eq!(
+        refuse_with_conflicts(&mint, &recorded.request, now).await,
+        recorded_conflicts
+    );
+
+    // Cleanup frees no live record. With one more, the identical request gets
+    // its list and its record.
+    mint.run_maintenance(now).await;
+    refuse_without_record(&mint, &refused.request, now).await;
+    let raised = mint.clone().with_state_limits(StateLimits {
+        max_output_conflict_records: 3,
+        ..StateLimits::default()
+    });
+    let raised_conflicts = refuse_with_conflicts(&raised, &refused.request, now).await;
+    assert_eq!(raised_conflicts, conflicts);
+    assert_conflict_record(&raised, &refused.request, &conflicts, cutoff).await;
+    compensate_held_melt(&mint, melt).await;
+}
+
+#[tokio::test]
+async fn test_ctf_settlement_conflict_records_have_a_cap() {
+    assert_eq!(
+        StateLimits::default().max_output_conflict_records,
+        MAX_OUTPUT_CONFLICT_RECORDS
+    );
+    assert_record_cap(
+        create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+            .await
+            .unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in PG_DB_URL"]
+async fn test_postgres_ctf_settlement_conflict_records_have_a_cap() {
+    let url = std::env::var("PG_DB_URL").expect("isolated PostgreSQL test database");
+    let url = format!(
+        "{url} schema=ctf_output_conflict_cap_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let db = Arc::new(
+        cdk_postgres::MintPgDatabase::new(url.as_str())
+            .await
+            .unwrap(),
+    );
+    let mint = build_test_mint_with_units(db, &[35; 32], &[(CurrencyUnit::Sat, 1)])
+        .await
+        .unwrap();
+    assert_record_cap(mint.clone()).await;
+    mint.stop().await.unwrap();
+}
+
+/// A refusal without a record is not definitive: the request commits after the
+/// other operation is removed.
+#[tokio::test]
+async fn test_ctf_settlement_refused_at_the_record_cap_commits_after_the_conflict_ends() {
+    let now = unix_time();
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap()
+        .with_state_limits(StateLimits {
+            max_output_conflict_records: 0,
+            ..StateLimits::default()
+        });
+    let fixture = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
+    let melt = hold_melt(&mint, vec![bare_seller_output(&fixture)]).await;
+    refuse_without_record(&mint, &fixture.request, now).await;
+
+    compensate_held_melt(&mint, melt).await;
+    commit_and_check(&mint, &fixture.request, now, 1).await;
 }
