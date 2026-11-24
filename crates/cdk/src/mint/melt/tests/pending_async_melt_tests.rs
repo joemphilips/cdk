@@ -22,8 +22,16 @@ use crate::test_helpers::mint::mint_test_proofs;
 use crate::types::{FeeReserve, QuoteTTL};
 use crate::Error;
 
+/// Holds a send until the test releases it.
+#[derive(Default)]
+struct HeldSend {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 struct NoEventPendingBackend {
     inner: FakeWallet,
+    held_send: Option<Arc<HeldSend>>,
     status_checks: AtomicUsize,
     settle_after_checks: usize,
     dispatch_status: MeltQuoteState,
@@ -49,6 +57,7 @@ impl NoEventPendingBackend {
                 2,
                 CurrencyUnit::Sat,
             ),
+            held_send: None,
             status_checks: AtomicUsize::new(0),
             settle_after_checks,
             dispatch_status: MeltQuoteState::Pending,
@@ -112,6 +121,10 @@ impl MintPayment for NoEventPendingBackend {
     ) -> Result<MakePaymentResponse, Self::Err> {
         if self.amount_mismatch_dispatch_error {
             return Err(payment::Error::AmountMismatch);
+        }
+        if let Some(held) = &self.held_send {
+            held.entered.notify_one();
+            held.release.notified().await;
         }
 
         let mut response = self.inner.make_payment(unit, options).await?;
@@ -404,6 +417,94 @@ async fn pending_melt_completes_via_explicit_status_check_without_notification()
         .unwrap()
         .unwrap();
     assert_eq!(stored_quote.state, MeltQuoteState::Paid);
+}
+
+/// A send has no deadline, and its dispatch holds the quote guard. A status
+/// check must still answer, and it must not release anything.
+#[tokio::test]
+async fn status_check_answers_pending_while_the_send_hangs() {
+    let held = Arc::new(HeldSend::default());
+    let mut backend = NoEventPendingBackend::new(1, Some(MeltQuoteState::Failed))
+        .with_dispatch_status(MeltQuoteState::Paid);
+    backend.held_send = Some(Arc::clone(&held));
+    let backend = Arc::new(backend);
+    let mint = create_pending_test_mint(backend.clone()).await.unwrap();
+    let proofs = mint_test_proofs(&mint, Amount::from(10_000)).await.unwrap();
+    let input_ys = proofs.ys().unwrap();
+    let quote = create_test_melt_quote(&mint, Amount::from(9_000)).await;
+    let pending = mint
+        .melt(&create_test_melt_request(&proofs, &quote))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), held.entered.notified())
+        .await
+        .expect("the send starts");
+
+    tokio::time::pause();
+    let checked =
+        tokio::time::timeout(Duration::from_secs(3_600), mint.check_melt_quote(&quote.id))
+            .await
+            .expect("a hung send must not hang the status")
+            .unwrap();
+    tokio::time::resume();
+
+    assert_eq!(checked.state(), MeltQuoteState::Pending);
+    assert_eq!(
+        backend.status_checks.load(Ordering::SeqCst),
+        0,
+        "the backend must not be asked while the send is in progress"
+    );
+    let states = mint
+        .localstore()
+        .get_proofs_states(&input_ys)
+        .await
+        .unwrap();
+    assert!(states
+        .iter()
+        .all(|state| *state == Some(cdk_common::State::Pending)));
+    assert!(mint
+        .localstore()
+        .get_melt_saga_by_quote_id(&quote.id)
+        .await
+        .unwrap()
+        .is_some());
+
+    held.release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(10), async { pending.await })
+        .await
+        .expect("the melt ends with the send")
+        .unwrap();
+    assert_eq!(response.state(), MeltQuoteState::Paid);
+    let states = mint
+        .localstore()
+        .get_proofs_states(&input_ys)
+        .await
+        .unwrap();
+    assert!(states
+        .iter()
+        .all(|state| *state == Some(cdk_common::State::Spent)));
+}
+
+/// While another operation holds the guard, only `PENDING` is a safe answer.
+/// The stored state of a melt that starts or ends can be out of date.
+#[tokio::test]
+async fn status_check_of_a_held_quote_that_is_not_pending_is_an_error() {
+    let backend = Arc::new(NoEventPendingBackend::new(1, Some(MeltQuoteState::Paid)));
+    let mint = create_pending_test_mint(backend).await.unwrap();
+    let quote = create_test_melt_quote(&mint, Amount::from(9_000)).await;
+    let guard = mint.melt_quote_lock(&quote.id).await.lock_owned().await;
+
+    tokio::time::pause();
+    let checked =
+        tokio::time::timeout(Duration::from_secs(3_600), mint.check_melt_quote(&quote.id))
+            .await
+            .expect("a held quote must not hang the status");
+    tokio::time::resume();
+    assert!(matches!(checked, Err(Error::Internal)));
+
+    drop(guard);
+    let checked = mint.check_melt_quote(&quote.id).await.unwrap();
+    assert_eq!(checked.state(), MeltQuoteState::Unpaid);
 }
 
 /// An `Unknown` status poll is not an authoritative outcome (e.g. CLN

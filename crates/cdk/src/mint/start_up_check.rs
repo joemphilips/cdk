@@ -915,7 +915,10 @@ impl Mint {
         quote: &mut MeltQuote,
     ) -> Result<(), Error> {
         let quote_lock = self.melt_quote_lock(&quote.id).await;
-        let _quote_guard = quote_lock.lock_owned().await;
+        // A live dispatch holds the guard until the backend answers the send,
+        // and a send has no deadline.
+        let quote_guard =
+            tokio::time::timeout(PAYMENT_STATUS_TIMEOUT, quote_lock.lock_owned()).await;
 
         // The caller may have loaded the quote before waiting for an active
         // dispatch/finalization. Refresh it after acquiring the guard.
@@ -924,6 +927,22 @@ impl Mint {
             .get_melt_quote(&quote.id)
             .await?
             .ok_or(Error::UnknownQuote)?;
+
+        let _quote_guard = match quote_guard {
+            Ok(quote_guard) => quote_guard,
+            Err(_) => {
+                tracing::warn!(
+                    quote_id = %quote.id,
+                    quote_state = %quote.state,
+                    "melt is still in progress; its status was not checked with the backend",
+                );
+                // Any other state can be out of date: the melt starts or ends.
+                return match quote.state {
+                    MeltQuoteState::Pending => Ok(()),
+                    _ => Err(Error::Internal),
+                };
+            }
+        };
 
         let saga = match self
             .get_melt_saga_by_quote_id(&quote.id.to_string())
