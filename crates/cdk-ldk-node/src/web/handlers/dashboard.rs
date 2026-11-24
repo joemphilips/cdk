@@ -2,9 +2,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Html;
 use ldk_node::bitcoin::secp256k1::PublicKey;
+use ldk_node::bitcoin::Txid;
 use ldk_node::lightning::chain::channelmonitor::BalanceSource;
 use ldk_node::lightning::ln::types::ChannelId;
-use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{ChannelDetails, LightningBalance, PendingSweepBalance};
 use maud::html;
 
@@ -149,14 +150,25 @@ fn ready_channel_balance_sats(channels: &[ChannelDetails], balances: &[Lightning
 /// The funds of closed channels that the on-chain wallet does not count, in sats.
 ///
 /// It covers an output of a force close from the first confirmation of the
-/// commitment transaction until the node broadcasts its sweep. LDK reports
-/// these two states only for a transaction in a block. An amount that the
-/// wallet can also count is not included, so that the sum of the ready, the
-/// closing and the on-chain balance counts no amount twice.
+/// commitment transaction until the on-chain wallet knows the sweep. LDK
+/// reports these states only for a commitment transaction in a block.
+///
+/// A sweep pays to an internal address of the wallet. The spendable on-chain
+/// balance counts such a payment without a confirmation. Thus the sum of the
+/// ready, the closing and the spendable balance counts no amount twice. The
+/// payments must be newer than the balances: a sweep that the wallet learns
+/// between the two is then missing in one reading, and not counted twice.
 fn closing_channel_balance_sats(
     lightning_balances: &[LightningBalance],
     sweeps: &[PendingSweepBalance],
+    payments: &[PaymentDetails],
 ) -> u64 {
+    // The wallet records each of its transactions, also an unconfirmed one.
+    let wallet_knows = |sweep_txid: &Txid| {
+        payments.iter().any(|payment| {
+            matches!(&payment.kind, PaymentKind::Onchain { txid, .. } if txid == sweep_txid)
+        })
+    };
     let awaiting_confirmations = lightning_balances.iter().map(|balance| match balance {
         LightningBalance::ClaimableAwaitingConfirmations {
             amount_satoshis,
@@ -188,9 +200,20 @@ fn closing_channel_balance_sats(
         PendingSweepBalance::PendingBroadcast {
             amount_satoshis, ..
         } => *amount_satoshis,
-        // The sweep transaction pays to the on-chain wallet.
-        PendingSweepBalance::BroadcastAwaitingConfirmation { .. }
-        | PendingSweepBalance::AwaitingThresholdConfirmations { .. } => 0,
+        PendingSweepBalance::BroadcastAwaitingConfirmation {
+            amount_satoshis,
+            latest_spending_txid,
+            ..
+        } => {
+            if wallet_knows(latest_spending_txid) {
+                0
+            } else {
+                *amount_satoshis
+            }
+        }
+        // LDK keeps this state for about four weeks. The wallet knows a
+        // confirmed sweep after its next sync.
+        PendingSweepBalance::AwaitingThresholdConfirmations { .. } => 0,
     });
     awaiting_confirmations.chain(sweeps).sum()
 }
@@ -240,13 +263,14 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
 
     let balances = node.list_balances();
     let ready_channel_balance = ready_channel_balance_sats(&channels, &balances.lightning_balances);
-    let closing_channel_balance = closing_channel_balance_sats(
-        &balances.lightning_balances,
-        &balances.pending_balances_from_channel_closures,
-    );
 
     // Calculate payment metrics for dashboard
     let all_payments = node.list_payments_with_filter(|_| true);
+    let closing_channel_balance = closing_channel_balance_sats(
+        &balances.lightning_balances,
+        &balances.pending_balances_from_channel_closures,
+        &all_payments,
+    );
     let metrics = calculate_usage_metrics(&all_payments);
 
     let content = html! {
@@ -429,9 +453,11 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
 #[cfg(test)]
 mod tests {
     use ldk_node::bitcoin::hashes::Hash;
-    use ldk_node::bitcoin::{BlockHash, Txid};
+    use ldk_node::bitcoin::BlockHash;
     use ldk_node::config::ChannelConfig;
+    use ldk_node::lightning::ln::channelmanager::PaymentId;
     use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
+    use ldk_node::payment::ConfirmationStatus;
     use ldk_node::UserChannelId;
 
     use super::*;
@@ -647,34 +673,58 @@ mod tests {
         }
     }
 
-    /// The three states of the sweep of one output.
-    fn sweep_states(amount_satoshis: u64) -> [PendingSweepBalance; 3] {
-        let channel_id = Some(CHANNEL);
-        let latest_spending_txid = Txid::all_zeros();
-        [
-            PendingSweepBalance::PendingBroadcast {
-                channel_id,
-                amount_satoshis,
-            },
-            PendingSweepBalance::BroadcastAwaitingConfirmation {
-                channel_id,
-                latest_broadcast_height: 150,
-                latest_spending_txid,
-                amount_satoshis,
-            },
-            PendingSweepBalance::AwaitingThresholdConfirmations {
-                channel_id,
-                latest_spending_txid,
-                confirmation_hash: BlockHash::all_zeros(),
-                confirmation_height: 151,
-                amount_satoshis,
-            },
-        ]
+    const CHANNEL_SWEEP: u64 = 248_000;
+
+    fn sweep_txid() -> Txid {
+        Txid::from_byte_array([7; 32])
+    }
+
+    fn pending_sweep() -> PendingSweepBalance {
+        PendingSweepBalance::PendingBroadcast {
+            channel_id: Some(CHANNEL),
+            amount_satoshis: CHANNEL_SWEEP,
+        }
+    }
+
+    fn broadcast_sweep() -> PendingSweepBalance {
+        PendingSweepBalance::BroadcastAwaitingConfirmation {
+            channel_id: Some(CHANNEL),
+            latest_broadcast_height: 150,
+            latest_spending_txid: sweep_txid(),
+            amount_satoshis: CHANNEL_SWEEP,
+        }
+    }
+
+    fn confirmed_sweep() -> PendingSweepBalance {
+        PendingSweepBalance::AwaitingThresholdConfirmations {
+            channel_id: Some(CHANNEL),
+            latest_spending_txid: sweep_txid(),
+            confirmation_hash: BlockHash::all_zeros(),
+            confirmation_height: 151,
+            amount_satoshis: CHANNEL_SWEEP,
+        }
+    }
+
+    fn payment(id: [u8; 32], kind: PaymentKind) -> PaymentDetails {
+        PaymentDetails {
+            id: PaymentId(id),
+            kind,
+            amount_msat: Some(1_000),
+            fee_paid_msat: None,
+            direction: PaymentDirection::Inbound,
+            status: PaymentStatus::Pending,
+            latest_update_timestamp: 0,
+        }
+    }
+
+    /// The record of the on-chain wallet for a transaction.
+    fn wallet_transaction(txid: Txid, status: ConfirmationStatus) -> PaymentDetails {
+        payment(txid.to_byte_array(), PaymentKind::Onchain { txid, status })
     }
 
     #[test]
     fn no_channel_close_counts_nothing() {
-        assert_eq!(closing_channel_balance_sats(&[], &[]), 0);
+        assert_eq!(closing_channel_balance_sats(&[], &[], &[]), 0);
     }
 
     /// Before the confirmation, the monitor reports the same balance as for an
@@ -688,7 +738,11 @@ mod tests {
             "a dropped unfunded channel",
         ] {
             let balance = open_balance(CHANNEL, 250_000);
-            assert_eq!(closing_channel_balance_sats(&[balance], &[]), 0, "{case}");
+            assert_eq!(
+                closing_channel_balance_sats(&[balance], &[], &[]),
+                0,
+                "{case}"
+            );
         }
     }
 
@@ -700,7 +754,7 @@ mod tests {
         ] {
             let balance = closed_balance(source, 249_000);
             assert_eq!(
-                closing_channel_balance_sats(&[balance], &[]),
+                closing_channel_balance_sats(&[balance], &[], &[]),
                 249_000,
                 "closed by {case}"
             );
@@ -713,17 +767,59 @@ mod tests {
     #[test]
     fn a_confirmed_cooperative_close_counts_nothing() {
         let balance = closed_balance(BalanceSource::CoopClose, 250_000);
-        assert_eq!(closing_channel_balance_sats(&[balance], &[]), 0);
+        assert_eq!(closing_channel_balance_sats(&[balance], &[], &[]), 0);
     }
 
-    /// Only an output without a sweep transaction is outside of the on-chain
-    /// wallet. A sweep transaction pays to that wallet.
+    /// The sweep pays to an internal address. The spendable on-chain balance
+    /// counts it as soon as the wallet knows it, also without a confirmation.
     #[test]
-    fn an_output_counts_until_its_sweep_is_broadcast() {
-        let [before, broadcast, confirmed] = sweep_states(248_000);
-        assert_eq!(closing_channel_balance_sats(&[], &[before]), 248_000);
-        assert_eq!(closing_channel_balance_sats(&[], &[broadcast]), 0);
-        assert_eq!(closing_channel_balance_sats(&[], &[confirmed]), 0);
+    fn an_output_counts_until_the_wallet_knows_its_sweep() {
+        let other = wallet_transaction(
+            Txid::from_byte_array([8; 32]),
+            ConfirmationStatus::Unconfirmed,
+        );
+        let bolt11 = payment(
+            sweep_txid().to_byte_array(),
+            PaymentKind::Bolt11 {
+                hash: PaymentHash(sweep_txid().to_byte_array()),
+                preimage: None,
+                secret: None,
+            },
+        );
+        let unrelated = [other, bolt11];
+        let known = [wallet_transaction(
+            sweep_txid(),
+            ConfirmationStatus::Unconfirmed,
+        )];
+
+        for (case, sweep, wallet, expected) in [
+            ("no sweep", pending_sweep(), &unrelated[..], CHANNEL_SWEEP),
+            (
+                "a sweep that the wallet does not know",
+                broadcast_sweep(),
+                &unrelated[..],
+                CHANNEL_SWEEP,
+            ),
+            (
+                "a sweep that the wallet knows",
+                broadcast_sweep(),
+                &known[..],
+                0,
+            ),
+            ("a confirmed sweep", confirmed_sweep(), &known[..], 0),
+            (
+                "a confirmed sweep that the wallet does not know yet",
+                confirmed_sweep(),
+                &[],
+                0,
+            ),
+        ] {
+            assert_eq!(
+                closing_channel_balance_sats(&[], &[sweep], wallet),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -762,7 +858,7 @@ mod tests {
                 amount_satoshis: 900,
             },
         ];
-        assert_eq!(closing_channel_balance_sats(&balances, &[]), 0);
+        assert_eq!(closing_channel_balance_sats(&balances, &[], &[]), 0);
     }
 
     /// The two cards never count one amount twice.
@@ -774,6 +870,6 @@ mod tests {
         // The node can list the closed channel for a short time.
         let channels = [ready_channel(CHANNEL), ready_channel(OTHER_CHANNEL)];
         assert_eq!(ready_channel_balance_sats(&channels, &balances), 100_000);
-        assert_eq!(closing_channel_balance_sats(&balances, &[]), 249_000);
+        assert_eq!(closing_channel_balance_sats(&balances, &[], &[]), 249_000);
     }
 }
