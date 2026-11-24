@@ -285,6 +285,54 @@ where
         .await?;
         Ok(deleted as u64)
     }
+
+    async fn count_ctf_settlement_rejections(&mut self, expired_at: u64) -> Result<u64, Self::Err> {
+        let count = query(
+            r#"
+            SELECT CAST(COUNT(*) AS BIGINT)
+            FROM ctf_settlement_replays
+            WHERE outcome_kind = 'rejected_after_cutoff' AND cutoff > :expired_at
+            "#,
+        )?
+        .bind(
+            "expired_at",
+            to_i64(expired_at, "settlement rejection expiry")?,
+        )
+        .pluck(&self.inner)
+        .await?
+        .map(|value| Ok::<u64, Error>(column_as_number!(value)))
+        .transpose()?
+        .unwrap_or(0);
+        Ok(count)
+    }
+
+    async fn delete_expired_ctf_settlement_rejections(
+        &mut self,
+        expired_at: u64,
+        limit: u64,
+    ) -> Result<u64, Self::Err> {
+        let deleted = query(
+            r#"
+            DELETE FROM ctf_settlement_replays
+            WHERE outcome_kind = 'rejected_after_cutoff'
+              AND request_digest IN (
+                SELECT request_digest
+                FROM ctf_settlement_replays
+                WHERE outcome_kind = 'rejected_after_cutoff' AND cutoff <= :expired_at
+                ORDER BY cutoff
+                LIMIT :limit
+            )
+            "#,
+        )?
+        .bind(
+            "expired_at",
+            to_i64(expired_at, "settlement rejection expiry")?,
+        )
+        .bind("limit", to_i64(limit, "settlement rejection delete limit")?)
+        .execute(&self.inner)
+        .await?;
+        Ok(deleted as u64)
+    }
 }
 
 #[async_trait]

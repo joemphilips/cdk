@@ -1,5 +1,6 @@
 //! NUT-CTF conditional token tests for swap and redeem operations
 
+mod cutoff_rejection_tests;
 mod fixed_anchor_tests;
 mod merge_settlement_tests;
 
@@ -230,6 +231,20 @@ where
     mint.start().await?;
 
     Ok(mint)
+}
+
+/// A mint with its own schema in the isolated PostgreSQL test database.
+async fn postgres_test_mint(schema: &str, seed: u8, units: &[(CurrencyUnit, u64)]) -> Mint {
+    let url = std::env::var("PG_DB_URL").expect("isolated PostgreSQL test database");
+    let url = format!("{url} schema={schema}_{}", uuid::Uuid::new_v4().simple());
+    let db = Arc::new(
+        cdk_postgres::MintPgDatabase::new(url.as_str())
+            .await
+            .unwrap(),
+    );
+    build_test_mint_with_units(db, &[seed; 32], units)
+        .await
+        .unwrap()
 }
 
 async fn mint_test_proofs_for_unit(

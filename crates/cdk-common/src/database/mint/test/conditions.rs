@@ -689,6 +689,123 @@ where
     }
 }
 
+/// Test that only expired cutoff rejections are deleted, oldest first, up to the limit, and that
+/// the count excludes exactly the rejections that cleanup can delete.
+///
+/// A committed outcome and an output conflict record do not count and stay.
+pub async fn ctf_settlement_rejection_cleanup_is_bounded_and_keeps_commits<DB>(db: DB)
+where
+    DB: Database<Error> + CtfSettlementReplayDatabase<Err = Error>,
+{
+    let committed = CanonicalHash::from_bytes([0x81; 32]);
+    let response = CtfSettlementResponse {
+        signatures: vec![Vec::new(), Vec::new()],
+    };
+    let operation = Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO);
+    let conflict = CanonicalHash::from_bytes([0x82; 32]);
+    let rejections = [
+        (CanonicalHash::from_bytes([0x91; 32]), 100),
+        (CanonicalHash::from_bytes([0x92; 32]), 200),
+        (CanonicalHash::from_bytes([0x93; 32]), 200),
+        (CanonicalHash::from_bytes([0x94; 32]), 300),
+    ];
+    let mut transaction = db.begin_transaction().await.unwrap();
+    assert_eq!(
+        transaction
+            .count_ctf_settlement_rejections(0)
+            .await
+            .unwrap(),
+        0
+    );
+    transaction
+        .add_completed_operation(&operation, &std::collections::HashMap::new())
+        .await
+        .unwrap();
+    transaction
+        .add_ctf_settlement_replay(committed, operation.id(), &response)
+        .await
+        .unwrap();
+    transaction
+        .add_ctf_settlement_output_conflict(conflict, &test_output_conflict_record(), 100)
+        .await
+        .unwrap();
+    for (digest, cutoff) in rejections {
+        transaction
+            .add_ctf_settlement_rejection(digest, cutoff)
+            .await
+            .unwrap();
+    }
+    // A transaction counts its own rejections.
+    assert_eq!(
+        transaction
+            .count_ctf_settlement_rejections(0)
+            .await
+            .unwrap(),
+        4
+    );
+    transaction.commit().await.unwrap();
+
+    for (expired_at, live) in [(99, 4), (100, 3), (199, 3), (200, 1), (299, 1), (300, 0)] {
+        let mut transaction = db.begin_transaction().await.unwrap();
+        assert_eq!(
+            transaction
+                .count_ctf_settlement_rejections(expired_at)
+                .await
+                .unwrap(),
+            live,
+            "expired_at={expired_at}"
+        );
+        assert_eq!(
+            transaction
+                .delete_expired_ctf_settlement_rejections(expired_at, 10)
+                .await
+                .unwrap(),
+            4 - live,
+            "expired_at={expired_at}"
+        );
+        transaction.rollback().await.unwrap();
+    }
+
+    // (expired_at, limit, deleted, rejections that remain)
+    let passes: [(u64, u64, u64, u64); 4] = [
+        (u64::MAX >> 1, 1, 1, 3),
+        (199, 10, 0, 3),
+        (200, 10, 2, 1),
+        (u64::MAX >> 1, 10, 1, 0),
+    ];
+    for (expired_at, limit, deleted, remaining) in passes {
+        let mut transaction = db.begin_transaction().await.unwrap();
+        assert_eq!(
+            transaction
+                .delete_expired_ctf_settlement_rejections(expired_at, limit)
+                .await
+                .unwrap(),
+            deleted,
+            "expired_at={expired_at} limit={limit}"
+        );
+        transaction.commit().await.unwrap();
+        // The oldest rejections go first, and each one that remains still reads back.
+        let mut read = Vec::new();
+        for (digest, _) in rejections {
+            read.push(db.get_ctf_settlement_replay(digest).await.unwrap());
+        }
+        assert_eq!(read.iter().flatten().count() as u64, remaining);
+        assert_eq!(
+            read.iter().skip_while(|record| record.is_none()).count() as u64,
+            remaining,
+            "{read:?}"
+        );
+    }
+    assert_eq!(
+        db.get_ctf_settlement_replay(committed).await.unwrap(),
+        Some(CtfSettlementReplay::Committed(response))
+    );
+    assert!(matches!(
+        db.get_ctf_settlement_replay(conflict).await.unwrap(),
+        Some(CtfSettlementReplay::RejectedOutputConflict { .. })
+    ));
+}
+
 /// Test get_condition_for_keyset lookup by keyset_id
 pub async fn get_condition_for_keyset<DB>(db: DB)
 where

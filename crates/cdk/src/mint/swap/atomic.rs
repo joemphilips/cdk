@@ -25,7 +25,7 @@ use super::super::conditions::STATUS_PENDING;
 #[cfg(feature = "conditional-tokens")]
 use super::super::settlement::PreparedCtfSettlement;
 #[cfg(feature = "conditional-tokens")]
-use super::super::state_limits::OUTPUT_CONFLICT_RETENTION_SECS;
+use super::super::state_limits::{settlement_records_expired, SETTLEMENT_RECORD_RETENTION_SECS};
 use super::super::{Mint, Verification};
 use crate::fees::ProofsFeeBreakdown;
 #[cfg(feature = "conditional-tokens")]
@@ -391,7 +391,7 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
         input_verification,
         output_verification,
         fee,
-        conflict_record_cutoff,
+        cutoff,
     } = settlement;
     let canonical_inputs = canonical_input_proofs(&inputs)?;
     let prepared = PreparedAtomicCtf::from_verified_settlement(
@@ -412,7 +412,7 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
         &condition_id,
         AtomicSettlementRecord {
             request_digest,
-            conflict_record_cutoff,
+            cutoff,
             max_conflict_records: mint.state_limits.max_output_conflict_records,
         },
         &canonical_inputs,
@@ -424,45 +424,60 @@ pub(in crate::mint) async fn execute_atomic_ctf_settlement(
 }
 
 /// Persist or replay a cutoff rejection under the same condition lock as commits.
+///
+/// Returns `None` when the mint holds its maximum of rejection records and
+/// wrote none. The request can then still commit, so it has no outcome.
 #[cfg(feature = "conditional-tokens")]
 pub(in crate::mint) async fn reject_atomic_ctf_settlement(
     mint: &Mint,
     condition_id: &str,
     request_digest: CanonicalHash,
     cutoff: u64,
-) -> Result<CtfSettlementReplay, Error> {
+    now: u64,
+) -> Result<Option<CtfSettlementReplay>, Error> {
     if let Some(replay) = mint
         .localstore()
         .get_ctf_settlement_replay(request_digest)
         .await?
     {
-        return Ok(replay);
+        return Ok(Some(replay));
     }
 
     let mut tx = mint.localstore().begin_transaction().await?;
-    let outcome =
-        persist_ctf_settlement_rejection_transaction(&mut tx, condition_id, request_digest, cutoff)
-            .await;
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
+    let outcome = persist_ctf_settlement_rejection_transaction(
+        &mut tx,
+        condition_id,
+        request_digest,
+        cutoff,
+        now,
+        mint.state_limits.max_cutoff_rejection_records,
+    )
+    .await;
+    match outcome {
+        Ok(Some(outcome)) => {
+            tx.commit().await?;
+            Ok(Some(outcome))
+        }
+        Ok(None) => {
+            tx.rollback().await?;
+            Ok(None)
+        }
         Err(error) => {
             tx.rollback().await?;
-            return Err(error);
+            Err(error)
         }
-    };
-    tx.commit().await?;
-    Ok(outcome)
+    }
 }
 
-/// The key of the request that a settlement commit records, and the end of a
-/// no-commit record for it.
+/// The key of the request that a settlement commit records, and the end of
+/// the no-commit records for it.
 #[cfg(feature = "conditional-tokens")]
 #[derive(Clone, Copy)]
 struct AtomicSettlementRecord {
     request_digest: CanonicalHash,
     /// `None` when the mint gives this request the plain refusal: it scans
     /// nothing and writes no conflict record.
-    conflict_record_cutoff: Option<u64>,
+    cutoff: Option<u64>,
     /// At this number of records, the mint writes no more.
     max_conflict_records: u64,
 }
@@ -637,10 +652,18 @@ async fn persist_atomic_ctf_settlement_transaction(
     if condition.attestation_status != STATUS_PENDING {
         return Err(Error::ConvertNotPermitted);
     }
+    // A refusal record of this request can be deleted from the end of its
+    // retention. So the clock must be read after the record, under the lock.
+    if record
+        .cutoff
+        .is_some_and(|cutoff| settlement_records_expired(cutoff, unix_time()))
+    {
+        return Err(Error::SettlementAfterExpiry);
+    }
 
     // The scan runs before this transaction writes a row. So it sees only
     // rows of other operations, never a row of this request.
-    let scanned = match record.conflict_record_cutoff {
+    let scanned = match record.cutoff {
         Some(cutoff) => {
             if let Some((stored, conflicts)) =
                 scan_output_conflicts(tx, commit.blinded_secrets).await?
@@ -674,21 +697,52 @@ async fn persist_ctf_settlement_rejection_transaction(
     condition_id: &str,
     request_digest: CanonicalHash,
     cutoff: u64,
-) -> Result<CtfSettlementReplay, Error> {
+    now: u64,
+    max_records: u64,
+) -> Result<Option<CtfSettlementReplay>, Error> {
     if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
-        return Ok(replay);
+        return Ok(Some(replay));
+    }
+    // After the retention, every commit of this request is refused under the
+    // lock that this transaction takes. So the refusal is definitive without a
+    // record, and a late copy cannot write the record again after its deletion.
+    let record_needed = !settlement_records_expired(cutoff, now);
+    if record_needed && rejection_records_are_full(tx, now, max_records).await? {
+        return Ok(None);
     }
 
     tx.get_condition_for_update(condition_id)
         .await?
         .ok_or(Error::ConditionNotFound)?;
     if let Some(replay) = tx.get_ctf_settlement_replay(request_digest).await? {
-        return Ok(replay);
+        return Ok(Some(replay));
     }
 
-    tx.add_ctf_settlement_rejection(request_digest, cutoff)
-        .await?;
-    Ok(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
+    if record_needed {
+        tx.add_ctf_settlement_rejection(request_digest, cutoff)
+            .await?;
+    }
+    Ok(Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff }))
+}
+
+/// Whether the mint holds its maximum of cutoff rejection records.
+///
+/// As for the conflict records, the count takes no lock, and a record that
+/// cleanup can delete does not count. It runs before the condition lock, so a
+/// refusal does not hold that lock for the count.
+#[cfg(feature = "conditional-tokens")]
+async fn rejection_records_are_full(
+    tx: &mut DynMintTransaction,
+    now: u64,
+    cap: u64,
+) -> Result<bool, Error> {
+    let expired_at = now.saturating_sub(SETTLEMENT_RECORD_RETENTION_SECS);
+    let records = tx.count_ctf_settlement_rejections(expired_at).await?;
+    if records < cap {
+        return Ok(false);
+    }
+    tracing::warn!(records, cap, "settlement cutoff rejection records are full");
+    Ok(true)
 }
 
 /// Whether the mint holds its maximum of output conflict records.
@@ -698,7 +752,7 @@ async fn persist_ctf_settlement_rejection_transaction(
 /// count takes no lock, so it does not serialize other settlements.
 #[cfg(feature = "conditional-tokens")]
 async fn conflict_records_are_full(tx: &mut DynMintTransaction, cap: u64) -> Result<bool, Error> {
-    let expired_at = unix_time().saturating_sub(OUTPUT_CONFLICT_RETENTION_SECS);
+    let expired_at = unix_time().saturating_sub(SETTLEMENT_RECORD_RETENTION_SECS);
     let records = tx.count_ctf_settlement_output_conflicts(expired_at).await?;
     if records < cap {
         return Ok(false);

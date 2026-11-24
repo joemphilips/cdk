@@ -17,7 +17,7 @@ use cdk_fake_wallet::{create_fake_invoice, FakeInvoiceDescription};
 use super::*;
 use crate::mint::melt::melt_saga::MeltSaga;
 use crate::mint::state_limits::{
-    StateLimits, MAX_OUTPUT_CONFLICT_RECORDS, OUTPUT_CONFLICT_RETENTION_SECS,
+    StateLimits, MAX_OUTPUT_CONFLICT_RECORDS, SETTLEMENT_RECORD_RETENTION_SECS,
 };
 
 fn conflict(output: &BlindedMessage, state: OutputConflictState) -> OutputConflict {
@@ -452,7 +452,8 @@ async fn test_ctf_settlement_conflict_record_answers_expiry_from_the_cutoff() {
 
 /// Maintenance deletes a record only after the cutoff plus the retention time.
 ///
-/// After the deletion, a copy of R takes the ordinary expiry path.
+/// After the deletion, a copy of R takes the ordinary expiry path. Its retention
+/// has ended, so that refusal has no record either.
 #[tokio::test]
 async fn test_ctf_settlement_maintenance_deletes_a_conflict_record_after_its_retention() {
     let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
@@ -465,7 +466,7 @@ async fn test_ctf_settlement_maintenance_deletes_a_conflict_record_after_its_ret
     let melt = hold_melt(&mint, vec![bare_seller_output(&fixture)]).await;
     let conflicts = refuse_with_conflicts(&mint, request, now).await;
     compensate_held_melt(&mint, melt).await;
-    let deleted_at = cutoff + OUTPUT_CONFLICT_RETENTION_SECS;
+    let deleted_at = cutoff + SETTLEMENT_RECORD_RETENTION_SECS;
 
     mint.run_maintenance(deleted_at - 1).await;
     assert_conflict_record(&mint, request, &conflicts, cutoff).await;
@@ -480,10 +481,7 @@ async fn test_ctf_settlement_maintenance_deletes_a_conflict_record_after_its_ret
         matches!(error, CtfSettlementError::AuthorizationExpired),
         "{error:?}"
     );
-    assert_eq!(
-        recorded_outcome(&mint, request).await,
-        Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
-    );
+    assert_eq!(recorded_outcome(&mint, request).await, None);
 }
 
 /// Two bare sellers MERGE 8 YES and 8 NO into 4 + 3 collateral. No input is locked.
@@ -622,7 +620,7 @@ async fn test_ctf_settlement_record_stays_binding_after_the_other_operation_is_r
     .await;
     assert_conflict_record(&mint, request, &conflicts, cutoff).await;
 
-    let deleted_at = cutoff + OUTPUT_CONFLICT_RETENTION_SECS;
+    let deleted_at = cutoff + SETTLEMENT_RECORD_RETENTION_SECS;
     mint.run_maintenance(deleted_at).await;
     assert_eq!(recorded_outcome(&mint, request).await, None);
     let error = mint
@@ -759,7 +757,7 @@ async fn assert_record_cap(mint: Mint) {
         max_output_conflict_records: 2,
         ..StateLimits::default()
     });
-    store_foreign_record(&mint, 0x01, now - OUTPUT_CONFLICT_RETENTION_SECS - 1).await;
+    store_foreign_record(&mint, 0x01, now - SETTLEMENT_RECORD_RETENTION_SECS - 1).await;
 
     let recorded = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
     let _recorded_melt = hold_melt(&mint, vec![bare_seller_output(&recorded)]).await;

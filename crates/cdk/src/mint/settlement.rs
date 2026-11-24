@@ -33,11 +33,11 @@ pub(super) struct PreparedCtfSettlement {
     pub(super) input_verification: Verification,
     pub(super) output_verification: Verification,
     pub(super) fee: ProofsFeeBreakdown,
-    /// The end of a no-commit record for this request: its earliest
-    /// `PAY_TO_UNLOCK` expiry. `None` when the request has no `PAY_TO_UNLOCK`
+    /// The earliest `PAY_TO_UNLOCK` expiry of the request, which ends its
+    /// no-commit records. `None` when the request has no `PAY_TO_UNLOCK`
     /// input. The mint does not list output conflicts for such a request,
     /// which gets the plain refusal.
-    pub(super) conflict_record_cutoff: Option<u64>,
+    pub(super) cutoff: Option<u64>,
 }
 
 /// The result of preparation before the settlement commit transaction starts.
@@ -74,6 +74,13 @@ pub enum CtfSettlementError {
     /// At least one participant authorization has already expired.
     #[error("settlement authorization has expired")]
     AuthorizationExpired,
+    /// At least one participant authorization has already expired, and the
+    /// mint holds its maximum of cutoff rejection records.
+    ///
+    /// The request has no record. The outcome is not definitive: the client
+    /// retries the identical request.
+    #[error("settlement authorization has expired, and the rejection records are full")]
+    AuthorizationExpiredUnrecorded,
     /// A participant authorization outlives the refundable keyset horizon.
     #[error("settlement authorization does not precede the effective keyset expiry ceiling")]
     AuthorizationBeyondKeysetExpiry,
@@ -195,9 +202,10 @@ impl Mint {
                 cutoff,
             } => {
                 let replay =
-                    reject_atomic_ctf_settlement(self, &condition_id, request_digest, cutoff)
+                    reject_atomic_ctf_settlement(self, &condition_id, request_digest, cutoff, now)
                         .await
-                        .map_err(CtfSettlementError::Mint)?;
+                        .map_err(CtfSettlementError::Mint)?
+                        .ok_or(CtfSettlementError::AuthorizationExpiredUnrecorded)?;
                 replay_ctf_settlement_result(replay, now, request)
             }
         }
@@ -305,7 +313,7 @@ impl Mint {
             input_verification,
             output_verification,
             fee,
-            conflict_record_cutoff: cutoff,
+            cutoff,
         }))
     }
 

@@ -1454,6 +1454,10 @@ fn ctf_settlement_execution_error_response(error: cdk::mint::CtfSettlementError)
             tracing::warn!("settlement output state changed during every commit attempt");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+        // Not definitive, for the same reason. 15005 would say that the request can never commit.
+        CtfSettlementError::AuthorizationExpiredUnrecorded => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         CtfSettlementError::Mint(cdk::Error::NUT11(_) | cdk::Error::NUT14(_)) => {
             individual_condition_witness_error_response()
         }
@@ -2038,10 +2042,18 @@ mod ctf_convert_admission_tests {
     }
 
     #[tokio::test]
-    async fn unresolved_output_conflict_is_not_a_definitive_refusal() {
-        let response =
-            ctf_settlement_execution_error_response(CtfSettlementError::OutputConflictUnresolved);
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    async fn a_refusal_without_a_record_is_not_definitive() {
+        for error in [
+            CtfSettlementError::OutputConflictUnresolved,
+            CtfSettlementError::AuthorizationExpiredUnrecorded,
+        ] {
+            let response = ctf_settlement_execution_error_response(error);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error body");
+            assert!(body.is_empty(), "no error code");
+        }
     }
 
     #[tokio::test]

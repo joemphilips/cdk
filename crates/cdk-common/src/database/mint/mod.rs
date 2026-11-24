@@ -960,6 +960,23 @@ pub trait CtfSettlementReplayTransaction {
         expired_at: u64,
         limit: u64,
     ) -> Result<u64, Self::Err>;
+
+    /// Count the cutoff rejections whose cutoff is after `expired_at`.
+    ///
+    /// The count takes no lock, so it does not see a rejection that another
+    /// open transaction adds.
+    async fn count_ctf_settlement_rejections(&mut self, expired_at: u64) -> Result<u64, Self::Err>;
+
+    /// Delete at most `limit` cutoff rejections whose cutoff is at or before
+    /// `expired_at`, oldest first, and return the number deleted.
+    ///
+    /// A committed outcome is never deleted. Without it, its identical request
+    /// would get the expiry refusal after the cutoff, as if it did not commit.
+    async fn delete_expired_ctf_settlement_rejections(
+        &mut self,
+        expired_at: u64,
+        limit: u64,
+    ) -> Result<u64, Self::Err>;
 }
 
 /// Read-only idempotency lookup for multi-party CTF settlement.

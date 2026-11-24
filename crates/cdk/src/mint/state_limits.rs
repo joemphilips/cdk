@@ -5,8 +5,10 @@
 //!   keeps every quote row, so a client still reads an expired quote as UNPAID.
 //! - Melt outflow: a rolling budget per hour and per day for each unit.
 //! - Liabilities: the outstanding ecash of each unit, for a solvency signal.
-//! - Settlement output conflict records: a global cap, and their deletion after
-//!   the request's earliest authorization expiry plus a retention time.
+//! - Settlement refusal records (output conflicts and cutoff rejections): a
+//!   global cap for each kind, and their deletion after the request's earliest
+//!   authorization expiry plus a retention time. A record of a committed
+//!   settlement stays: its identical request replays the commit at any time.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -33,23 +35,32 @@ use crate::nuts::{CurrencyUnit, Id};
 /// above that window.
 pub const UNPAID_QUOTE_RETENTION_SECS: u64 = 6 * 60 * 60;
 /// Time after the earliest authorization expiry of a refused settlement
-/// request before maintenance deletes its output conflict record.
+/// request before maintenance deletes its refusal record.
 ///
 /// The mint checks the expiry of a request before its commit transaction. A
 /// copy of the request that passes that check just before the cutoff can
-/// reach the transaction after it, and only the record refuses it there. So
-/// the record must outlive the cutoff by more than that window.
+/// reach the transaction after it, and the record refuses it there. The
+/// commit transaction itself refuses a copy from the end of the retention
+/// ([`settlement_records_expired`]), so a deleted record leaves no window.
+/// The retention must be longer than a backward step of the clock, and longer
+/// than the clock difference of two mints that share one database.
 #[cfg(feature = "conditional-tokens")]
-pub const OUTPUT_CONFLICT_RETENTION_SECS: u64 = 60 * 60;
+pub const SETTLEMENT_RECORD_RETENTION_SECS: u64 = 60 * 60;
 /// The default of [`StateLimits::max_output_conflict_records`].
 ///
 /// A refusal is free and leaves the inputs unspent, so one client can cause a
 /// record again and again with other outputs. A record holds
 /// `outputs.div_ceil(4)` bytes of state: 2 KiB for 8192 outputs.
 pub const MAX_OUTPUT_CONFLICT_RECORDS: u64 = 100_000;
-/// The number of output conflict records that one delete transaction removes.
+/// The default of [`StateLimits::max_cutoff_rejection_records`].
+///
+/// A rejection is free and does not need unspent inputs, so one client can
+/// cause a record again and again with other outputs, until the retention of
+/// its expired proof ends.
+pub const MAX_CUTOFF_REJECTION_RECORDS: u64 = 100_000;
+/// The number of refusal records that one delete transaction removes.
 #[cfg(feature = "conditional-tokens")]
-const OUTPUT_CONFLICT_DELETE_BATCH: u64 = 500;
+const SETTLEMENT_RECORD_DELETE_BATCH: u64 = 500;
 /// The number of quotes that one read of the release pass returns.
 const RELEASE_BATCH: u64 = 500;
 /// The position of the release pass: the last finished (expiry, quote id).
@@ -66,6 +77,26 @@ pub const MELT_BUDGET_EXCEEDED_TOKEN: &str = "MINT_MELT_BUDGET_EXCEEDED";
 pub const LIABILITIES_TOKEN: &str = "MINT_LIABILITIES";
 /// Fixed log token of a keyset that redeemed more than it issued. Alert rules match it.
 pub const LIABILITY_ANOMALY_TOKEN: &str = "MINT_LIABILITY_ANOMALY";
+
+/// The settlement refusal records that maintenance deletes.
+#[cfg(feature = "conditional-tokens")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettlementRecordKind {
+    /// The request had outputs that were signed or pending in another operation.
+    OutputConflict,
+    /// The request reached the mint after its earliest authorization expiry.
+    CutoffRejection,
+}
+
+/// Whether the retention of the refusal records of a request with this
+/// earliest authorization expiry has ended.
+///
+/// Maintenance can then delete them. So the mint must not commit the request,
+/// and needs no record to refuse it.
+#[cfg(feature = "conditional-tokens")]
+pub(super) fn settlement_records_expired(cutoff: u64, now: u64) -> bool {
+    cutoff <= now.saturating_sub(SETTLEMENT_RECORD_RETENTION_SECS)
+}
 
 /// The counts of one release pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -112,7 +143,7 @@ pub struct MeltBudget {
 }
 
 /// Limits on request-created state and on outflow. The default has no limit
-/// except the cap of output conflict records.
+/// except the caps of settlement refusal records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateLimits {
     /// The largest number of unexpired unpaid mint quotes
@@ -124,6 +155,11 @@ pub struct StateLimits {
     /// past their retention. At it, a refusal has no conflict list and writes
     /// no record. Concurrent refusals can exceed it by their number.
     pub max_output_conflict_records: u64,
+    /// The largest number of settlement cutoff rejection records that are not
+    /// past their retention. At it, a refusal after the cutoff is not
+    /// definitive and writes no record. Concurrent refusals can exceed it by
+    /// their number.
+    pub max_cutoff_rejection_records: u64,
 }
 
 impl Default for StateLimits {
@@ -132,6 +168,7 @@ impl Default for StateLimits {
             max_unpaid_mint_quotes: None,
             melt_budgets: HashMap::new(),
             max_output_conflict_records: MAX_OUTPUT_CONFLICT_RECORDS,
+            max_cutoff_rejection_records: MAX_CUTOFF_REJECTION_RECORDS,
         }
     }
 }
@@ -415,26 +452,33 @@ impl Mint {
         })
     }
 
-    /// Delete the output conflict records of refused settlement requests
-    /// whose cutoff is at least [`OUTPUT_CONFLICT_RETENTION_SECS`] before `now`.
+    /// Delete the records of refused settlement requests of one kind whose
+    /// cutoff is at least [`SETTLEMENT_RECORD_RETENTION_SECS`] before `now`.
     ///
     /// Each transaction deletes one bounded batch. The pass ends: a new record
-    /// is written only for a request whose cutoff is after its write time.
-    /// Every record has a cutoff, because only a request with a
-    /// `PAY_TO_UNLOCK` input gets one.
+    /// is written only for a request whose retention ends after its write time.
     #[cfg(feature = "conditional-tokens")]
-    pub async fn delete_expired_output_conflicts(&self, now: u64) -> Result<u64, Error> {
-        let expired_at = now.saturating_sub(OUTPUT_CONFLICT_RETENTION_SECS);
+    pub(super) async fn delete_expired_settlement_records(
+        &self,
+        kind: SettlementRecordKind,
+        now: u64,
+    ) -> Result<u64, Error> {
+        let expired_at = now.saturating_sub(SETTLEMENT_RECORD_RETENTION_SECS);
+        let limit = SETTLEMENT_RECORD_DELETE_BATCH;
         let mut deleted = 0;
         loop {
             let mut tx = self.localstore.begin_transaction().await?;
-            let batch = match tx
-                .delete_expired_ctf_settlement_output_conflicts(
-                    expired_at,
-                    OUTPUT_CONFLICT_DELETE_BATCH,
-                )
-                .await
-            {
+            let batch = match kind {
+                SettlementRecordKind::OutputConflict => {
+                    tx.delete_expired_ctf_settlement_output_conflicts(expired_at, limit)
+                        .await
+                }
+                SettlementRecordKind::CutoffRejection => {
+                    tx.delete_expired_ctf_settlement_rejections(expired_at, limit)
+                        .await
+                }
+            };
+            let batch = match batch {
                 Ok(batch) => batch,
                 Err(err) => {
                     tx.rollback().await?;
@@ -443,7 +487,7 @@ impl Mint {
             };
             tx.commit().await?;
             deleted += batch;
-            if batch < OUTPUT_CONFLICT_DELETE_BATCH {
+            if batch < limit {
                 return Ok(deleted);
             }
         }
@@ -455,16 +499,21 @@ impl Mint {
             tracing::warn!("Could not release expired unpaid mint quotes: {}", err);
         }
         #[cfg(feature = "conditional-tokens")]
-        match self.delete_expired_output_conflicts(now).await {
-            Ok(0) => {}
-            Ok(deleted) => tracing::info!(
-                deleted,
-                "deleted expired settlement output conflict records"
-            ),
-            Err(err) => tracing::warn!(
-                "Could not delete expired settlement output conflict records: {}",
-                err
-            ),
+        for kind in [
+            SettlementRecordKind::OutputConflict,
+            SettlementRecordKind::CutoffRejection,
+        ] {
+            match self.delete_expired_settlement_records(kind, now).await {
+                Ok(0) => {}
+                Ok(deleted) => {
+                    tracing::info!(deleted, ?kind, "deleted expired settlement records")
+                }
+                Err(err) => tracing::warn!(
+                    ?kind,
+                    "Could not delete expired settlement records: {}",
+                    err
+                ),
+            }
         }
         match self.liabilities().await {
             Ok(liabilities) => {
