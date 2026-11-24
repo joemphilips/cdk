@@ -51,6 +51,29 @@ authentication or encryption and can be intercepted or modified. Use plaintext
 only on a trusted, isolated network or through a separately authenticated and
 encrypted tunnel; prefer mTLS even for internal deployments.
 
+#### Call deadline
+
+The client waits at most 15 seconds for the answer of each call, except the send
+(`MakePayment`). A send has no deadline, because the result of a dropped send is
+unknown. For the event stream, the deadline covers the opening of the stream.
+The value is a constant (`CALL_DEADLINE`).
+
+A call past its deadline answers an error, as a call to an unreachable processor
+does:
+
+| Call | Effect in the mint |
+| --- | --- |
+| Settings at the mint start | The mint does not start |
+| Settings, create payment | No mint quote |
+| Payment quote | No melt quote |
+| Check incoming payment | The mint quote does not change; the next check asks again |
+| Check outgoing payment | The melt and its proofs stay pending; the next check asks again |
+| Event stream | The mint opens the stream again after its backoff |
+
+A late answer is dropped. The client opens two connections. The send has its own
+connection, because a server can close a connection with many calls past their
+deadline.
+
 #### Backend-Specific Configuration
 
 ##### Core Lightning (CLN)

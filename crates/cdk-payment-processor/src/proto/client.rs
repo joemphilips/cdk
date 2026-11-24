@@ -1,8 +1,10 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context as AnyhowContext};
 use cdk_common::grpc::{VersionInterceptor, VERSION_HEADER};
@@ -16,7 +18,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
-use tonic::{async_trait, Request};
+use tonic::{async_trait, Request, Status};
 use tracing::instrument;
 
 use crate::proto::cdk_payment_processor_client::CdkPaymentProcessorClient;
@@ -26,10 +28,27 @@ use crate::proto::{
     PaymentQuoteRequest,
 };
 
+/// The longest time that the client waits for the answer of one call.
+///
+/// Every call has this deadline, except the send. The result of a send that is
+/// dropped is unknown, so only its own answer can end it. For the event stream,
+/// the deadline covers the opening of the stream, not the stream.
+///
+/// The bound is above the 10 seconds after which the mint itself stops a melt
+/// status check, so it does not change that check. It is below 30 seconds, a
+/// usual limit of an HTTP client or a proxy in front of the mint, so a wallet
+/// gets an answer of the mint.
+pub(super) const CALL_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Payment Processor
 #[derive(Clone)]
 pub struct PaymentProcessorClient {
     inner: CdkPaymentProcessorClient<InterceptedService<Channel, VersionInterceptor>>,
+    /// The send has its own connection. A call past its deadline resets its
+    /// stream, and a server can close a connection with many resets. A send in
+    /// progress on that connection would end with an unknown result.
+    send: CdkPaymentProcessorClient<InterceptedService<Channel, VersionInterceptor>>,
+    pub(super) call_deadline: Duration,
     payment_event_stream_is_active: Arc<AtomicBool>,
     cancel_payment_event_stream: Arc<Mutex<CancellationToken>>,
 }
@@ -81,28 +100,50 @@ impl PaymentProcessorClient {
         let scheme = if tls_dir.is_some() { "https" } else { "http" };
         let endpoint = format!("{scheme}://{addr}:{port}");
 
-        let channel = if let Some(tls_dir) = tls_dir {
-            let tls = load_mtls_config(&tls_dir)?;
-            Channel::from_shared(endpoint)?
-                .tls_config(tls)?
-                .connect()
-                .await?
+        let endpoint = Channel::from_shared(endpoint)?;
+        let endpoint = if let Some(tls_dir) = tls_dir {
+            endpoint.tls_config(load_mtls_config(&tls_dir)?)?
         } else {
             // No TLS directory, skip TLS configuration
-            Channel::from_shared(endpoint)?.connect().await?
+            endpoint
         };
 
         let interceptor = VersionInterceptor::new(
             VERSION_HEADER,
             cdk_common::PAYMENT_PROCESSOR_PROTOCOL_VERSION,
         );
-        let client = CdkPaymentProcessorClient::with_interceptor(channel, interceptor);
+        let inner = CdkPaymentProcessorClient::with_interceptor(
+            endpoint.connect().await?,
+            interceptor.clone(),
+        );
+        let send =
+            CdkPaymentProcessorClient::with_interceptor(endpoint.connect().await?, interceptor);
 
         Ok(Self {
-            inner: client,
+            inner,
+            send,
+            call_deadline: CALL_DEADLINE,
             payment_event_stream_is_active: Arc::new(AtomicBool::new(false)),
             cancel_payment_event_stream: Arc::new(Mutex::new(CancellationToken::new())),
         })
+    }
+
+    /// Run one call with the deadline.
+    ///
+    /// A call past its deadline answers an error, as a processor that is not
+    /// reachable does. The caller must not take it as a result of a payment.
+    /// The end of the call drops a late answer. The client alone counts the
+    /// time: the request has no `grpc-timeout` header.
+    async fn with_deadline<T, F>(&self, call: F) -> Result<T, Status>
+    where
+        F: Future<Output = Result<T, Status>>,
+    {
+        match tokio::time::timeout(self.call_deadline, call).await {
+            Ok(result) => result,
+            Err(_) => Err(Status::deadline_exceeded(
+                "the payment processor did not answer within the call deadline",
+            )),
+        }
     }
 }
 
@@ -137,8 +178,8 @@ impl MintPayment for PaymentProcessorClient {
 
     async fn get_settings(&self) -> Result<cdk_common::payment::SettingsResponse, Self::Err> {
         let mut inner = self.inner.clone();
-        let response = inner
-            .get_settings(Request::new(EmptyRequest {}))
+        let response = self
+            .with_deadline(inner.get_settings(Request::new(EmptyRequest {})))
             .await
             .map_err(|err| {
                 tracing::error!("Could not get settings: {}", err);
@@ -220,10 +261,10 @@ impl MintPayment for PaymentProcessorClient {
             },
         };
 
-        let response = inner
-            .create_payment(Request::new(CreatePaymentRequest {
+        let response = self
+            .with_deadline(inner.create_payment(Request::new(CreatePaymentRequest {
                 options: Some(proto_options),
-            }))
+            })))
             .await
             .map_err(|err| {
                 tracing::error!("Could not create payment request: {}", err);
@@ -306,8 +347,8 @@ impl MintPayment for PaymentProcessorClient {
             cdk_common::payment::OutgoingPaymentOptions::Onchain(opts) => opts.quote_id.to_string(),
         };
 
-        let response = inner
-            .get_payment_quote(Request::new(PaymentQuoteRequest {
+        let response = self
+            .with_deadline(inner.get_payment_quote(Request::new(PaymentQuoteRequest {
                 request: proto_request,
                 unit: unit.to_string(),
                 options: proto_options.map(Into::into),
@@ -316,7 +357,7 @@ impl MintPayment for PaymentProcessorClient {
                 quote_id,
                 onchain_options,
                 amount,
-            }))
+            })))
             .await
             .map_err(|err| {
                 tracing::error!("Could not get payment quote: {}", err);
@@ -337,7 +378,7 @@ impl MintPayment for PaymentProcessorClient {
         unit: &cdk_common::CurrencyUnit,
         options: cdk_common::payment::OutgoingPaymentOptions,
     ) -> Result<CdkMakePaymentResponse, Self::Err> {
-        let mut inner = self.inner.clone();
+        let mut inner = self.send.clone();
         let payment_options = match options {
             cdk_common::payment::OutgoingPaymentOptions::Custom(opts) => {
                 super::OutgoingPaymentVariant {
@@ -396,6 +437,7 @@ impl MintPayment for PaymentProcessorClient {
             }
         };
 
+        // No deadline, and its own connection: see `CALL_DEADLINE` and `send`.
         let response = inner
             .make_payment(Request::new(MakePaymentRequest {
                 payment_options: Some(payment_options),
@@ -429,8 +471,8 @@ impl MintPayment for PaymentProcessorClient {
     ) -> Result<Pin<Box<dyn Stream<Item = cdk_common::payment::Event> + Send>>, Self::Err> {
         tracing::debug!("Client waiting for payment");
         let mut inner = self.inner.clone();
-        let stream = inner
-            .wait_payment_event(Request::new(EmptyRequest {}))
+        let stream = self
+            .with_deadline(inner.wait_payment_event(Request::new(EmptyRequest {})))
             .await
             .map_err(|err| {
                 self.payment_event_stream_is_active
@@ -490,10 +532,12 @@ impl MintPayment for PaymentProcessorClient {
         payment_identifier: &cdk_common::payment::PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
         let mut inner = self.inner.clone();
-        let response = inner
-            .check_incoming_payment(Request::new(CheckIncomingPaymentRequest {
-                request_identifier: Some(payment_identifier.clone().into()),
-            }))
+        let response = self
+            .with_deadline(inner.check_incoming_payment(Request::new(
+                CheckIncomingPaymentRequest {
+                    request_identifier: Some(payment_identifier.clone().into()),
+                },
+            )))
             .await
             .map_err(|err| {
                 tracing::error!("Could not check incoming payment: {}", err);
@@ -513,10 +557,12 @@ impl MintPayment for PaymentProcessorClient {
         payment_identifier: &cdk_common::payment::PaymentIdentifier,
     ) -> Result<CdkMakePaymentResponse, Self::Err> {
         let mut inner = self.inner.clone();
-        let response = inner
-            .check_outgoing_payment(Request::new(CheckOutgoingPaymentRequest {
-                request_identifier: Some(payment_identifier.clone().into()),
-            }))
+        let response = self
+            .with_deadline(inner.check_outgoing_payment(Request::new(
+                CheckOutgoingPaymentRequest {
+                    request_identifier: Some(payment_identifier.clone().into()),
+                },
+            )))
             .await
             .map_err(|err| {
                 tracing::error!("Could not check outgoing payment: {}", err);

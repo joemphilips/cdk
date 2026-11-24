@@ -10,6 +10,8 @@ use cdk_common::util::hex;
 use cdk_common::{CurrencyUnit, MeltOptions as CdkMeltOptions};
 
 mod client;
+#[cfg(test)]
+mod deadline_tests;
 mod server;
 
 pub use client::PaymentProcessorClient;

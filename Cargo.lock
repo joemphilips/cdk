@@ -1778,6 +1778,7 @@ dependencies = [
  "async-trait",
  "bip39",
  "cashu",
+ "cdk",
  "cdk-cln",
  "cdk-common",
  "cdk-fake-wallet",
