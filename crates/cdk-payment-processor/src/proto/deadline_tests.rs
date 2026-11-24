@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,7 +51,7 @@ use tonic::{Request, Response, Status};
 use super::client::{PaymentProcessorClient, CALL_DEADLINE};
 use super::server::PaymentProcessorServer;
 use crate::proto;
-use crate::proto::cdk_payment_processor_server::CdkPaymentProcessorServer;
+use crate::proto::cdk_payment_processor_server::{CdkPaymentProcessor, CdkPaymentProcessorServer};
 
 /// A deadline for calls that never get an answer.
 const SHORT_DEADLINE: Duration = Duration::from_millis(100);
@@ -136,6 +137,8 @@ struct Processor {
     /// Every open event stream takes its events from this one queue.
     events: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<Event>>>>,
     open_streams: Arc<watch::Sender<usize>>,
+    /// The number of event streams that were opened.
+    stream_opens: AtomicUsize,
 }
 
 /// Counts an open event stream of the backend.
@@ -346,6 +349,11 @@ impl MintPayment for Processor {
     async fn wait_payment_event(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Event> + Send>>, Self::Err> {
+        // A server without a delay would open streams without an end, and the
+        // paused clock would never advance. This makes the test fail instead.
+        if self.stream_opens.fetch_add(1, Ordering::SeqCst) >= 1_000 {
+            return futures::future::pending().await;
+        }
         let state = (
             Arc::clone(&self.events),
             OpenStream::new(&self.open_streams),
@@ -402,7 +410,7 @@ struct HeldEventStream {
 }
 
 #[tonic::async_trait]
-impl proto::cdk_payment_processor_server::CdkPaymentProcessor for HeldEventStream {
+impl CdkPaymentProcessor for HeldEventStream {
     async fn get_settings(
         &self,
         request: Request<proto::EmptyRequest>,
@@ -859,6 +867,54 @@ async fn a_dropped_event_stream_takes_no_event_of_the_next_stream() {
     }
     assert_eq!(received, sent, "every event arrives exactly once, in order");
     assert_eq!(*server.processor.open_streams.borrow(), 1);
+}
+
+/// No socket is necessary here, so the clock is paused and advances by itself.
+#[tokio::test(start_paused = true)]
+async fn a_backend_stream_that_ends_at_once_is_opened_again_with_a_delay() {
+    let (processor, events) = Processor::new();
+    // The queue has no sender: each backend stream ends at its first event.
+    drop(events);
+    let server = PaymentProcessorServer::new(processor.clone(), "127.0.0.1", 0).expect("server");
+    let mut live = server
+        .wait_payment_event(Request::new(proto::EmptyRequest {}))
+        .await
+        .expect("open the stream")
+        .into_inner();
+
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let opens = processor.stream_opens.load(Ordering::SeqCst);
+    assert!(
+        (10..=13).contains(&opens),
+        "one open each 5 seconds, got {opens} in one minute"
+    );
+
+    // The backend is healthy again.
+    let (events, receiver) = mpsc::unbounded_channel();
+    *processor.events.lock().await = Some(receiver);
+    events
+        .send(Event::PaymentReceived(WaitPaymentResponse {
+            payment_identifier: PaymentIdentifier::CustomId("payment".to_string()),
+            payment_amount: Amount::new(1, CurrencyUnit::Sat),
+            payment_id: "payment".to_string(),
+        }))
+        .expect("the processor lives");
+    let event = within("the event after the recovery", live.next())
+        .await
+        .expect("the stream is open");
+    event.expect("an event");
+
+    // The end of the client ends the delay too.
+    drop(events);
+    drop(live);
+    processor.wait_open_streams(0).await;
+    let opens = processor.stream_opens.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(
+        processor.stream_opens.load(Ordering::SeqCst),
+        opens,
+        "a stream without a client must not be opened again"
+    );
 }
 
 /// The answer of a call that passed its deadline is never the answer of a later

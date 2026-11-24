@@ -22,6 +22,9 @@ use super::cdk_payment_processor_server::{CdkPaymentProcessor, CdkPaymentProcess
 use crate::error::Error;
 use crate::proto::{TryFromProtoAmount, *};
 
+/// The delay before the server opens the event stream of its backend again.
+const BACKEND_STREAM_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<PaymentEventResponse, Status>> + Send>>;
 
 /// Payment Processor
@@ -617,10 +620,13 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     result = ln.wait_payment_event() => {
                         match result {
                             Ok(stream) => forward_payment_events(stream, &tx).await,
-                            Err(err) => {
-                                tracing::warn!("Could not get invoice stream: {}", err);
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            }
+                            Err(err) => tracing::warn!("Could not get invoice stream: {}", err),
+                        }
+                        // A backend whose stream fails or ends at once must not
+                        // cause a busy loop.
+                        tokio::select! {
+                            _ = tx.closed() => {}
+                            _ = sleep(BACKEND_STREAM_RETRY_DELAY) => {}
                         }
                     }
                 }
