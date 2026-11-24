@@ -1,4 +1,5 @@
-//! The call deadline of the client, against a processor that does not answer.
+//! The call deadline of the client, against a processor that does not answer,
+//! and the event stream of the server, against a client that goes away.
 //!
 //! The client and the server are the real ones, on a loopback socket. The real
 //! socket excludes a paused clock, so these tests use a short deadline. A call
@@ -132,7 +133,25 @@ struct Processor {
     outgoing_status: Mutex<Option<MeltQuoteState>>,
     /// The payments that a status check reports: each new invoice is paid.
     paid_invoices: Mutex<HashMap<PaymentIdentifier, WaitPaymentResponse>>,
-    events: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
+    /// Every open event stream takes its events from this one queue.
+    events: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<Event>>>>,
+    open_streams: Arc<watch::Sender<usize>>,
+}
+
+/// Counts an open event stream of the backend.
+struct OpenStream(Arc<watch::Sender<usize>>);
+
+impl OpenStream {
+    fn new(count: &Arc<watch::Sender<usize>>) -> Self {
+        count.send_modify(|count| *count += 1);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
 }
 
 impl Processor {
@@ -153,7 +172,7 @@ impl Processor {
         (
             Arc::new(Self {
                 gates,
-                events: Mutex::new(Some(receiver)),
+                events: Arc::new(tokio::sync::Mutex::new(Some(receiver))),
                 ..Default::default()
             }),
             sender,
@@ -199,6 +218,17 @@ impl Processor {
                 .wait_for(|left| *left >= entered)
                 .await
                 .expect("gate lives");
+        })
+        .await;
+    }
+
+    async fn wait_open_streams(&self, count: usize) {
+        within(&format!("a wait for {count} open event streams"), async {
+            self.open_streams
+                .subscribe()
+                .wait_for(|open| *open == count)
+                .await
+                .expect("the processor lives");
         })
         .await;
     }
@@ -316,14 +346,17 @@ impl MintPayment for Processor {
     async fn wait_payment_event(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Event> + Send>>, Self::Err> {
-        let events = self.events.lock().expect("lock").take();
-        match events {
-            Some(events) => Ok(Box::pin(futures::stream::unfold(
-                events,
-                |mut events| async move { events.recv().await.map(|event| (event, events)) },
-            ))),
-            None => Ok(Box::pin(futures::stream::pending())),
-        }
+        let state = (
+            Arc::clone(&self.events),
+            OpenStream::new(&self.open_streams),
+        );
+        Ok(Box::pin(futures::stream::unfold(
+            state,
+            |state| async move {
+                let event = state.0.lock().await.as_mut()?.recv().await?;
+                Some((event, state))
+            },
+        )))
     }
 
     fn is_payment_event_stream_active(&self) -> bool {
@@ -786,6 +819,46 @@ async fn an_open_event_stream_outlives_the_deadline() {
         .expect("the stream is open");
     assert!(matches!(event, Event::PaymentReceived(_)));
     assert!(client.is_payment_event_stream_active());
+}
+
+/// A client that drops its stream ends the server task of that stream. A task
+/// that stays takes events from the backend and discards them.
+#[tokio::test]
+async fn a_dropped_event_stream_takes_no_event_of_the_next_stream() {
+    let server = TestServer::start();
+    let client = server.client().await;
+    for _ in 0..3 {
+        let stream = within("the event stream", client.wait_payment_event())
+            .await
+            .expect("open the stream");
+        server.processor.wait_open_streams(1).await;
+        drop(stream);
+        server.processor.wait_open_streams(0).await;
+    }
+
+    let mut live = within("the event stream", client.wait_payment_event())
+        .await
+        .expect("open the stream");
+    let sent: Vec<_> = (0..12).map(|number| format!("payment-{number}")).collect();
+    for payment_id in &sent {
+        server
+            .events
+            .send(Event::PaymentReceived(WaitPaymentResponse {
+                payment_identifier: PaymentIdentifier::CustomId(payment_id.clone()),
+                payment_amount: Amount::new(1, CurrencyUnit::Sat),
+                payment_id: payment_id.clone(),
+            }))
+            .expect("the processor lives");
+    }
+    let mut received = Vec::new();
+    while received.len() < sent.len() {
+        match within("the next event", live.next()).await {
+            Some(Event::PaymentReceived(payment)) => received.push(payment.payment_id),
+            _ => panic!("unexpected event after {received:?}"),
+        }
+    }
+    assert_eq!(received, sent, "every event arrives exactly once, in order");
+    assert_eq!(*server.processor.open_streams.borrow(), 1);
 }
 
 /// The answer of a call that passed its deadline is never the answer of a later

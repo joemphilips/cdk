@@ -602,6 +602,13 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
+                    // The client is gone. Without this end, the task keeps its
+                    // backend stream and takes events from the next client.
+                    _ = tx.closed() => {
+                        tracing::debug!("Payment event client disconnected");
+                        break;
+                    }
                     _ = shutdown_clone.notified() => {
                         tracing::info!("Shutdown signal received, stopping task");
                         ln.cancel_payment_event_stream();
@@ -609,19 +616,7 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     }
                     result = ln.wait_payment_event() => {
                         match result {
-                            Ok(mut stream) => {
-                                while let Some(event) = stream.next().await {
-                                    match tx.send(Result::<_, Status>::Ok(event.into())).await {
-                                        Ok(_) => {
-                                            // Response was queued to be sent to client
-                                        }
-                                        Err(item) => {
-                                            tracing::error!("Error adding payment event to stream: {}", item);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                            Ok(stream) => forward_payment_events(stream, &tx).await,
                             Err(err) => {
                                 tracing::warn!("Could not get invoice stream: {}", err);
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -636,6 +631,28 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
         Ok(Response::new(
             Box::pin(output_stream) as Self::WaitPaymentEventStream
         ))
+    }
+}
+
+/// Send the events of one backend stream until it ends or the client is gone.
+async fn forward_payment_events(
+    mut stream: Pin<Box<dyn Stream<Item = cdk_common::payment::Event> + Send>>,
+    tx: &mpsc::Sender<Result<PaymentEventResponse, Status>>,
+) {
+    loop {
+        let event = tokio::select! {
+            // A stream without a client must not take one more event.
+            biased;
+            _ = tx.closed() => return,
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            return;
+        };
+        if tx.send(Ok(event.into())).await.is_err() {
+            tracing::warn!("Payment event dropped: the client disconnected");
+            return;
+        }
     }
 }
 
