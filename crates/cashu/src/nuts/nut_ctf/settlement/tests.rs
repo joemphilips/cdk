@@ -1086,46 +1086,23 @@ fn nut06_multi_party_is_complete_and_round_trips() {
     );
 }
 
+/// Output conflict detail is a part of NUT-CTF-settle. It has no capability field.
 #[test]
-fn nut06_output_conflict_detail_is_off_and_absent_by_default() {
+fn nut06_multi_party_fields_are_exactly_the_limits_and_the_mandatory_features() {
     let settings = NutCtfSplitMergeSettings::default()
         .with_multi_party(
             NutCtfSettlementSettings::new(64, 4096, 8192, 1_048_576, 3600, 256)
                 .expect("valid multi-party settings"),
         )
         .expect("legacy convert is enabled");
-    let value = serde_json::to_value(&settings).expect("serialize settings");
 
-    assert_eq!(value, multi_party_settings_without_output_conflict_detail());
-    assert!(!settings
-        .multi_party()
-        .expect("multi-party advertised")
-        .output_conflict_detail());
+    assert_eq!(
+        serde_json::to_value(&settings).expect("serialize settings"),
+        multi_party_settings()
+    );
 }
 
-#[test]
-fn nut06_enabled_output_conflict_detail_is_advertised_and_round_trips() {
-    let settings = NutCtfSplitMergeSettings::default()
-        .with_multi_party(
-            NutCtfSettlementSettings::new(64, 4096, 8192, 1_048_576, 3600, 256)
-                .expect("valid multi-party settings")
-                .with_output_conflict_detail(true),
-        )
-        .expect("legacy convert is enabled");
-    let value = serde_json::to_value(&settings).expect("serialize settings");
-
-    assert_eq!(value["output_conflict_detail"], true);
-    assert_eq!(value["idempotent_retries"], true);
-    let decoded: NutCtfSplitMergeSettings =
-        serde_json::from_value(value).expect("deserialize settings");
-    assert_eq!(decoded, settings);
-    assert!(decoded
-        .multi_party()
-        .expect("multi-party advertised")
-        .output_conflict_detail());
-}
-
-fn multi_party_settings_without_output_conflict_detail() -> Value {
+fn multi_party_settings() -> Value {
     json!({
         "supported": true,
         "max_participants": 64,
@@ -1139,29 +1116,35 @@ fn multi_party_settings_without_output_conflict_detail() -> Value {
     })
 }
 
+/// A wallet reads the info of an older or newer mint, and a mint reads the
+/// info that an older version of it stored. `output_conflict_detail` is a
+/// field of such an older mint.
 #[test]
-fn nut06_mint_without_output_conflict_detail_does_not_report_conflicts() {
-    let mut value = multi_party_settings_without_output_conflict_detail();
-    let older: NutCtfSplitMergeSettings =
-        serde_json::from_value(value.clone()).expect("a mint without the field decodes");
-    assert!(!older
-        .multi_party()
-        .expect("multi-party advertised")
-        .output_conflict_detail());
+fn nut06_ignores_a_field_that_it_does_not_know() {
+    let known: NutCtfSplitMergeSettings =
+        serde_json::from_value(multi_party_settings()).expect("settings decode");
 
-    value["output_conflict_detail"] = json!(false);
-    let disabled: NutCtfSplitMergeSettings =
-        serde_json::from_value(value).expect("an explicit false decodes");
-    assert_eq!(disabled, older);
-}
+    for (field, unknown) in [
+        ("output_conflict_detail", json!(true)),
+        ("output_conflict_detail", json!(false)),
+        ("unexpected", json!({"nested": [1]})),
+    ] {
+        let mut value = multi_party_settings();
+        value[field] = unknown.clone();
+        let decoded: NutCtfSplitMergeSettings = serde_json::from_value(value)
+            .unwrap_or_else(|error| panic!("{field}={unknown} must decode: {error}"));
+        assert_eq!(decoded, known, "{field}={unknown}");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("serialize settings"),
+            multi_party_settings(),
+            "{field}={unknown} must not be served again"
+        );
 
-#[test]
-fn nut06_output_conflict_detail_requires_the_multi_party_capability() {
-    assert!(serde_json::from_value::<NutCtfSplitMergeSettings>(json!({
-        "supported": true,
-        "output_conflict_detail": true
-    }))
-    .is_err());
+        let single_party: NutCtfSplitMergeSettings =
+            serde_json::from_value(json!({"supported": true, field: unknown.clone()}))
+                .unwrap_or_else(|error| panic!("{field}={unknown} must decode: {error}"));
+        assert_eq!(single_party, NutCtfSplitMergeSettings::default());
+    }
 }
 
 #[test]
@@ -1214,15 +1197,10 @@ fn nut06_rejects_limits_that_cannot_hold_one_valid_multi_request() {
 }
 
 #[test]
-fn nut06_rejects_partial_unknown_or_disabled_multi_party_fields() {
+fn nut06_rejects_partial_or_disabled_multi_party_fields() {
     assert!(serde_json::from_value::<NutCtfSplitMergeSettings>(json!({
         "supported": true,
         "max_participants": 64
-    }))
-    .is_err());
-    assert!(serde_json::from_value::<NutCtfSplitMergeSettings>(json!({
-        "supported": true,
-        "unexpected": 1
     }))
     .is_err());
 

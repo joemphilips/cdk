@@ -2293,3 +2293,77 @@ mod oracle_evidence_http_tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(all(test, feature = "conditional-tokens"))]
+mod settlement_info_http_tests {
+    use std::sync::Arc;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use cdk::mint::{MintBuilder, UnitConfig};
+    use cdk::nuts::nut_ctf::NutCtfSettlementSettings;
+    use cdk::nuts::CurrencyUnit;
+    use tower::ServiceExt;
+
+    /// Output conflict detail is always on, so `/v1/info` has no field for it.
+    #[tokio::test]
+    async fn served_settlement_info_is_exactly_the_limits_and_the_mandatory_features() {
+        let db = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("mint database"),
+        );
+        let mut builder = MintBuilder::new(db.clone());
+        builder
+            .configure_unit(
+                CurrencyUnit::Sat,
+                UnitConfig {
+                    amounts: vec![1, 2, 4, 8],
+                    input_fee_ppk: 1,
+                },
+            )
+            .expect("unit");
+        let mint = builder
+            .with_ctf_settlement_settings(
+                NutCtfSettlementSettings::new(32, 512, 512, 1_048_576, 86_400, 128)
+                    .expect("settlement settings"),
+            )
+            .expect("settlement advertisement")
+            .build_with_seed(db, &[8; 64])
+            .await
+            .expect("mint");
+        let router = crate::create_mint_router(Arc::new(mint), Vec::new())
+            .await
+            .expect("router");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/info")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let info: serde_json::Value = serde_json::from_slice(&body).expect("mint info");
+        assert_eq!(
+            info["nuts"]["CTF-split-merge"],
+            serde_json::json!({
+                "supported": true,
+                "max_participants": 32,
+                "max_inputs": 512,
+                "max_outputs": 512,
+                "max_request_bytes": 1048576,
+                "idempotent_retries": true,
+                "max_expiry_seconds": 86400,
+                "partial_fill": true,
+                "max_pool_entries": 128
+            })
+        );
+    }
+}

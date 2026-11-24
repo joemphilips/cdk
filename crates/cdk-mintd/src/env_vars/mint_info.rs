@@ -47,10 +47,9 @@ pub const ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS: &str =
 #[cfg(feature = "conditional-tokens")]
 pub const ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES: &str =
     "CDK_MINTD_CTF_SETTLEMENT_MAX_POOL_ENTRIES";
-/// Optional. See `CtfSettlementConfig::output_conflict_detail`, including its
-/// rollback warning.
+/// Removed: output conflict detail is always on. A leftover value is refused.
 #[cfg(feature = "conditional-tokens")]
-pub const ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL: &str =
+const REMOVED_ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL: &str =
     "CDK_MINTD_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL";
 
 #[cfg(feature = "conditional-tokens")]
@@ -79,6 +78,12 @@ fn registration_fee_from_env(
 
 #[cfg(feature = "conditional-tokens")]
 pub(crate) fn ctf_settlement_from_env() -> Result<Option<CtfSettlementConfig>> {
+    if env::var_os(REMOVED_ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL).is_some() {
+        bail!(
+            "{REMOVED_ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL} was removed: output conflict \
+             detail is always on; unset the variable"
+        );
+    }
     let fields = [
         (
             ENV_MINT_CTF_SETTLEMENT_MAX_PARTICIPANTS,
@@ -105,13 +110,7 @@ pub(crate) fn ctf_settlement_from_env() -> Result<Option<CtfSettlementConfig>> {
             read_optional_env(ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES)?,
         ),
     ];
-    let output_conflict_detail = read_optional_env(ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL)?;
     if fields.iter().all(|(_, value)| value.is_none()) {
-        if output_conflict_detail.is_some() {
-            bail!(
-                "{ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL} needs every CTF settlement limit"
-            );
-        }
         return Ok(None);
     }
 
@@ -131,14 +130,6 @@ pub(crate) fn ctf_settlement_from_env() -> Result<Option<CtfSettlementConfig>> {
         max_request_bytes: parse(3)?,
         max_expiry_seconds: parse(4)?,
         max_pool_entries: parse(5)?,
-        output_conflict_detail: output_conflict_detail
-            .as_deref()
-            .map(str::parse)
-            .transpose()
-            .with_context(|| {
-                format!("{ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL} must be true or false")
-            })?
-            .unwrap_or(false),
     }))
 }
 
@@ -229,6 +220,8 @@ impl MintInfo {
 mod tests {
     use super::*;
 
+    const FORMER_OUTPUT_CONFLICT_DETAIL: &str = "CDK_MINTD_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL";
+
     fn clear_registration_fee_env() {
         env::remove_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_BASE);
         env::remove_var(ENV_MINT_CTF_REGISTRATION_FEE_MSAT_PER_KEYSET);
@@ -243,7 +236,7 @@ mod tests {
         env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_REQUEST_BYTES);
         env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_EXPIRY_SECONDS);
         env::remove_var(ENV_MINT_CTF_SETTLEMENT_MAX_POOL_ENTRIES);
-        env::remove_var(ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL);
+        env::remove_var(FORMER_OUTPUT_CONFLICT_DETAIL);
     }
 
     fn set_complete_settlement_limits() {
@@ -374,29 +367,30 @@ mod tests {
         clear_settlement_env();
         assert_eq!(settlement.max_inputs, 512);
         assert_eq!(settlement.max_expiry_seconds, 86_400);
-        assert!(!settlement.output_conflict_detail);
     }
 
+    /// Output conflict detail is always on. The former variable is refused,
+    /// with and without the limits: it is never ignored.
     #[test]
-    fn ctf_settlement_env_enables_output_conflict_detail_only_with_limits() {
+    fn ctf_settlement_env_refuses_the_former_output_conflict_detail_variable() {
         let _guard = crate::test_utils::env_lock();
-        clear_settlement_env();
-        env::set_var(ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL, "true");
-        let without_limits = ctf_settlement_from_env();
+        for value in ["true", "false", ""] {
+            clear_settlement_env();
+            env::set_var(FORMER_OUTPUT_CONFLICT_DETAIL, value);
+            let without_limits = ctf_settlement_from_env();
+            set_complete_settlement_limits();
+            let with_limits = ctf_settlement_from_env();
+            clear_settlement_env();
 
-        set_complete_settlement_limits();
-        let enabled = ctf_settlement_from_env();
-        env::set_var(ENV_MINT_CTF_SETTLEMENT_OUTPUT_CONFLICT_DETAIL, "yes");
-        let malformed = ctf_settlement_from_env();
-
-        clear_settlement_env();
-        assert!(without_limits.is_err());
-        assert!(
-            enabled
-                .expect("settlement env")
-                .expect("configured settlement")
-                .output_conflict_detail
-        );
-        assert!(malformed.is_err());
+            for refused in [without_limits, with_limits] {
+                let error = refused
+                    .expect_err("the former variable must be refused")
+                    .to_string();
+                assert!(
+                    error.contains(FORMER_OUTPUT_CONFLICT_DETAIL),
+                    "{value:?}: {error}"
+                );
+            }
+        }
     }
 }

@@ -1276,32 +1276,58 @@ mod tests {
         assert_eq!(limits.max_request_bytes, 1_048_576);
         assert_eq!(limits.max_pool_entries, 128);
         assert_eq!(advertised.max_expiry_seconds(), 86_400);
-        assert!(
-            !advertised.output_conflict_detail(),
-            "output conflict detail is off unless the operator enables it"
-        );
     }
 
-    /// The operator enables output conflict detail through the advertised settings.
+    /// A mint reads the info that an older version of it stored with
+    /// `output_conflict_detail`, keeps its other values, and no longer serves
+    /// the field.
     #[cfg(feature = "conditional-tokens")]
     #[tokio::test]
-    async fn enabled_output_conflict_detail_is_advertised_in_mint_info() {
+    async fn stored_mint_info_with_output_conflict_detail_is_served_without_it() {
+        use crate::mint::{
+            CDK_MINT_CONFIG_KV_KEY, CDK_MINT_CONFIG_SECONDARY_NAMESPACE, CDK_MINT_PRIMARY_NAMESPACE,
+        };
+
         let (builder, store) = builder_with_bolt11_processor().await;
         let settlement = NutCtfSettlementSettings::new(32, 512, 512, 1_048_576, 86_400, 128)
-            .expect("settlement settings")
-            .with_output_conflict_detail(true);
+            .expect("settlement settings");
         let mint = builder
             .with_ctf_settlement_settings(settlement)
             .expect("settlement advertisement")
-            .build_with_seed(store.clone(), &seed())
+            .build_with_seed(store, &seed())
             .await
             .expect("mint");
+        let mut info = mint.mint_info().await.expect("mint info");
+        info.name = Some("kept name".to_owned());
+        let expected = serde_json::to_value(&info).expect("serialize mint info");
+        let settings = &expected["nuts"]["CTF-split-merge"];
+        assert_eq!(settings["max_pool_entries"], 128);
+        assert!(
+            settings.get("output_conflict_detail").is_none(),
+            "{settings}"
+        );
 
-        let info = serde_json::to_value(mint.mint_info().await.expect("mint info"))
-            .expect("serialize mint info");
+        let mut older = expected.clone();
+        older["nuts"]["CTF-split-merge"]["output_conflict_detail"] = serde_json::Value::Bool(true);
+        let mut tx = mint
+            .localstore()
+            .begin_transaction()
+            .await
+            .expect("transaction");
+        tx.kv_write(
+            CDK_MINT_PRIMARY_NAMESPACE,
+            CDK_MINT_CONFIG_SECONDARY_NAMESPACE,
+            CDK_MINT_CONFIG_KV_KEY,
+            &serde_json::to_vec(&older).expect("older mint info"),
+        )
+        .await
+        .expect("store the older mint info");
+        tx.commit().await.expect("commit");
+
+        let served = mint.mint_info().await.expect("older mint info decodes");
         assert_eq!(
-            info["nuts"]["CTF-split-merge"]["output_conflict_detail"],
-            serde_json::Value::Bool(true)
+            serde_json::to_value(&served).expect("serialize mint info"),
+            expected
         );
     }
 

@@ -3,6 +3,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::CtfSettlementLimits;
 
 /// Multi-party range-settlement capability advertised with CTF convert.
+///
+/// Output conflict detail has no field: a mint with this capability always
+/// lists the signed and pending outputs of a refused request. It needs
+/// `request_digest`, so `idempotent_retries` is mandatory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct NutCtfSettlementSettings {
     max_participants: u64,
@@ -13,13 +17,6 @@ pub struct NutCtfSettlementSettings {
     max_expiry_seconds: u64,
     partial_fill: bool,
     max_pool_entries: u64,
-    /// A refusal for a signed or pending output lists each such output.
-    ///
-    /// The detail needs `request_digest`, which `idempotent_retries` already
-    /// requires. It is off by default and is not serialized when off, so a
-    /// client that rejects unknown info fields still reads the setting.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    output_conflict_detail: bool,
 }
 
 impl NutCtfSettlementSettings {
@@ -56,19 +53,7 @@ impl NutCtfSettlementSettings {
             max_expiry_seconds,
             partial_fill: true,
             max_pool_entries,
-            output_conflict_detail: false,
         })
-    }
-
-    /// Enable or disable output conflict detail.
-    pub const fn with_output_conflict_detail(mut self, enabled: bool) -> Self {
-        self.output_conflict_detail = enabled;
-        self
-    }
-
-    /// Whether a refusal for a signed or pending output lists each such output.
-    pub const fn output_conflict_detail(self) -> bool {
-        self.output_conflict_detail
     }
 
     /// Maximum authorization lifetime.
@@ -171,8 +156,9 @@ impl<'de> Deserialize<'de> for NutCtfSplitMergeSettings {
     }
 }
 
+/// The known wire fields. A reader ignores any other field: a newer mint can
+/// add one, and an older mint can still send `output_conflict_detail`.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NutCtfSplitMergeSettingsWire {
     supported: bool,
     max_participants: Option<u64>,
@@ -183,25 +169,9 @@ struct NutCtfSplitMergeSettingsWire {
     max_expiry_seconds: Option<u64>,
     partial_fill: Option<bool>,
     max_pool_entries: Option<u64>,
-    output_conflict_detail: Option<bool>,
 }
 
 fn decode_multi_party(
-    raw: &NutCtfSplitMergeSettingsWire,
-) -> Result<Option<NutCtfSettlementSettings>, NutCtfSettlementSettingsError> {
-    let settings = decode_multi_party_limits(raw)?;
-    match (settings, raw.output_conflict_detail) {
-        (None, Some(_)) => Err(NutCtfSettlementSettingsError::PartialSettings),
-        (None, None) => Ok(None),
-        // A mint that predates the field does not report output conflicts.
-        (Some(mut settings), detail) => {
-            settings.output_conflict_detail = detail.unwrap_or(false);
-            Ok(Some(settings))
-        }
-    }
-}
-
-fn decode_multi_party_limits(
     raw: &NutCtfSplitMergeSettingsWire,
 ) -> Result<Option<NutCtfSettlementSettings>, NutCtfSettlementSettingsError> {
     match (

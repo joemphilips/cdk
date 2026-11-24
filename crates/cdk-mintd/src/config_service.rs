@@ -2491,6 +2491,69 @@ tls_mode = "disable"
         std::fs::remove_file(url_path).expect("remove URL");
     }
 
+    /// A stored document that an older version accepted with the former key
+    /// stops the start. The operator can still read it and replace it.
+    #[cfg(all(
+        feature = "conditional-tokens",
+        feature = "sqlite",
+        feature = "fakewallet"
+    ))]
+    #[tokio::test]
+    async fn startup_refuses_a_stored_former_output_conflict_detail_key_until_it_is_removed() {
+        let secret_path = crate::test_utils::unique_temp_path("former_conflict_detail_secret");
+        std::fs::write(&secret_path, TEST_MNEMONIC_ONE).expect("write signing secret");
+        let corrected = format!(
+            "{}{}",
+            document(&format!("file:{}", secret_path.display()), "settlement"),
+            r#"
+[mint_info.ctf_settlement]
+max_participants = 32
+max_inputs = 512
+max_outputs = 512
+max_request_bytes = 1048576
+max_expiry_seconds = 86400
+max_pool_entries = 128
+"#
+        );
+        let older = format!("{corrected}output_conflict_detail = true\n");
+        let identity = discover_signing_identity(
+            &ConfigurationService::validate_document(&corrected)
+                .expect("corrected document")
+                .settings,
+        )
+        .expect("identity");
+        let database = Arc::new(memory::empty().await.expect("in-memory config store"));
+        let repository = ConfigRepository::new(database);
+        repository
+            .initialize(ConfigEnvelope::new(older.clone(), identity.fingerprint))
+            .await
+            .expect("store the older document");
+        let service = ConfigurationService::new(repository, Database::default());
+
+        let error = service
+            .startup()
+            .await
+            .expect_err("the former key must stop the start")
+            .to_string();
+        assert!(
+            error.contains("unknown field `output_conflict_detail`"),
+            "{error}"
+        );
+        assert_eq!(service.document().await.expect("stored document"), older);
+
+        service
+            .apply(
+                &corrected,
+                false,
+                Path::new("."),
+                BdkWalletPolicy::RequireExisting,
+            )
+            .await
+            .expect("apply the corrected document");
+        service.startup().await.expect("corrected startup");
+        std::fs::remove_file(secret_path).expect("remove signing secret");
+    }
+
     #[test]
     fn initialization_state_allows_remote_keysets_to_remain_external() {
         let pubkey = cdk::nuts::PublicKey::from_hex(

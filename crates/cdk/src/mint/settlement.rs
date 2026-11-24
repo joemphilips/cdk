@@ -34,9 +34,9 @@ pub(super) struct PreparedCtfSettlement {
     pub(super) output_verification: Verification,
     pub(super) fee: ProofsFeeBreakdown,
     /// The end of a no-commit record for this request: its earliest
-    /// `PAY_TO_UNLOCK` expiry. `None` when the mint does not list output
-    /// conflicts for it, because the capability is off or the request has no
-    /// `PAY_TO_UNLOCK` input. Such a request gets the plain refusal.
+    /// `PAY_TO_UNLOCK` expiry. `None` when the request has no `PAY_TO_UNLOCK`
+    /// input. The mint does not list output conflicts for such a request,
+    /// which gets the plain refusal.
     pub(super) conflict_record_cutoff: Option<u64>,
 }
 
@@ -295,7 +295,7 @@ impl Mint {
             input_verification,
             output_verification,
             fee,
-            conflict_record_cutoff: cutoff.filter(|_| settings.output_conflict_detail()),
+            conflict_record_cutoff: cutoff,
         }))
     }
 

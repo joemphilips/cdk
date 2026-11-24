@@ -7,7 +7,9 @@
 //! also after the other operation is removed.
 
 use cdk_common::melt::MeltQuoteRequest;
-use cdk_common::nuts::nut_ctf::settlement::{OutputConflict, OutputConflictState, OutputConflicts};
+use cdk_common::nuts::nut_ctf::settlement::{
+    NutCtfSplitMergeSettings, OutputConflict, OutputConflictState, OutputConflicts,
+};
 use cdk_common::nuts::{MeltQuoteBolt11Request, MeltRequest};
 use cdk_fake_wallet::{create_fake_invoice, FakeInvoiceDescription};
 
@@ -102,7 +104,7 @@ async fn refuse_with_conflicts(
     now: u64,
 ) -> OutputConflicts {
     match mint
-        .process_ctf_settlement(request, conflict_detail_settings(), now)
+        .process_ctf_settlement(request, settlement_settings(), now)
         .await
     {
         Err(CtfSettlementError::OutputConflict(conflicts)) => conflicts,
@@ -318,7 +320,7 @@ async fn test_ctf_settlement_identical_copy_is_not_a_conflict_with_itself() {
     let first_request = request.clone();
     let first = tokio::spawn(async move {
         first_mint
-            .process_ctf_settlement(&first_request, conflict_detail_settings(), now)
+            .process_ctf_settlement(&first_request, settlement_settings(), now)
             .await
     });
     timeout(Duration::from_secs(5), reached)
@@ -329,7 +331,7 @@ async fn test_ctf_settlement_identical_copy_is_not_a_conflict_with_itself() {
     let copy_request = request.clone();
     let copy = tokio::spawn(async move {
         copy_mint
-            .process_ctf_settlement(&copy_request, conflict_detail_settings(), now)
+            .process_ctf_settlement(&copy_request, settlement_settings(), now)
             .await
     });
     release.send(()).expect("R must still wait at the pause");
@@ -346,7 +348,7 @@ async fn test_ctf_settlement_identical_copy_is_not_a_conflict_with_itself() {
         .expect("the copy replays R");
     assert_eq!(copied, committed);
     assert_eq!(
-        mint.process_ctf_settlement(&request, conflict_detail_settings(), now)
+        mint.process_ctf_settlement(&request, settlement_settings(), now)
             .await
             .expect("a retry replays R"),
         committed
@@ -365,7 +367,7 @@ async fn refuse_before_signing_without_record(
 ) -> CtfSettlementError {
     let signing_before = mint.blind_sign_attempts();
     let error = mint
-        .process_ctf_settlement(request, conflict_detail_settings(), now)
+        .process_ctf_settlement(request, settlement_settings(), now)
         .await
         .expect_err("an invalid request must be refused");
     assert_eq!(mint.blind_sign_attempts(), signing_before, "{error:?}");
@@ -435,7 +437,7 @@ async fn test_ctf_settlement_conflict_record_answers_expiry_from_the_cutoff() {
     );
     for at in [cutoff, cutoff + 1] {
         let error = mint
-            .process_ctf_settlement(request, conflict_detail_settings(), at)
+            .process_ctf_settlement(request, settlement_settings(), at)
             .await
             .expect_err("an expired request cannot commit");
         assert!(
@@ -468,7 +470,7 @@ async fn test_ctf_settlement_maintenance_deletes_a_conflict_record_after_its_ret
     mint.run_maintenance(deleted_at).await;
     assert_eq!(recorded_outcome(&mint, request).await, None);
     let error = mint
-        .process_ctf_settlement(request, conflict_detail_settings(), deleted_at)
+        .process_ctf_settlement(request, settlement_settings(), deleted_at)
         .await
         .expect_err("an expired request cannot commit");
     assert!(
@@ -479,11 +481,6 @@ async fn test_ctf_settlement_maintenance_deletes_a_conflict_record_after_its_ret
         recorded_outcome(&mint, request).await,
         Some(CtfSettlementReplay::RejectedAfterCutoff { cutoff })
     );
-}
-
-/// The capability that lists output conflicts. It is off by default.
-fn conflict_detail_settings() -> NutCtfSettlementSettings {
-    settlement_settings().with_output_conflict_detail(true)
 }
 
 /// Two bare sellers MERGE 8 YES and 8 NO into 4 + 3 collateral. No input is locked.
@@ -511,15 +508,15 @@ async fn bare_only_merge_request(
         ],
     );
     assert!(request
-        .validated_authorizations(conflict_detail_settings().structural_limits().unwrap())
+        .validated_authorizations(settlement_settings().structural_limits().unwrap())
         .unwrap()
         .is_empty());
     request
 }
 
 /// A request without a `PAY_TO_UNLOCK` input has no expiry, so a record for
-/// it could never be deleted. The mint answers it as before: 11008 without
-/// a list, and no record.
+/// it could never be deleted. The mint answers 11008 without a list, and
+/// writes no record.
 #[tokio::test]
 async fn test_ctf_settlement_request_without_a_locked_input_gets_the_plain_refusal() {
     let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
@@ -531,7 +528,7 @@ async fn test_ctf_settlement_request_without_a_locked_input_gets_the_plain_refus
     let _melt = hold_melt(&mint, reused).await;
 
     let error = mint
-        .process_ctf_settlement(&request, conflict_detail_settings(), now)
+        .process_ctf_settlement(&request, settlement_settings(), now)
         .await
         .expect_err("a reused output cannot commit");
     assert!(
@@ -541,43 +538,57 @@ async fn test_ctf_settlement_request_without_a_locked_input_gets_the_plain_refus
     assert_eq!(recorded_outcome(&mint, &request).await, None);
 }
 
-/// With output conflict detail off, the mint answers as before this feature.
-///
-/// The refusal is 11008 without a list, it writes no record, and a copy of
-/// the request commits after the other operation is removed.
+/// The settings that the mint serves in `/v1/info` are the settings of the
+/// request handler. No field and no setting turns the conflict list on.
 #[tokio::test]
-async fn test_ctf_settlement_without_output_conflict_detail_answers_as_before() {
+async fn test_ctf_settlement_lists_conflicts_with_the_advertised_settings_alone() {
     let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
         .await
         .unwrap();
+    let mut info = mint.mint_info().await.unwrap();
+    info.nuts.nut_ctf_split_merge = Some(
+        NutCtfSplitMergeSettings::single_party(true)
+            .with_multi_party(settlement_settings())
+            .unwrap(),
+    );
+    mint.set_mint_info(info).await.unwrap();
+    let info = mint.mint_info().await.unwrap();
+    let advertised = serde_json::to_value(&info).unwrap()["nuts"]["CTF-split-merge"].clone();
+    assert_eq!(advertised["idempotent_retries"], true);
+    assert!(
+        advertised.get("output_conflict_detail").is_none(),
+        "{advertised}"
+    );
+    let settings = info
+        .nuts
+        .nut_ctf_split_merge
+        .and_then(|settings| settings.multi_party())
+        .expect("multi-party settlement");
+
     let now = unix_time();
     let fixture = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
     let request = &fixture.request;
-    let melt = hold_melt(&mint, vec![bare_seller_output(&fixture)]).await;
-    let off = NutCtfSettlementSettings::new(8, 32, 64, 64 * 1024, 3600, 32).unwrap();
+    let reused = bare_seller_output(&fixture);
+    let _melt = hold_melt(&mint, vec![reused.clone()]).await;
 
-    let error = mint
-        .process_ctf_settlement(request, off, now)
-        .await
-        .expect_err("a pending output cannot commit");
-    assert!(
-        matches!(error, CtfSettlementError::Mint(Error::DuplicateOutputs)),
-        "{error:?}"
+    let conflicts = match mint.process_ctf_settlement(request, settings, now).await {
+        Err(CtfSettlementError::OutputConflict(conflicts)) => conflicts,
+        other => panic!("expected an output conflict refusal, got {other:?}"),
+    };
+    assert_eq!(
+        conflicts.outputs(),
+        &[conflict(&reused, OutputConflictState::Pending)]
     );
-    assert_eq!(recorded_outcome(&mint, request).await, None);
-
-    compensate_held_melt(&mint, melt).await;
-    commit_and_check_with(&mint, request, off, now, 1).await;
+    assert_conflict_record(&mint, request, &conflicts, now + OFFER_LIFETIME_SECONDS).await;
 }
 
-/// A record stays binding after the operator turns the capability off.
+/// A record stays binding after the other operation is removed.
 ///
-/// The record was written with the capability on. Until cleanup, an identical
-/// copy is refused with its list also with the capability off, after the
-/// other operation is removed. After cleanup the copy can only take the
-/// expiry path, because cleanup waits past the request's cutoff.
+/// Until cleanup, an identical copy is refused with the recorded list. After
+/// cleanup the copy can only take the expiry path, because cleanup waits past
+/// the request's cutoff.
 #[tokio::test]
-async fn test_ctf_settlement_record_stays_binding_after_the_capability_is_turned_off() {
+async fn test_ctf_settlement_record_stays_binding_after_the_other_operation_is_removed() {
     let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
         .await
         .unwrap();
@@ -591,16 +602,13 @@ async fn test_ctf_settlement_record_stays_binding_after_the_capability_is_turned
     compensate_held_melt(&mint, melt).await;
     assert_outputs_have_no_rows(&mint, std::slice::from_ref(&reused)).await;
 
-    let off = settlement_settings();
-    assert!(!off.output_conflict_detail());
     let completed_before = completed_swap_count(&mint).await;
     for at in [now, cutoff - 1] {
-        match mint.process_ctf_settlement(request, off, at).await {
-            Err(CtfSettlementError::OutputConflict(refused)) => {
-                assert_eq!(refused, conflicts, "at {at}")
-            }
-            other => panic!("at {at}: the record must still refuse the copy, got {other:?}"),
-        }
+        assert_eq!(
+            refuse_with_conflicts(&mint, request, at).await,
+            conflicts,
+            "at {at}"
+        );
     }
     assert_no_other_writes(
         &mint,
@@ -615,7 +623,7 @@ async fn test_ctf_settlement_record_stays_binding_after_the_capability_is_turned
     mint.run_maintenance(deleted_at).await;
     assert_eq!(recorded_outcome(&mint, request).await, None);
     let error = mint
-        .process_ctf_settlement(request, off, deleted_at)
+        .process_ctf_settlement(request, settlement_settings(), deleted_at)
         .await
         .expect_err("an expired request cannot commit");
     assert!(
@@ -643,7 +651,7 @@ async fn test_ctf_settlement_conflict_inserted_after_the_scan_is_found_on_retry(
     // The first scan sees no row, as when the other insert commits after it.
     set_fail_for("MISS_OUTPUT_CONFLICT_SCAN_ONCE");
     let result = mint
-        .process_ctf_settlement(request, conflict_detail_settings(), now)
+        .process_ctf_settlement(request, settlement_settings(), now)
         .await;
     clear_fail_for("MISS_OUTPUT_CONFLICT_SCAN_ONCE");
 
@@ -676,7 +684,7 @@ async fn test_ctf_settlement_conflict_missed_in_every_attempt_is_not_definitive(
 
     set_fail_for("MISS_OUTPUT_CONFLICT_SCAN");
     let result = mint
-        .process_ctf_settlement(request, conflict_detail_settings(), now)
+        .process_ctf_settlement(request, settlement_settings(), now)
         .await;
     clear_fail_for("MISS_OUTPUT_CONFLICT_SCAN");
 
