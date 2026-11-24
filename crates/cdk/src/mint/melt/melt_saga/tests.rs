@@ -5129,3 +5129,80 @@ async fn test_melt_budget_refuses_external_payment_and_releases_inputs() {
     ));
     assert_proofs_state(&mint, &more.ys().unwrap(), None).await;
 }
+
+/// The refusal has the wire code of an amount outside the limits, not of a
+/// disabled mint. It leaves no state: the identical request pays later.
+#[tokio::test]
+async fn test_melt_budget_refusal_has_the_limit_code_and_leaves_no_state() {
+    let started = create_test_mint().await.unwrap();
+    let quote = create_test_melt_quote(&started, Amount::from(4_000)).await;
+    let outflow = quote.amount().value() + quote.fee_reserve().value();
+    let limits = |per_hour| crate::mint::StateLimits {
+        melt_budgets: std::collections::HashMap::from([(
+            CurrencyUnit::Sat,
+            crate::mint::MeltBudget {
+                per_hour,
+                per_day: 10 * outflow,
+            },
+        )]),
+        ..Default::default()
+    };
+    let without_unit = crate::mint::StateLimits {
+        melt_budgets: std::collections::HashMap::from([(
+            CurrencyUnit::Msat,
+            crate::mint::MeltBudget {
+                per_hour: u64::MAX,
+                per_day: u64::MAX,
+            },
+        )]),
+        ..Default::default()
+    };
+    let proofs = mint_test_proofs(&started, Amount::from(10_000))
+        .await
+        .unwrap();
+    let ys = proofs.ys().unwrap();
+    let keyset = started
+        .keysets()
+        .keysets
+        .into_iter()
+        .find(|keyset| keyset.unit == CurrencyUnit::Sat && keyset.active)
+        .unwrap();
+    let change = cdk_common::nuts::PreMintSecrets::blank(keyset.id, Amount::from(64))
+        .unwrap()
+        .blinded_messages();
+    let request = MeltRequest::new(quote.id.clone(), proofs, Some(change));
+
+    for limits in [limits(outflow - 1), without_unit] {
+        let mint = started.clone().with_state_limits(limits);
+        let refused = mint
+            .melt(&request)
+            .await
+            .expect("the setup is accepted")
+            .await
+            .expect_err("a melt above the budget is refused");
+        let answer = cdk_common::error::ErrorResponse::from(refused);
+        assert_eq!(answer.code.to_code(), 11006);
+        assert_eq!(
+            answer.detail,
+            "Melt outflow budget exceeded; try again later"
+        );
+
+        assert_proofs_state(&mint, &ys, None).await;
+        assert_eq!(
+            mint.check_melt_quote(&quote.id).await.unwrap().state(),
+            MeltQuoteState::Unpaid
+        );
+        assert!(mint
+            .localstore
+            .get_incomplete_sagas(OperationKind::Melt)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // The same inputs and change outputs are free again.
+    let mint = started.with_state_limits(limits(outflow));
+    let paid = mint.melt(&request).await.unwrap().await.unwrap();
+    assert_eq!(paid.state(), MeltQuoteState::Paid);
+    assert_proofs_state(&mint, &ys, Some(State::Spent)).await;
+}

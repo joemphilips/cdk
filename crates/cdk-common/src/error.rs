@@ -1146,9 +1146,11 @@ impl From<Error> for ErrorResponse {
                 code: ErrorCode::MintingDisabled,
                 detail: err.to_string(),
             },
-            // The same code as a disabled melt: no state changed, and a later retry can pass.
+            // The amount is outside what the mint pays out in the period. The melt is enabled
+            // and no payment started. The setup is compensated first, but that can fail. So a
+            // wallet can release its inputs only after it reads the quote as UNPAID.
             Error::MeltBudgetExceeded => ErrorResponse {
-                code: ErrorCode::MintingDisabled,
+                code: ErrorCode::AmountOutofLimitRange,
                 detail: err.to_string(),
             },
             Error::BlindedMessageAlreadySigned => ErrorResponse {
