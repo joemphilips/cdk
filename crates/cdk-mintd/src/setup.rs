@@ -449,6 +449,65 @@ mod ldk_node_tests {
             "Unknown LDK Node chain_source_type: unknown"
         );
     }
+
+    /// `cdk-mintd config rollback` can select the embedded backend again after
+    /// the node state moved. The setup of that configuration must refuse.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn setup_refuses_a_storage_directory_with_a_cutover_record() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "cdk-mintd-cutover-record-{}",
+            cdk_common::QuoteId::new()
+        ));
+        std::fs::create_dir(&storage_dir).expect("create the storage directory");
+        let record = storage_dir.join("CUTOVER.json");
+        std::fs::write(&record, "{}").expect("write the cutover record");
+
+        let settings = Settings {
+            ldk_node: Some(config::LdkNode {
+                bitcoin_network: Some("regtest".to_string()),
+                chain_source_type: Some("esplora".to_string()),
+                esplora_url: Some("http://127.0.0.1:1".to_string()),
+                storage_dir_path: Some(storage_dir.to_string_lossy().to_string()),
+                ldk_node_mnemonic: Some(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon about"
+                        .to_string(),
+                ),
+                ldk_node_port: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let kv_store = cdk_sqlite::mint::memory::empty()
+            .await
+            .expect("in-memory store");
+
+        let result = settings
+            .ldk_node
+            .as_ref()
+            .expect("ldk_node settings")
+            .setup(
+                &settings,
+                CurrencyUnit::Msat,
+                None,
+                Path::new("."),
+                Some(Arc::new(kv_store)),
+            )
+            .await;
+        let files: Vec<_> = std::fs::read_dir(&storage_dir)
+            .expect("list the storage directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .collect();
+        std::fs::remove_dir_all(&storage_dir).expect("remove the storage directory");
+
+        let error = result.expect_err("setup must refuse the cutover record");
+        assert!(
+            error.to_string().contains(&record.display().to_string()),
+            "the error must name the record, got: {error}"
+        );
+        assert_eq!(files, [record], "a refused setup must not create a node");
+    }
 }
 
 #[cfg(feature = "ldk-node")]

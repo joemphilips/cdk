@@ -1,5 +1,7 @@
 //! LDK Node Errors
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 /// LDK Node Error
@@ -8,6 +10,26 @@ pub enum Error {
     /// Invalid web UI access configuration
     #[error("Invalid web UI access configuration: {0}")]
     WebAccess(String),
+
+    /// The storage directory has a cutover record
+    #[error(
+        "The cutover record {} exists: the state of this node moved to another backend. \
+         The embedded node does not start. Do not remove the record to start it",
+        record.display()
+    )]
+    CutoverRecord {
+        /// Path of the record
+        record: PathBuf,
+    },
+
+    /// The lookup of the cutover record failed
+    #[error("Could not check for the cutover record {}: {source}", record.display())]
+    CutoverRecordUnchecked {
+        /// Path of the record
+        record: PathBuf,
+        /// Cause
+        source: std::io::Error,
+    },
 
     /// LDK Node error
     #[error("LDK Node error: {0}")]

@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,6 +37,7 @@ use tracing::instrument;
 use crate::error::Error;
 use crate::log::StdoutLogWriter;
 
+mod cutover;
 mod error;
 mod log;
 mod web;
@@ -322,8 +324,11 @@ impl CdkLdkNodeBuilder {
     /// Builds the [`CdkLdkNode`] instance
     ///
     /// # Errors
-    /// Returns an error if the LDK node builder fails to create the node
+    /// Returns an error if the storage directory has a cutover record, or if
+    /// the LDK node builder fails to create the node
     pub fn build(self) -> Result<CdkLdkNode, Error> {
+        cutover::refuse_after_cutover(Path::new(&self.storage_dir_path))?;
+
         let mut ldk = Builder::new();
         ldk.set_network(self.network);
         tracing::info!("Storage dir of node is {}", self.storage_dir_path);

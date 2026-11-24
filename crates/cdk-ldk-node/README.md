@@ -149,6 +149,15 @@ Private opening does not change existing public channels, disable forwarding
 globally, or change invoice route-hint selection. Receiving over a private
 channel also requires sufficient inbound liquidity and a discoverable route.
 
+## Cutover Record
+
+The embedded node does not start when its storage directory holds a file
+`CUTOVER.json`. The move of the node state to another backend writes that file.
+After the move, the state in the directory is stale, and a directory without
+state gives a new node with the same keys. Both can lose channel funds. The
+content of the file does not matter. A failed lookup of the file also refuses
+the start.
+
 ## Basic Configuration
 
 ### Config File Example
