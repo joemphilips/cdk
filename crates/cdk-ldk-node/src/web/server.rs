@@ -158,7 +158,7 @@ mod tests {
 
     /// The mint signals of the operator tools read these cards by this exact form.
     #[tokio::test]
-    async fn the_dashboard_shows_the_ready_channel_balance_beside_the_total() {
+    async fn the_dashboard_shows_the_ready_and_closing_balances_beside_the_total() {
         let (_storage, router) = test_router().await;
         let response = router
             .oneshot(operator(Request::get("/")).body(Body::empty()).unwrap())
@@ -172,7 +172,11 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        for label in ["Lightning Balance", "Ready Channel Balance"] {
+        for label in [
+            "Lightning Balance",
+            "Ready Channel Balance",
+            "Closing Channel Balance",
+        ] {
             let card = format!(
                 "<div class=\"metric-value\">₿0</div><div class=\"metric-label\">{label}</div>"
             );

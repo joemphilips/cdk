@@ -2,9 +2,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Html;
 use ldk_node::bitcoin::secp256k1::PublicKey;
+use ldk_node::lightning::chain::channelmonitor::BalanceSource;
 use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
-use ldk_node::{ChannelDetails, LightningBalance};
+use ldk_node::{ChannelDetails, LightningBalance, PendingSweepBalance};
 use maud::html;
 
 use crate::web::handlers::AppState;
@@ -145,6 +146,55 @@ fn ready_channel_balance_sats(channels: &[ChannelDetails], balances: &[Lightning
         .sum()
 }
 
+/// The funds of closed channels that the on-chain wallet does not count, in sats.
+///
+/// It covers an output of a force close from the first confirmation of the
+/// commitment transaction until the node broadcasts its sweep. LDK reports
+/// these two states only for a transaction in a block. An amount that the
+/// wallet can also count is not included, so that the sum of the ready, the
+/// closing and the on-chain balance counts no amount twice.
+fn closing_channel_balance_sats(
+    lightning_balances: &[LightningBalance],
+    sweeps: &[PendingSweepBalance],
+) -> u64 {
+    let awaiting_confirmations = lightning_balances.iter().map(|balance| match balance {
+        LightningBalance::ClaimableAwaitingConfirmations {
+            amount_satoshis,
+            source,
+            ..
+        } => match source {
+            // The output needs a sweep to the on-chain wallet. The exception is
+            // the penalty claim of a revoked commitment: LDK gives it the same
+            // source, and the wallet also counts it, for at most 6 blocks.
+            BalanceSource::HolderForceClosed | BalanceSource::CounterpartyForceClosed => {
+                *amount_satoshis
+            }
+            // The output pays to the on-chain wallet. LDK also reports this
+            // state when a peer spends an outpoint that never funded a channel.
+            BalanceSource::CoopClose => 0,
+            // The claim can pay to the on-chain wallet.
+            BalanceSource::Htlc => 0,
+        },
+        // The closing transaction has no confirmation, or the channel is open.
+        LightningBalance::ClaimableOnChannelClose { .. } => 0,
+        // The peer can still take these amounts, and the claim pays to the
+        // on-chain wallet.
+        LightningBalance::ContentiousClaimable { .. }
+        | LightningBalance::MaybeTimeoutClaimableHTLC { .. }
+        | LightningBalance::MaybePreimageClaimableHTLC { .. }
+        | LightningBalance::CounterpartyRevokedOutputClaimable { .. } => 0,
+    });
+    let sweeps = sweeps.iter().map(|sweep| match sweep {
+        PendingSweepBalance::PendingBroadcast {
+            amount_satoshis, ..
+        } => *amount_satoshis,
+        // The sweep transaction pays to the on-chain wallet.
+        PendingSweepBalance::BroadcastAwaitingConfirmation { .. }
+        | PendingSweepBalance::AwaitingThresholdConfirmations { .. } => 0,
+    });
+    awaiting_confirmations.chain(sweeps).sum()
+}
+
 pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
     let node = &state.node.inner;
 
@@ -190,6 +240,10 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
 
     let balances = node.list_balances();
     let ready_channel_balance = ready_channel_balance_sats(&channels, &balances.lightning_balances);
+    let closing_channel_balance = closing_channel_balance_sats(
+        &balances.lightning_balances,
+        &balances.pending_balances_from_channel_closures,
+    );
 
     // Calculate payment metrics for dashboard
     let all_payments = node.list_payments_with_filter(|_| true);
@@ -209,6 +263,10 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
                 div class="metric-card" {
                     div class="metric-value" { (format_sats_as_btc(ready_channel_balance)) }
                     div class="metric-label" { "Ready Channel Balance" }
+                }
+                div class="metric-card" {
+                    div class="metric-value" { (format_sats_as_btc(closing_channel_balance)) }
+                    div class="metric-label" { "Closing Channel Balance" }
                 }
                 div class="metric-card" {
                     div class="metric-value" { (format_sats_as_btc(balances.total_onchain_balance_sats)) }
@@ -370,8 +428,10 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
 
 #[cfg(test)]
 mod tests {
+    use ldk_node::bitcoin::hashes::Hash;
+    use ldk_node::bitcoin::{BlockHash, Txid};
     use ldk_node::config::ChannelConfig;
-    use ldk_node::lightning_types::payment::PaymentHash;
+    use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
     use ldk_node::UserChannelId;
 
     use super::*;
@@ -574,5 +634,146 @@ mod tests {
             ),
             200_030
         );
+    }
+
+    /// The balance of a channel whose closing transaction has a confirmation.
+    fn closed_balance(source: BalanceSource, amount_satoshis: u64) -> LightningBalance {
+        LightningBalance::ClaimableAwaitingConfirmations {
+            channel_id: CHANNEL,
+            counterparty_node_id: peer(PEER),
+            amount_satoshis,
+            confirmation_height: 144,
+            source,
+        }
+    }
+
+    /// The three states of the sweep of one output.
+    fn sweep_states(amount_satoshis: u64) -> [PendingSweepBalance; 3] {
+        let channel_id = Some(CHANNEL);
+        let latest_spending_txid = Txid::all_zeros();
+        [
+            PendingSweepBalance::PendingBroadcast {
+                channel_id,
+                amount_satoshis,
+            },
+            PendingSweepBalance::BroadcastAwaitingConfirmation {
+                channel_id,
+                latest_broadcast_height: 150,
+                latest_spending_txid,
+                amount_satoshis,
+            },
+            PendingSweepBalance::AwaitingThresholdConfirmations {
+                channel_id,
+                latest_spending_txid,
+                confirmation_hash: BlockHash::all_zeros(),
+                confirmation_height: 151,
+                amount_satoshis,
+            },
+        ]
+    }
+
+    #[test]
+    fn no_channel_close_counts_nothing() {
+        assert_eq!(closing_channel_balance_sats(&[], &[]), 0);
+    }
+
+    /// Before the confirmation, the monitor reports the same balance as for an
+    /// open channel, also when the node lists the channel no more. The dropped
+    /// channel whose funding never confirmed is in this state without an end.
+    #[test]
+    fn a_close_without_a_confirmation_counts_nothing() {
+        for case in [
+            "a cooperative close",
+            "a force close",
+            "a dropped unfunded channel",
+        ] {
+            let balance = open_balance(CHANNEL, 250_000);
+            assert_eq!(closing_channel_balance_sats(&[balance], &[]), 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_confirmed_force_close_of_either_side_counts() {
+        for (case, source) in [
+            ("this node", BalanceSource::HolderForceClosed),
+            ("the peer", BalanceSource::CounterpartyForceClosed),
+        ] {
+            let balance = closed_balance(source, 249_000);
+            assert_eq!(
+                closing_channel_balance_sats(&[balance], &[]),
+                249_000,
+                "closed by {case}"
+            );
+        }
+    }
+
+    /// The output pays to an address of the on-chain wallet, which counts it.
+    /// LDK also reports this state for an unfunded channel, when the peer
+    /// spends the outpoint that it named as the funding output.
+    #[test]
+    fn a_confirmed_cooperative_close_counts_nothing() {
+        let balance = closed_balance(BalanceSource::CoopClose, 250_000);
+        assert_eq!(closing_channel_balance_sats(&[balance], &[]), 0);
+    }
+
+    /// Only an output without a sweep transaction is outside of the on-chain
+    /// wallet. A sweep transaction pays to that wallet.
+    #[test]
+    fn an_output_counts_until_its_sweep_is_broadcast() {
+        let [before, broadcast, confirmed] = sweep_states(248_000);
+        assert_eq!(closing_channel_balance_sats(&[], &[before]), 248_000);
+        assert_eq!(closing_channel_balance_sats(&[], &[broadcast]), 0);
+        assert_eq!(closing_channel_balance_sats(&[], &[confirmed]), 0);
+    }
+
+    #[test]
+    fn the_htlcs_and_penalties_of_a_closed_channel_count_nothing() {
+        let channel_id = CHANNEL;
+        let counterparty_node_id = peer(PEER);
+        let payment_hash = PaymentHash([3; 32]);
+        let balances = [
+            closed_balance(BalanceSource::Htlc, 900),
+            LightningBalance::ContentiousClaimable {
+                channel_id,
+                counterparty_node_id,
+                amount_satoshis: 900,
+                timeout_height: 200,
+                payment_hash,
+                payment_preimage: PaymentPreimage([4; 32]),
+            },
+            LightningBalance::MaybeTimeoutClaimableHTLC {
+                channel_id,
+                counterparty_node_id,
+                amount_satoshis: 900,
+                claimable_height: 200,
+                payment_hash,
+                outbound_payment: false,
+            },
+            LightningBalance::MaybePreimageClaimableHTLC {
+                channel_id,
+                counterparty_node_id,
+                amount_satoshis: 900,
+                expiry_height: 200,
+                payment_hash,
+            },
+            LightningBalance::CounterpartyRevokedOutputClaimable {
+                channel_id,
+                counterparty_node_id,
+                amount_satoshis: 900,
+            },
+        ];
+        assert_eq!(closing_channel_balance_sats(&balances, &[]), 0);
+    }
+
+    /// The two cards never count one amount twice.
+    #[test]
+    fn the_ready_and_closing_balances_do_not_overlap() {
+        let closed = closed_balance(BalanceSource::HolderForceClosed, 249_000);
+        let other = open_balance(OTHER_CHANNEL, 100_000);
+        let balances = [closed, other];
+        // The node can list the closed channel for a short time.
+        let channels = [ready_channel(CHANNEL), ready_channel(OTHER_CHANNEL)];
+        assert_eq!(ready_channel_balance_sats(&channels, &balances), 100_000);
+        assert_eq!(closing_channel_balance_sats(&balances, &[]), 249_000);
     }
 }
