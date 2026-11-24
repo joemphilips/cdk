@@ -156,6 +156,30 @@ mod tests {
         )
     }
 
+    /// The mint signals of the operator tools read these cards by this exact form.
+    #[tokio::test]
+    async fn the_dashboard_shows_the_ready_channel_balance_beside_the_total() {
+        let (_storage, router) = test_router().await;
+        let response = router
+            .oneshot(operator(Request::get("/")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            to_bytes(response.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for label in ["Lightning Balance", "Ready Channel Balance"] {
+            let card = format!(
+                "<div class=\"metric-value\">₿0</div><div class=\"metric-label\">{label}</div>"
+            );
+            assert_eq!(html.matches(&card).count(), 1, "{label}");
+        }
+    }
+
     async fn csrf_session(router: &Router) -> (String, String) {
         let response = router
             .clone()

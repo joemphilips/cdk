@@ -1,7 +1,10 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Html;
+use ldk_node::bitcoin::secp256k1::PublicKey;
+use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::{ChannelDetails, LightningBalance};
 use maud::html;
 
 use crate::web::handlers::AppState;
@@ -87,6 +90,61 @@ fn calculate_usage_metrics(payments: &[ldk_node::payment::PaymentDetails]) -> Us
     metrics
 }
 
+/// The Lightning balance of the ready channels, in sats.
+///
+/// `total_lightning_balance_sats` covers every channel monitor. A monitor
+/// exists before the funding transaction confirms, and it stays when the peer
+/// drops the channel. Thus a peer can add a push that never confirms to that
+/// total. This sum covers only a channel that the node lists as ready and with
+/// a confirmation. A connected peer is not necessary.
+fn ready_channel_balance_sats(channels: &[ChannelDetails], balances: &[LightningBalance]) -> u64 {
+    let is_ready = |channel_id: &ChannelId, counterparty_node_id: &PublicKey| {
+        channels.iter().any(|channel| {
+            channel.channel_id == *channel_id
+                && channel.counterparty_node_id == *counterparty_node_id
+                && channel.is_channel_ready
+                && channel.confirmations.is_some_and(|count| count >= 1)
+        })
+    };
+
+    balances
+        .iter()
+        .map(|balance| match balance {
+            // As in the total, a forwarded HTLC in flight still counts.
+            LightningBalance::ClaimableOnChannelClose {
+                channel_id,
+                counterparty_node_id,
+                amount_satoshis,
+                ..
+            }
+            | LightningBalance::MaybeTimeoutClaimableHTLC {
+                channel_id,
+                counterparty_node_id,
+                amount_satoshis,
+                outbound_payment: false,
+                ..
+            } => {
+                if is_ready(channel_id, counterparty_node_id) {
+                    *amount_satoshis
+                } else {
+                    0
+                }
+            }
+            // As in the total, these HTLCs do not count: the peer can still claim
+            // them, or this node does not know their preimage.
+            LightningBalance::MaybeTimeoutClaimableHTLC {
+                outbound_payment: true,
+                ..
+            }
+            | LightningBalance::MaybePreimageClaimableHTLC { .. } => 0,
+            // The commitment transaction is on chain: the channel is closed.
+            LightningBalance::ClaimableAwaitingConfirmations { .. }
+            | LightningBalance::ContentiousClaimable { .. }
+            | LightningBalance::CounterpartyRevokedOutputClaimable { .. } => 0,
+        })
+        .sum()
+}
+
 pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
     let node = &state.node.inner;
 
@@ -117,8 +175,9 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
                 (peers, connected)
             });
 
+    let channels = node.list_channels();
     let (num_active_channels, num_inactive_channels) =
-        node.list_channels()
+        channels
             .iter()
             .fold((0, 0), |(mut active, mut inactive), c| {
                 if c.is_usable {
@@ -130,6 +189,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
             });
 
     let balances = node.list_balances();
+    let ready_channel_balance = ready_channel_balance_sats(&channels, &balances.lightning_balances);
 
     // Calculate payment metrics for dashboard
     let all_payments = node.list_payments_with_filter(|_| true);
@@ -145,6 +205,10 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
                 div class="metric-card" {
                     div class="metric-value" { (format_sats_as_btc(balances.total_lightning_balance_sats)) }
                     div class="metric-label" { "Lightning Balance" }
+                }
+                div class="metric-card" {
+                    div class="metric-value" { (format_sats_as_btc(ready_channel_balance)) }
+                    div class="metric-label" { "Ready Channel Balance" }
                 }
                 div class="metric-card" {
                     div class="metric-value" { (format_sats_as_btc(balances.total_onchain_balance_sats)) }
@@ -302,4 +366,213 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
     Ok(Html(
         layout_with_status("Dashboard", content, is_running).into_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use ldk_node::config::ChannelConfig;
+    use ldk_node::lightning_types::payment::PaymentHash;
+    use ldk_node::UserChannelId;
+
+    use super::*;
+
+    const PEER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const OTHER_PEER: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    const CHANNEL: ChannelId = ChannelId([1; 32]);
+    const OTHER_CHANNEL: ChannelId = ChannelId([2; 32]);
+
+    fn peer(node_id: &str) -> PublicKey {
+        node_id.parse().expect("node ID")
+    }
+
+    /// A confirmed, ready channel with a connected peer.
+    fn ready_channel(channel_id: ChannelId) -> ChannelDetails {
+        ChannelDetails {
+            channel_id,
+            counterparty_node_id: peer(PEER),
+            funding_txo: None,
+            short_channel_id: Some(42),
+            outbound_scid_alias: None,
+            inbound_scid_alias: None,
+            channel_value_sats: 500_000,
+            unspendable_punishment_reserve: Some(5_000),
+            user_channel_id: UserChannelId(1),
+            feerate_sat_per_1000_weight: 253,
+            outbound_capacity_msat: 245_000_000,
+            inbound_capacity_msat: 245_000_000,
+            confirmations_required: Some(3),
+            confirmations: Some(6),
+            is_outbound: false,
+            is_channel_ready: true,
+            is_usable: true,
+            is_announced: false,
+            cltv_expiry_delta: None,
+            counterparty_unspendable_punishment_reserve: 5_000,
+            counterparty_outbound_htlc_minimum_msat: None,
+            counterparty_outbound_htlc_maximum_msat: None,
+            counterparty_forwarding_info_fee_base_msat: None,
+            counterparty_forwarding_info_fee_proportional_millionths: None,
+            counterparty_forwarding_info_cltv_expiry_delta: None,
+            next_outbound_htlc_limit_msat: 0,
+            next_outbound_htlc_minimum_msat: 0,
+            force_close_spend_delay: None,
+            inbound_htlc_minimum_msat: 1,
+            inbound_htlc_maximum_msat: None,
+            config: ChannelConfig::default(),
+        }
+    }
+
+    /// The balance that the channel monitor of an open channel reports.
+    fn open_balance(channel_id: ChannelId, amount_satoshis: u64) -> LightningBalance {
+        LightningBalance::ClaimableOnChannelClose {
+            channel_id,
+            counterparty_node_id: peer(PEER),
+            amount_satoshis,
+            transaction_fee_satoshis: 0,
+            outbound_payment_htlc_rounded_msat: 0,
+            outbound_forwarded_htlc_rounded_msat: 0,
+            inbound_claiming_htlc_rounded_msat: 0,
+            inbound_htlc_rounded_msat: 0,
+        }
+    }
+
+    #[test]
+    fn a_ready_channel_counts() {
+        assert_eq!(
+            ready_channel_balance_sats(
+                &[ready_channel(CHANNEL)],
+                &[open_balance(CHANNEL, 250_000)]
+            ),
+            250_000
+        );
+    }
+
+    #[test]
+    fn an_offline_confirmed_channel_counts() {
+        let offline = ChannelDetails {
+            is_usable: false,
+            ..ready_channel(CHANNEL)
+        };
+        assert_eq!(
+            ready_channel_balance_sats(&[offline], &[open_balance(CHANNEL, 250_000)]),
+            250_000
+        );
+    }
+
+    /// The monitor of an inbound channel reports the push before the funding
+    /// transaction confirms. The peer can open such a channel at no cost.
+    #[test]
+    fn an_inbound_pending_channel_with_a_push_counts_nothing() {
+        let pending = ChannelDetails {
+            short_channel_id: None,
+            confirmations: Some(0),
+            is_channel_ready: false,
+            is_usable: false,
+            ..ready_channel(OTHER_CHANNEL)
+        };
+        assert_eq!(
+            ready_channel_balance_sats(
+                &[ready_channel(CHANNEL), pending],
+                &[
+                    open_balance(CHANNEL, 250_000),
+                    open_balance(OTHER_CHANNEL, 249_000)
+                ],
+            ),
+            250_000
+        );
+    }
+
+    #[test]
+    fn each_condition_of_a_ready_channel_is_necessary() {
+        for (case, channel) in [
+            (
+                "confirmed, but not ready",
+                ChannelDetails {
+                    is_channel_ready: false,
+                    ..ready_channel(CHANNEL)
+                },
+            ),
+            (
+                "ready without a confirmation",
+                ChannelDetails {
+                    confirmations: Some(0),
+                    ..ready_channel(CHANNEL)
+                },
+            ),
+            (
+                "ready with an unknown confirmation count",
+                ChannelDetails {
+                    confirmations: None,
+                    ..ready_channel(CHANNEL)
+                },
+            ),
+        ] {
+            assert_eq!(
+                ready_channel_balance_sats(&[channel], &[open_balance(CHANNEL, 250_000)]),
+                0,
+                "{case}"
+            );
+        }
+    }
+
+    /// The peer dropped an unfunded channel: the node lists it no more, but its
+    /// monitor and the push stay.
+    #[test]
+    fn a_dropped_channel_whose_monitor_remains_counts_nothing() {
+        assert_eq!(
+            ready_channel_balance_sats(
+                &[ready_channel(CHANNEL)],
+                &[
+                    open_balance(CHANNEL, 250_000),
+                    open_balance(OTHER_CHANNEL, 249_000)
+                ],
+            ),
+            250_000
+        );
+    }
+
+    #[test]
+    fn a_monitor_of_another_peer_counts_nothing() {
+        let other = ChannelDetails {
+            counterparty_node_id: peer(OTHER_PEER),
+            ..ready_channel(CHANNEL)
+        };
+        assert_eq!(
+            ready_channel_balance_sats(&[other], &[open_balance(CHANNEL, 250_000)]),
+            0
+        );
+    }
+
+    /// The amounts of one channel follow `total_lightning_balance_sats`: an
+    /// in-flight HTLC of a payment of this node does not count, a forwarded one does.
+    #[test]
+    fn in_flight_htlcs_count_as_in_the_total() {
+        let htlc =
+            |amount_satoshis, outbound_payment| LightningBalance::MaybeTimeoutClaimableHTLC {
+                channel_id: CHANNEL,
+                counterparty_node_id: peer(PEER),
+                amount_satoshis,
+                claimable_height: 100,
+                payment_hash: PaymentHash([3; 32]),
+                outbound_payment,
+            };
+        assert_eq!(
+            ready_channel_balance_sats(
+                &[ready_channel(CHANNEL)],
+                &[
+                    open_balance(CHANNEL, 200_000),
+                    htlc(7_000, true),
+                    htlc(30, false),
+                    LightningBalance::MaybePreimageClaimableHTLC {
+                        channel_id: CHANNEL,
+                        counterparty_node_id: peer(PEER),
+                        amount_satoshis: 900,
+                        expiry_height: 100,
+                        payment_hash: PaymentHash([4; 32]),
+                    },
+                ],
+            ),
+            200_030
+        );
+    }
 }
