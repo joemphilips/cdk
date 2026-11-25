@@ -836,6 +836,58 @@ async fn test_postgres_ctf_settlement_conflict_records_have_a_cap() {
     mint.stop().await.unwrap();
 }
 
+/// A record answers at the cap, also when only the record still refuses the
+/// request: the cap limits new records, not the effect of a stored one.
+#[tokio::test]
+async fn test_ctf_settlement_conflict_record_answers_at_the_record_cap() {
+    let now = unix_time();
+    let cutoff = now + OFFER_LIFETIME_SECONDS;
+    let with_cap = |mint: &Mint, max_output_conflict_records| {
+        mint.clone().with_state_limits(StateLimits {
+            max_output_conflict_records,
+            ..StateLimits::default()
+        })
+    };
+    let mint = create_test_mint_with_unit(CurrencyUnit::Sat, 1)
+        .await
+        .unwrap();
+    let mint = with_cap(&mint, 1);
+    let fixture = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
+    let request = &fixture.request;
+    let reused = bare_seller_output(&fixture);
+    let melt = hold_melt(&mint, vec![reused.clone()]).await;
+    let conflicts = refuse_with_conflicts(&mint, request, now).await;
+    assert_conflict_record(&mint, request, &conflicts, cutoff).await;
+
+    // The mint is at its cap: another request gets no record.
+    let other = two_party_merge_fixture(&mint, now, LockedSeller::Standard, 8).await;
+    let _other_melt = hold_melt(&mint, vec![bare_seller_output(&other)]).await;
+    refuse_without_record(&mint, &other.request, now).await;
+
+    compensate_held_melt(&mint, melt).await;
+    assert_outputs_have_no_rows(&mint, std::slice::from_ref(&reused)).await;
+    let completed_before = completed_swap_count(&mint).await;
+    let signing_before = mint.blind_sign_attempts();
+    // Also above the cap, after an operator lowered it.
+    for cap in [1, 0] {
+        let mint = with_cap(&mint, cap);
+        assert_eq!(
+            refuse_with_conflicts(&mint, request, now).await,
+            conflicts,
+            "cap {cap}"
+        );
+        assert_conflict_record(&mint, request, &conflicts, cutoff).await;
+    }
+    assert_eq!(mint.blind_sign_attempts(), signing_before);
+    assert_no_other_writes(
+        &mint,
+        request,
+        std::slice::from_ref(&reused),
+        completed_before,
+    )
+    .await;
+}
+
 /// A refusal without a record is not definitive: the request commits after the
 /// other operation is removed.
 #[tokio::test]

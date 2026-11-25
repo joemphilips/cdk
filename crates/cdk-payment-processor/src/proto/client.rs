@@ -17,7 +17,7 @@ use futures::{Stream, StreamExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::InterceptedService;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{async_trait, Request, Status};
 use tracing::instrument;
 
@@ -32,13 +32,16 @@ use crate::proto::{
 ///
 /// Every call has this deadline, except the send. The result of a send that is
 /// dropped is unknown, so only its own answer can end it. For the event stream,
-/// the deadline covers the opening of the stream, not the stream.
+/// the deadline covers the opening of the stream, not the stream. Each of the
+/// two connections of [`PaymentProcessorClient::new`] has the deadline too.
 ///
 /// The bound is above the 10 seconds after which the mint itself stops a melt
 /// status check, so it does not change that check. It is below 30 seconds, a
 /// usual limit of an HTTP client or a proxy in front of the mint, so a wallet
 /// gets an answer of the mint.
 pub(super) const CALL_DEADLINE: Duration = Duration::from_secs(15);
+
+const NO_ANSWER: &str = "the payment processor did not answer within the call deadline";
 
 /// Payment Processor
 #[derive(Clone)]
@@ -113,11 +116,11 @@ impl PaymentProcessorClient {
             cdk_common::PAYMENT_PROCESSOR_PROTOCOL_VERSION,
         );
         let inner = CdkPaymentProcessorClient::with_interceptor(
-            endpoint.connect().await?,
+            connect(&endpoint).await?,
             interceptor.clone(),
         );
         let send =
-            CdkPaymentProcessorClient::with_interceptor(endpoint.connect().await?, interceptor);
+            CdkPaymentProcessorClient::with_interceptor(connect(&endpoint).await?, interceptor);
 
         Ok(Self {
             inner,
@@ -140,11 +143,18 @@ impl PaymentProcessorClient {
     {
         match tokio::time::timeout(self.call_deadline, call).await {
             Ok(result) => result,
-            Err(_) => Err(Status::deadline_exceeded(
-                "the payment processor did not answer within the call deadline",
-            )),
+            Err(_) => Err(Status::deadline_exceeded(NO_ANSWER)),
         }
     }
+}
+
+/// Connect with the deadline. The kernel accepts a connection for a stopped
+/// processor, so without it the TLS handshake waits without an end.
+async fn connect(endpoint: &Endpoint) -> anyhow::Result<Channel> {
+    let channel = tokio::time::timeout(CALL_DEADLINE, endpoint.connect())
+        .await
+        .map_err(|_| anyhow!(NO_ANSWER))??;
+    Ok(channel)
 }
 
 fn load_mtls_config(tls_dir: &Path) -> anyhow::Result<ClientTlsConfig> {
@@ -578,7 +588,7 @@ impl MintPayment for PaymentProcessorClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -587,10 +597,10 @@ mod tests {
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-    struct TestDirectory(PathBuf);
+    pub(in crate::proto) struct TestDirectory(PathBuf);
 
     impl TestDirectory {
-        fn new() -> Self {
+        pub(in crate::proto) fn new() -> Self {
             let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "cdk-payment-processor-mtls-{}-{sequence}",
@@ -600,7 +610,7 @@ mod tests {
             Self(path)
         }
 
-        fn path(&self) -> &Path {
+        pub(in crate::proto) fn path(&self) -> &Path {
             &self.0
         }
     }

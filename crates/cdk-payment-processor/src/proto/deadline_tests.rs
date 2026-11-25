@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,9 +46,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::Server;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
+use super::client::tests::TestDirectory;
 use super::client::{PaymentProcessorClient, CALL_DEADLINE};
 use super::server::PaymentProcessorServer;
 use crate::proto;
@@ -481,6 +483,18 @@ impl Drop for TestServer {
 
 impl TestServer {
     fn start() -> Self {
+        Self::start_on(Server::builder())
+    }
+
+    fn start_with_tls(tls: &TestDirectory) -> Self {
+        let read = |name| std::fs::read(tls.path().join(name)).expect("read a TLS file");
+        let config = ServerTlsConfig::new()
+            .identity(Identity::from_pem(read("server.pem"), read("server.key")))
+            .client_ca_root(Certificate::from_pem(read("ca.pem")));
+        Self::start_on(Server::builder().tls_config(config).expect("TLS server"))
+    }
+
+    fn start_on(mut builder: Server) -> Self {
         let (processor, events) = Processor::new();
         let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("address"))
             .expect("bind a loopback port");
@@ -498,7 +512,7 @@ impl TestServer {
             ),
         );
         let task = tokio::spawn(async move {
-            Server::builder()
+            builder
                 .add_service(service)
                 .serve_with_incoming(incoming)
                 .await
@@ -586,6 +600,131 @@ fn assert_deadline<T>(call: Call, result: Result<T, payment::Error>) {
 async fn a_client_has_the_default_deadline() {
     let server = TestServer::start();
     assert_eq!(server.client().await.call_deadline, CALL_DEADLINE);
+}
+
+/// A certificate that each side uses for itself and trusts.
+fn mutual_tls_directory() -> TestDirectory {
+    let tls = TestDirectory::new();
+    let output = Command::new("openssl")
+        .current_dir(tls.path())
+        .args(["req", "-x509", "-newkey", "ec", "-nodes", "-days", "1"])
+        .args(["-pkeyopt", "ec_paramgen_curve:prime256v1"])
+        .args([
+            "-subj",
+            "/CN=test",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+        ])
+        .args(["-addext", "basicConstraints=critical,CA:FALSE"])
+        .args(["-keyout", "server.key", "-out", "server.pem"])
+        .output()
+        .expect("openssl must be available for TLS tests");
+    assert!(
+        output.status.success(),
+        "openssl failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (from, to) in [
+        ("server.pem", "ca.pem"),
+        ("server.pem", "client.pem"),
+        ("server.key", "client.key"),
+    ] {
+        std::fs::copy(tls.path().join(from), tls.path().join(to)).expect("copy a TLS file");
+    }
+    tls
+}
+
+/// A loopback listener that passes the first connections on to the server. It
+/// accepts each later one and never answers it, as a stopped process does.
+struct SilentListener {
+    port: u16,
+    accepted: watch::Receiver<usize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SilentListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl SilentListener {
+    async fn start(upstream: u16, answered: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let (count, accepted) = watch::channel(0);
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            let mut silent = Vec::new();
+            while let Ok((mut client, _)) = listener.accept().await {
+                if *count.borrow() < answered {
+                    connections.spawn(async move {
+                        let mut server = TcpStream::connect(("127.0.0.1", upstream)).await?;
+                        tokio::io::copy_bidirectional(&mut client, &mut server).await
+                    });
+                } else {
+                    silent.push(client);
+                }
+                count.send_modify(|count| *count += 1);
+            }
+        });
+        Self {
+            port,
+            accepted,
+            task,
+        }
+    }
+}
+
+/// The client waits for the TLS handshake of each of its two connections.
+#[tokio::test]
+async fn a_connection_without_an_answer_ends_at_the_deadline() {
+    let tls = mutual_tls_directory();
+    let server = TestServer::start_with_tls(&tls);
+    for answered in [0, 1] {
+        let mut listener = SilentListener::start(server.port, answered).await;
+        let started = tokio::time::Instant::now();
+        let connect = tokio::spawn(PaymentProcessorClient::new(
+            "127.0.0.1",
+            listener.port,
+            Some(tls.path().to_path_buf()),
+        ));
+        within(
+            "the connection",
+            listener.accepted.wait_for(|count| *count > answered),
+        )
+        .await
+        .expect("the listener lives");
+
+        // Nothing answers from here, so only the clock can end the wait.
+        tokio::time::pause();
+        let result = within("the silent connection", connect)
+            .await
+            .expect("connect task");
+        let elapsed = started.elapsed();
+        tokio::time::resume();
+
+        let error = result.expect_err("a connection without an answer must fail");
+        assert!(
+            error.to_string().contains("call deadline"),
+            "connection {answered}: the error must name the deadline, got: {error}"
+        );
+        assert!(
+            elapsed >= CALL_DEADLINE,
+            "connection {answered} ended after {elapsed:?}"
+        );
+    }
+
+    let listener = SilentListener::start(server.port, 2).await;
+    let client = within(
+        "the answered connections",
+        PaymentProcessorClient::new("127.0.0.1", listener.port, Some(tls.path().to_path_buf())),
+    )
+    .await
+    .expect("connect");
+    within("a call", client.get_settings())
+        .await
+        .expect("the processor answers");
 }
 
 #[tokio::test]
