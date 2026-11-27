@@ -427,7 +427,7 @@ impl LocalCaddy {
             std::fs::create_dir(directory.join(name)).unwrap();
         }
         let configuration = directory.join("Caddyfile");
-        std::fs::write(&configuration, format!("{{\n admin off\n auto_https off\n}}\nhttp://127.0.0.1:{port} {{\n reverse_proxy 127.0.0.1:{upstream}\n}}\n")).unwrap();
+        std::fs::write(&configuration, format!("{{\n admin off\n auto_https off\n}}\nhttp://127.0.0.1:{port} {{\n bind 127.0.0.1\n reverse_proxy 127.0.0.1:{upstream}\n}}\n")).unwrap();
         let child = std::process::Command::new(binary)
             .args(["run", "--config"])
             .arg(configuration)
