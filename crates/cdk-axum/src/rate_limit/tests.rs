@@ -1,3 +1,6 @@
+#[path = "test_support.rs"]
+mod test_support;
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -452,4 +455,498 @@ fn invalid_configuration_is_refused() {
         assert!(RateLimiter::new(&case).is_err(), "{case:?}");
     }
     assert!(RateLimiter::new(&config(1)).is_ok());
+}
+
+/// Same real router as production, with observed disposable providers. Tracing is
+/// attached to the served future, including requests arriving through Caddy.
+async fn observed_router(config: Config) -> (Router, Arc<test_support::Effects>) {
+    observed_router_with_capacity(config, super::MAX_TRACKED_BUCKETS).await
+}
+
+async fn observed_router_with_capacity(
+    config: Config,
+    capacity: usize,
+) -> (Router, Arc<test_support::Effects>) {
+    use cdk::mint::MintMeltLimits;
+    use cdk::nuts::PaymentMethod;
+    use cdk_common::nut00::KnownMethod;
+    use cdk_sql_common::SQLMintDatabase;
+    use tracing::instrument::WithSubscriber;
+
+    let effects = Arc::new(test_support::Effects::default());
+    let db = Arc::new(
+        SQLMintDatabase::<test_support::ObservedPool<cdk_sqlite::SqliteConnectionManager>>::new(
+            test_support::ObservedConfig {
+                inner: ":memory:".into(),
+                effects: effects.clone(),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let mut builder = MintBuilder::new(db.clone());
+    builder
+        .configure_unit(
+            CurrencyUnit::Sat,
+            cdk::mint::UnitConfig {
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: 0,
+            },
+        )
+        .unwrap();
+    for method in [KnownMethod::Bolt11, KnownMethod::Bolt12] {
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Known(method),
+                MintMeltLimits::new(1, 100),
+                Arc::new(test_support::PoisonPayment(effects.clone())),
+            )
+            .await
+            .unwrap();
+    }
+    let mint = Arc::new(builder.build_with_seed(db, &[8; 64]).await.unwrap());
+    let cache = crate::cache::HttpCache::new(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Some(Box::new(test_support::ObservedCache(effects.clone()))),
+    );
+    let router = crate::create_mint_router_with_custom_cache(
+        mint,
+        cache,
+        vec!["bolt11".to_owned(), "bolt12".to_owned()],
+        false,
+        Some(Arc::new(
+            RateLimiter::with_capacity(&config, capacity).unwrap(),
+        )),
+    )
+    .await
+    .unwrap();
+    let observer = tracing::Dispatch::new(test_support::HandlerObserver::new(effects.clone()));
+    let router = router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let observer = observer.clone();
+            async move { next.run(request).with_subscriber(observer).await }
+        },
+    ));
+    effects.arm();
+    (router, effects)
+}
+
+#[tokio::test]
+async fn actual_handler_spans_have_positive_controls() {
+    let (router, effects) = observed_router(config(100)).await;
+    for (path, body) in [
+        ("/v1/swap", r#"{"inputs":[],"outputs":[]}"#),
+        ("/v1/mint/quote/bolt11", r#"{"amount":1,"unit":"sat"}"#),
+        ("/v1/restore", r#"{"outputs":[]}"#),
+    ] {
+        let response = send(
+            &router,
+            Call {
+                body: Body::from(body),
+                ..post(path, CLIENT)
+            },
+        )
+        .await;
+        assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    test_support::assert_handler_controls(&effects);
+}
+
+#[tokio::test]
+async fn malformed_representatives_stop_before_handler_and_external_effects() {
+    let (router, effects) = observed_router(config(100)).await;
+    for path in ["/v1/swap", "/v1/mint/quote/bolt11", "/v1/restore"] {
+        assert_eq!(
+            status(
+                &router,
+                Call {
+                    body: Body::from("{"),
+                    ..post(path, CLIENT)
+                }
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "{path}"
+        );
+        effects.assert_zero();
+    }
+}
+
+#[tokio::test]
+async fn production_body_boundary_is_exact_with_and_without_length() {
+    const CAP: usize = 524_288;
+    let mut limits = config(100);
+    limits.max_body_bytes = CAP;
+    let (router, effects) = observed_router(limits).await;
+    for known_length in [true, false] {
+        for (peer, length, expected) in [
+            (CLIENT, CAP, StatusCode::BAD_REQUEST),
+            (CLIENT, CAP + 1, StatusCode::PAYLOAD_TOO_LARGE),
+            (ENGINE, CAP + 1, StatusCode::BAD_REQUEST),
+        ] {
+            let mut bytes = vec![b' '; length];
+            bytes[0] = b'{';
+            let body = if known_length {
+                Body::from(bytes)
+            } else {
+                let chunks: Vec<_> = bytes.chunks(8192).map(Bytes::copy_from_slice).collect();
+                Body::from_stream(futures::stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::io::Error>),
+                ))
+            };
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/swap")
+                .header(header::CONTENT_TYPE, "application/json");
+            if known_length {
+                request = request.header(header::CONTENT_LENGTH, length);
+            }
+            let mut request = request.body(body).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 40_000)));
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                expected,
+                "length={length}, known={known_length}, peer={peer}"
+            );
+            effects.assert_zero();
+        }
+    }
+}
+
+#[tokio::test]
+async fn bolt12_and_unknown_write_routes_have_exact_class_baselines() {
+    for (path, class, baseline) in [
+        ("/v1/mint/quote/bolt12", "quote", StatusCode::BAD_REQUEST),
+        ("/v1/melt/quote/bolt12", "quote", StatusCode::BAD_REQUEST),
+        ("/v1/mint/bolt12", "value_write", StatusCode::BAD_REQUEST),
+        (
+            "/v1/mint/bolt12/batch",
+            "value_write",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/v1/melt/bolt12", "value_write", StatusCode::BAD_REQUEST),
+        (
+            "/v1/mint/quote/bolt12/check",
+            "recovery",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/v1/not-a-route", "value_write", StatusCode::NOT_FOUND),
+    ] {
+        let (router, effects) = observed_router(config(1)).await;
+        assert_eq!(
+            status(
+                &router,
+                Call {
+                    body: Body::from("{"),
+                    ..post(path, CLIENT)
+                }
+            )
+            .await,
+            baseline,
+            "{path}"
+        );
+        effects.assert_zero();
+        for (other, representative) in representatives() {
+            assert_eq!(
+                status(&router, representative).await == StatusCode::TOO_MANY_REQUESTS,
+                class == other,
+                "{path}: {other}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn head_consumes_read_but_options_uses_outer_cors_bypass() {
+    let router = router(config(1)).await;
+    assert_eq!(
+        status(
+            &router,
+            Call {
+                method: Method::HEAD,
+                ..get("/v1/info", CLIENT)
+            }
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&router, get("/v1/keysets", CLIENT)).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let router = self::router(config(1)).await;
+    assert_eq!(
+        status(
+            &router,
+            Call {
+                method: Method::OPTIONS,
+                ..get("/v1/info", CLIENT)
+            }
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&router, get("/v1/info", CLIENT)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&router, get("/v1/info", CLIENT)).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn full_table_real_router_has_exact_json_and_keeps_engine_independent() {
+    let (router, effects) = observed_router_with_capacity(config(1), 1).await;
+    assert_eq!(
+        status(
+            &router,
+            Call {
+                body: Body::from("{"),
+                ..post("/v1/swap", CLIENT)
+            }
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    let refused = send(
+        &router,
+        Call {
+            body: Body::from("{"),
+            ..post("/v1/swap", OTHER_CLIENT)
+        },
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused.headers()[header::RETRY_AFTER], "1");
+    let body = axum::body::to_bytes(refused.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"code":0,"detail":"Too many requests"})
+    );
+    assert_eq!(
+        status(
+            &router,
+            Call {
+                body: Body::from("{"),
+                ..post("/v1/swap", ENGINE)
+            }
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    effects.assert_zero();
+}
+
+/// Local forwarding proof only. The external wrapper supplies an exact verified
+/// Caddy binary; this test has no production endpoint or TLS acceptance claim.
+#[tokio::test]
+#[ignore = "requires the reviewed pinned local Caddy wrapper"]
+async fn pinned_caddy_preserves_real_client_identity() {
+    use futures::FutureExt;
+    use test_support::wire_request;
+    let mut limits = config(1);
+    limits.max_body_bytes = 524_288;
+    limits.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    limits.engine_addresses = vec!["127.0.0.3".parse().unwrap()];
+    limits.engine.burst = 3;
+    let (router, effects) = observed_router(limits).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let _server_cleanup = test_support::AbortTask(server.abort_handle());
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let mut caddy = test_support::LocalCaddy::start(port, upstream);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        std::panic::AssertUnwindSafe(async {
+            let ready_end = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(caddy.running(), "owned Caddy exited during startup");
+                match wire_request(port, 2, "GET", "/v1/info", &[], 0, false).await {
+                    Ok(response) => {
+                        assert_eq!(response.status, 200);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        assert!(
+                            tokio::time::Instant::now() < ready_end,
+                            "Caddy readiness deadline"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("local readiness failed: {error}"),
+                }
+            }
+            effects.arm();
+            let forms: [&[&str]; 4] = [
+                &[],
+                &["127.0.0.3"],
+                &["127.0.0.3, 127.0.0.2"],
+                &["127.0.0.3", "127.0.0.3"],
+            ];
+            for (index, forwarded) in forms.into_iter().enumerate() {
+                for (method, path, expected) in [
+                    ("POST", "/v1/swap", 400),
+                    ("POST", "/v1/mint/quote/bolt11", 400),
+                    ("POST", "/v1/restore", 400),
+                    ("GET", "/v1/info", 200),
+                ] {
+                    let size = usize::from(method == "POST");
+                    let first =
+                        wire_request(port, 10 + index as u8, method, path, forwarded, size, false)
+                            .await
+                            .unwrap();
+                    assert_eq!(first.status, expected, "{path}, forwarding form {index}");
+                    let refused =
+                        wire_request(port, 10 + index as u8, method, path, forwarded, size, false)
+                            .await
+                            .unwrap();
+                    assert_eq!(refused.status, 429);
+                    assert!(refused
+                        .headers
+                        .to_ascii_lowercase()
+                        .contains("retry-after:"));
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap(),
+                        serde_json::json!({"code":0,"detail":"Too many requests"})
+                    );
+                    if method == "POST" {
+                        effects.assert_zero();
+                    }
+                    effects.arm(); // GET is a legitimate read handler, not a zero-effect claim.
+                }
+            }
+            // Rotating untrusted, non-engine XFF must not create new buckets
+            // for one actual TCP source address.
+            assert_eq!(
+                wire_request(port, 20, "POST", "/v1/swap", &[], 1, false)
+                    .await
+                    .unwrap()
+                    .status,
+                400
+            );
+            for forwarded in [
+                &["192.0.2.10"][..],
+                &["192.0.2.11, 192.0.2.12"][..],
+                &["192.0.2.13", "192.0.2.14"][..],
+            ] {
+                let refused = wire_request(port, 20, "POST", "/v1/swap", forwarded, 1, false)
+                    .await
+                    .unwrap();
+                assert_eq!(refused.status, 429);
+                assert!(refused
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("retry-after:"));
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap(),
+                    serde_json::json!({"code":0,"detail":"Too many requests"})
+                );
+                effects.assert_zero();
+            }
+            for (index, chunked) in [false, true].into_iter().enumerate() {
+                assert_eq!(
+                    wire_request(
+                        port,
+                        30 + index as u8 * 2,
+                        "POST",
+                        "/v1/swap",
+                        &[],
+                        524_288,
+                        chunked
+                    )
+                    .await
+                    .unwrap()
+                    .status,
+                    400
+                );
+                assert_eq!(
+                    wire_request(
+                        port,
+                        31 + index as u8 * 2,
+                        "POST",
+                        "/v1/swap",
+                        &[],
+                        524_289,
+                        chunked
+                    )
+                    .await
+                    .unwrap()
+                    .status,
+                    413
+                );
+                assert_eq!(
+                    wire_request(port, 3, "POST", "/v1/swap", &[], 524_289, chunked)
+                        .await
+                        .unwrap()
+                        .status,
+                    400
+                );
+                effects.assert_zero();
+            }
+            assert_eq!(
+                wire_request(port, 3, "GET", "/v1/info", &[], 0, false)
+                    .await
+                    .unwrap()
+                    .status,
+                200
+            );
+            assert_eq!(
+                wire_request(port, 3, "POST", "/v1/restore", &[], 1, false)
+                    .await
+                    .unwrap()
+                    .status,
+                429
+            );
+        })
+        .catch_unwind(),
+    )
+    .await;
+    let stopped = caddy.stop();
+    server.abort();
+    let joined = tokio::time::timeout(Duration::from_secs(2), server).await;
+    assert!(stopped, "owned Caddy did not exit within cleanup bound");
+    assert!(joined.is_ok(), "owned Axum task did not join");
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => std::panic::resume_unwind(error),
+        Err(error) => panic!("bounded Caddy fixture deadline: {error}"),
+    }
+    println!("CADDY_FIXTURE_CLOSED");
+}
+
+#[cfg(feature = "conditional-tokens")]
+#[tokio::test]
+async fn malformed_convert_enters_preflight_but_has_no_external_effects() {
+    let (router, effects) = observed_router(config(10)).await;
+    assert_eq!(
+        status(
+            &router,
+            Call {
+                body: Body::from("{"),
+                ..post("/v1/ctf/convert", CLIENT)
+            }
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    effects.assert_external_zero();
+    effects.assert_convert_entered();
 }
