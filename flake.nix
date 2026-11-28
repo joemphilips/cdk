@@ -137,6 +137,9 @@
           ];
         };
 
+        # Image builds need only the pinned host compiler, Cargo and standard library.
+        image_toolchain = pkgs.rust-bin.stable."1.97.1".minimal;
+
         # MSRV stable
         msrv_toolchain = pkgs.rust-bin.stable."1.85.0".default.override {
           targets = [ "wasm32-unknown-unknown" ]; # wasm
@@ -1575,6 +1578,15 @@
               // envVars
             );
 
+            image = pkgs.mkShell (
+              {
+                shellHook = commonShellHook;
+                buildInputs = baseBuildInputs ++ [ image_toolchain ];
+                inherit nativeBuildInputs;
+              }
+              // envVars
+            );
+
             regtest = pkgs.mkShell (
               {
                 shellHook = commonShellHook + pgShellHook + redisShellHook;
@@ -1780,6 +1792,7 @@
             inherit
               msrv
               stable
+              image
               regtest
               nightly
               nightly-regtest

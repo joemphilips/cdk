@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Image-only Nix shell with the pinned Rust 1.97.1 minimal host toolchain. It retains the existing native and base build inputs. The default developer shell is unchanged.
+
 ## [0.18.2](https://github.com/cashubtc/cdk/releases/tag/v0.18.2)
 
 ### Summary
