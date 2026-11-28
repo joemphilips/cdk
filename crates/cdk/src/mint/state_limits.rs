@@ -23,6 +23,7 @@ use cdk_common::util::unix_time;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+use super::liability_value::{sum_liabilities, ConditionalOutstanding};
 use super::Mint;
 use crate::error::Error;
 use crate::nuts::{CurrencyUnit, Id};
@@ -560,49 +561,6 @@ fn log_anomalies(anomalies: &[LiabilityAnomaly]) {
             first
         );
     }
-}
-
-/// The outstanding amount of one conditional keyset.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConditionalOutstanding {
-    pub(crate) unit: CurrencyUnit,
-    pub(crate) condition_id: String,
-    /// The outcomes that the keyset tokens pay out on
-    pub(crate) outcomes: Vec<String>,
-    pub(crate) amount: u64,
-}
-
-/// Sum the regular outstanding amounts and the largest payout of each condition.
-pub(crate) fn sum_liabilities(
-    regular: Vec<(CurrencyUnit, u64)>,
-    conditional: Vec<ConditionalOutstanding>,
-    winners: &HashMap<String, String>,
-) -> HashMap<CurrencyUnit, u64> {
-    let mut totals: HashMap<CurrencyUnit, u64> = HashMap::new();
-    for (unit, amount) in regular {
-        let total = totals.entry(unit).or_default();
-        *total = total.saturating_add(amount);
-    }
-    // Payout of each outcome of each condition: the tokens that cover it.
-    let mut payouts: HashMap<(CurrencyUnit, String), HashMap<String, u64>> = HashMap::new();
-    for keyset in conditional {
-        let outcomes = payouts
-            .entry((keyset.unit, keyset.condition_id))
-            .or_default();
-        for outcome in keyset.outcomes {
-            let payout = outcomes.entry(outcome).or_default();
-            *payout = payout.saturating_add(keyset.amount);
-        }
-    }
-    for ((unit, condition_id), outcomes) in payouts {
-        let payout = match winners.get(&condition_id) {
-            Some(winner) => outcomes.get(winner).copied().unwrap_or(0),
-            None => outcomes.values().copied().max().unwrap_or(0),
-        };
-        let total = totals.entry(unit).or_default();
-        *total = total.saturating_add(payout);
-    }
-    totals
 }
 
 #[cfg(test)]

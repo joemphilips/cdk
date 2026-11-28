@@ -47,6 +47,7 @@ mod conditions;
 mod ctf_conservation;
 mod issue;
 mod keysets;
+mod liability_value;
 mod melt;
 mod payment_backend;
 mod proofs;
