@@ -2,6 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
+use bitcoin::hashes::{sha256, Hash, HashEngine};
 use cdk_common::mint::StoredCondition;
 use cdk_common::nuts::nut_ctf as ctf;
 use cdk_common::nuts::nut_ctf::{canonical_outcome_collection, parse_outcome_collection};
@@ -44,7 +45,7 @@ type Result<T> = std::result::Result<T, Refusal>;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
-enum Unit {
+pub(super) enum Unit {
     Sat,
     Msat,
 }
@@ -62,6 +63,8 @@ impl Unit {
 enum Record {
     Header {
         version: u8,
+        #[serde(default)]
+        chain: Option<super::requests::Chain>,
     },
     Condition {
         stored: ConditionFact,
@@ -83,7 +86,30 @@ enum Record {
         payment_ledger: u64,
         issuance_ledger: u64,
     },
+    MeltQuote {
+        id: String,
+        unit: Unit,
+        amount: u64,
+        state: String,
+    },
+    Request {
+        fact: super::requests::Request,
+    },
+    Credit {
+        fact: super::requests::Credit,
+    },
+    Receipt {
+        fact: super::requests::Receipt,
+    },
     End {
+        #[serde(default)]
+        melts: Option<usize>,
+        #[serde(default)]
+        requests: Option<usize>,
+        #[serde(default)]
+        credits: Option<usize>,
+        #[serde(default)]
+        receipts: Option<usize>,
         conditions: usize,
         keysets: usize,
         quotes: usize,
@@ -241,6 +267,12 @@ pub(super) struct Amounts {
 pub(super) struct Valuation {
     version: u8,
     authorizing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_counts: Option<super::requests::Counts>,
     sat: Amounts,
     msat: Amounts,
     total_msat: u64,
@@ -277,7 +309,12 @@ fn evaluate_with_limits<R: Read>(
     let mut conditions = HashMap::<String, Condition>::new();
     let mut winners = HashMap::new();
     let mut keysets = HashSet::new();
-    let mut quotes = HashSet::new();
+    let mut quotes = HashMap::new();
+    let mut melts = HashMap::new();
+    let mut request_facts = super::requests::Facts::default();
+    let mut protocol = 0;
+    let mut chain = None;
+    let mut commitment = sha256::Hash::engine();
     let mut regular = Vec::new();
     let mut conditional = Vec::new();
     let mut regular_totals = HashMap::<CurrencyUnit, u64>::new();
@@ -294,6 +331,7 @@ fn evaluate_with_limits<R: Read>(
             .read_exact(&mut header)
             .map_err(|_| Refusal::Framing)?;
         bytes += 4;
+        commitment.input(&header);
         let size = u32::from_be_bytes(header) as usize;
         if size == 0 {
             let mut trailing = [0u8; 1];
@@ -314,14 +352,24 @@ fn evaluate_with_limits<R: Read>(
         reader
             .read_exact(&mut frame)
             .map_err(|_| Refusal::Framing)?;
+        commitment.input(&frame);
         bytes += size;
         records += 1;
         let record: Record = serde_json::from_slice(&frame).map_err(|_| Refusal::Shape)?;
-        if records == 1 && !matches!(record, Record::Header { version: 1 }) {
+        if records == 1 && !matches!(record, Record::Header { .. }) {
             return Err(Refusal::Shape);
         }
         match record {
-            Record::Header { version: 1 } if records == 1 => (),
+            Record::Header {
+                version,
+                chain: selected,
+            } if records == 1 => {
+                if !matches!((version, selected), (1, None) | (2, Some(_))) {
+                    return Err(Refusal::Shape);
+                }
+                protocol = version;
+                chain = selected;
+            }
             Record::Header { .. } => return Err(Refusal::Shape),
             Record::Condition { stored } => {
                 let (id, condition, winner) = condition_fact(stored)?;
@@ -439,7 +487,7 @@ fn evaluate_with_limits<R: Read>(
             } => {
                 data_started = true;
                 identity(&id)?;
-                if !quotes.insert(id) {
+                if quotes.insert(id, (unit, paid)).is_some() {
                     return Err(Refusal::Identity);
                 }
                 if paid != payment_ledger || issued != issuance_ledger || issued > paid {
@@ -448,7 +496,40 @@ fn evaluate_with_limits<R: Read>(
                 let total = paid_totals.entry(unit.cashu()).or_default();
                 *total = add(*total, paid - issued)?;
             }
+            Record::MeltQuote {
+                id,
+                unit,
+                amount,
+                state,
+            } if protocol == 2 => {
+                identity(&id)?;
+                if !matches!(state.as_str(), "UNPAID" | "PENDING" | "PAID")
+                    || melts
+                        .insert(
+                            id,
+                            super::requests::MeltAnchor {
+                                unit,
+                                amount,
+                                state,
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(Refusal::Identity);
+                }
+            }
+            Record::Request { fact } if protocol == 2 => request_facts.request(fact)?,
+            Record::Credit { fact } if protocol == 2 => request_facts.credit(fact)?,
+            Record::Receipt { fact } if protocol == 2 => request_facts.receipt(fact)?,
+            Record::MeltQuote { .. }
+            | Record::Request { .. }
+            | Record::Credit { .. }
+            | Record::Receipt { .. } => return Err(Refusal::Shape),
             Record::End {
+                melts: melt_count,
+                requests,
+                credits,
+                receipts,
                 conditions: condition_count,
                 keysets: keyset_count,
                 quotes: quote_count,
@@ -458,6 +539,26 @@ fn evaluate_with_limits<R: Read>(
                     || quote_count != quotes.len()
                 {
                     return Err(Refusal::Identity);
+                }
+                let counts = request_facts.counts();
+                if protocol == 2 {
+                    if melt_count != Some(melts.len())
+                        || (requests, credits, receipts)
+                            != (
+                                Some(counts.requests),
+                                Some(counts.credits),
+                                Some(counts.receipts),
+                            )
+                    {
+                        return Err(Refusal::Identity);
+                    }
+                    request_facts.verify(chain.ok_or(Refusal::Shape)?, &quotes, &melts)?;
+                } else if melt_count.is_some()
+                    || requests.is_some()
+                    || credits.is_some()
+                    || receipts.is_some()
+                {
+                    return Err(Refusal::Shape);
                 }
                 ended = true;
             }
@@ -497,8 +598,11 @@ fn evaluate_with_limits<R: Read>(
         msat.total,
     )?;
     Ok(Valuation {
-        version: 1,
+        version: protocol,
         authorizing: false,
+        request_complete: (protocol == 2).then_some(true),
+        input_sha256: (protocol == 2).then(|| sha256::Hash::from_engine(commitment).to_string()),
+        request_counts: (protocol == 2).then(|| request_facts.counts()),
         sat,
         msat,
         total_msat,
@@ -513,3 +617,7 @@ fn evaluate_with_limits<R: Read>(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "request_tests.rs"]
+mod request_tests;

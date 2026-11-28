@@ -5,6 +5,7 @@ mod liability_value;
 #[path = "../../mint/oracle_evidence.rs"]
 mod oracle_evidence;
 mod records;
+mod requests;
 
 use cdk::Error;
 
