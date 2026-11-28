@@ -197,6 +197,11 @@ serde_urlencoded = { version = "0.7", default-features = false }
 ureq = { version = "3.1.0", features = ["json"] }
 tokio = { workspace = true, features = ["full"] }
 
+[[bin]]
+name = "cdk-mint-obligation-value"
+path = "src/bin/obligation_value/main.rs"
+required-features = ["mint", "conditional-tokens"]
+
 
 [[bench]]
 name = "dhke_benchmarks"

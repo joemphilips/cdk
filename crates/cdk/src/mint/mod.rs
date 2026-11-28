@@ -49,6 +49,8 @@ mod issue;
 mod keysets;
 mod liability_value;
 mod melt;
+#[cfg(feature = "conditional-tokens")]
+mod oracle_evidence;
 mod payment_backend;
 mod proofs;
 #[cfg(feature = "conditional-tokens")]
